@@ -1,0 +1,11 @@
+query Environments($projectId: String!) {
+  environments(projectId: $projectId, isEphemeral: false) {
+    edges {
+      node {
+        id
+        name
+        isEphemeral
+      }
+    }
+  }
+}

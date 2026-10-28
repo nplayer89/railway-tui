@@ -1,0 +1,17 @@
+subscription DeploymentLogsSub(
+  $deploymentId: String!
+  $filter: String
+  $limit: Int
+) {
+  deploymentLogs(deploymentId: $deploymentId, filter: $filter, limit: $limit) {
+    timestamp
+    message
+    attributes {
+      key
+      value
+    }
+    tags {
+      deploymentInstanceId
+    }
+  }
+}

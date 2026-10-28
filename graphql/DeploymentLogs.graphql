@@ -1,0 +1,21 @@
+query DeploymentLogs(
+  $deploymentId: String!
+  $limit: Int!
+  $startDate: DateTime
+) {
+  deploymentLogs(
+    deploymentId: $deploymentId
+    limit: $limit
+    startDate: $startDate
+  ) {
+    timestamp
+    message
+    attributes {
+      key
+      value
+    }
+    tags {
+      deploymentInstanceId
+    }
+  }
+}

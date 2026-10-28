@@ -1,0 +1,35 @@
+[package]
+name = "railway-tui"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "railway_tui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "railway-tui"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.30"
+# Same crossterm as ratatui's backend; enabled here only for `EventStream`.
+crossterm = { version = "0.29", features = ["event-stream"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots", "json", "stream"] }
+reqwest-websocket = "0.5"
+graphql_client = "0.14"
+graphql-ws-client = { version = "0.11", features = ["client-graphql-client"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+thiserror = "2"
+url = "2"
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }

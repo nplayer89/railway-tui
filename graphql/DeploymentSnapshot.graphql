@@ -1,0 +1,6 @@
+query DeploymentSnapshot($id: String!) {
+  deployment(id: $id) {
+    snapshotId
+    createdAt
+  }
+}
