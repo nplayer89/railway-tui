@@ -4,10 +4,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use railway_tui::api::write::WriteError;
 use railway_tui::api::{Api, ApiError};
 use railway_tui::auth::{AuthError, TokenSource};
 use railway_tui::budget::{LimitSource, RateBudget};
-use railway_tui::model::{DeploymentStatus, Instance, InstanceStatus};
+use railway_tui::model::{DeploymentStatus, Instance, InstanceStatus, Variables};
 use serde_json::json;
 use url::Url;
 use wiremock::matchers::{body_string_contains, header, method};
@@ -542,4 +543,402 @@ async fn variables_error_message_has_no_values() {
     for secret in ["tok", "p1", "e1", "s1"] {
         assert!(!text.contains(secret), "{text}");
     }
+}
+
+// ---- Writes (mutations). Every write path is tested here, never against Railway. ----
+
+fn write_api(server: &MockServer, tokens: Arc<FakeTokens>, timeout: Duration) -> Api {
+    let endpoint = Url::parse(&format!("{}/graphql/v2", server.uri())).unwrap();
+    Api::with_timeout(
+        endpoint,
+        tokens,
+        Arc::new(Mutex::new(RateBudget::new(None))),
+        timeout,
+    )
+}
+
+fn ok_body(field: &str) -> serde_json::Value {
+    json!({"data": {field: true}})
+}
+
+fn tricky_vars() -> Variables {
+    let mut vars = Variables::new();
+    for (k, v) in [
+        ("EMPTY", ""),
+        ("EQ", "a=b"),
+        ("Q", "\"x'"),
+        ("NL", "l1\nl2"),
+        ("U", "héllo ✓"),
+    ] {
+        vars.insert(k.to_string(), v.to_string());
+    }
+    vars.insert("BIG".to_string(), "x".repeat(10240));
+    vars
+}
+
+async fn sent_bodies(server: &MockServer) -> Vec<serde_json::Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn upsert_sends_skip_deploys_and_no_replace() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("variableCollectionUpsert"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body("variableCollectionUpsert")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = write_api(
+        &server,
+        FakeTokens::new("tok", "tok2"),
+        Duration::from_secs(5),
+    );
+    let vars = tricky_vars();
+
+    api.upsert_variables("p1", "e1", "s1", &vars).await.unwrap();
+
+    let bodies = sent_bodies(&server).await;
+    let input = &bodies[0]["variables"]["input"];
+    assert_eq!(input["skipDeploys"], json!(true));
+    assert_eq!(input["replace"], json!(false));
+    assert_eq!(input["projectId"], json!("p1"));
+    assert_eq!(input["environmentId"], json!("e1"));
+    assert_eq!(input["serviceId"], json!("s1"));
+    let sent: Variables = serde_json::from_value(input["variables"].clone()).unwrap();
+    assert_eq!(sent, vars, "values must arrive byte-for-byte");
+}
+
+#[tokio::test]
+async fn write_401_is_refused_and_not_resent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let tokens = FakeTokens::new("tok", "tok2");
+    let api = write_api(&server, tokens.clone(), Duration::from_secs(5));
+
+    let err = api
+        .upsert_variables("p1", "e1", "s1", &tricky_vars())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            WriteError::Refused(ApiError::Auth(AuthError::Rejected))
+        ),
+        "{err:?}"
+    );
+    assert_eq!(tokens.refreshes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn write_not_authorized_is_refused_and_not_resent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"data": null, "errors": [{"message": "Not Authorized"}]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let tokens = FakeTokens::new("tok", "tok2");
+    let api = write_api(&server, tokens.clone(), Duration::from_secs(5));
+
+    let err = api.redeploy_service("e1", "s1").await.unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            WriteError::Refused(ApiError::Auth(AuthError::Rejected))
+        ),
+        "{err:?}"
+    );
+    assert_eq!(tokens.refreshes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn write_500_is_unknown() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = write_api(
+        &server,
+        FakeTokens::new("tok", "tok2"),
+        Duration::from_secs(5),
+    );
+
+    let err = api
+        .upsert_variables("p1", "e1", "s1", &tricky_vars())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, WriteError::Unknown(ApiError::Http(500))),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn write_400_is_refused() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = write_api(
+        &server,
+        FakeTokens::new("tok", "tok2"),
+        Duration::from_secs(5),
+    );
+
+    let err = api.redeploy_service("e1", "s1").await.unwrap_err();
+
+    assert!(
+        matches!(err, WriteError::Refused(ApiError::Http(400))),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn write_graphql_error_is_refused() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"data": null, "errors": [{"message": "Problem processing request"}]}),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = write_api(
+        &server,
+        FakeTokens::new("tok", "tok2"),
+        Duration::from_secs(5),
+    );
+    let vars = tricky_vars();
+
+    let err = api
+        .upsert_variables("p1", "e1", "s1", &vars)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, WriteError::Refused(ApiError::GraphQl(_))),
+        "{err:?}"
+    );
+    let shown = format!("{err} {err:?}");
+    for value in ["a=b", "l1", "héllo"] {
+        assert!(!shown.contains(value), "value leaked: {shown}");
+    }
+}
+
+#[tokio::test]
+async fn write_timeout_is_unknown() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(ok_body("variableCollectionUpsert"))
+                .set_delay(Duration::from_secs(2)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = write_api(
+        &server,
+        FakeTokens::new("tok", "tok2"),
+        Duration::from_millis(200),
+    );
+
+    let err = api
+        .upsert_variables("p1", "e1", "s1", &tricky_vars())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, WriteError::Unknown(ApiError::Network(_))),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn write_429_is_refused_and_blocks_the_budget() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "30"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = write_api(
+        &server,
+        FakeTokens::new("tok", "tok2"),
+        Duration::from_secs(5),
+    );
+
+    let err = api.redeploy_service("e1", "s1").await.unwrap_err();
+
+    assert!(
+        matches!(err, WriteError::Refused(ApiError::RateLimited { .. })),
+        "{err:?}"
+    );
+    assert!(api.budget().lock().unwrap().blocked_until().is_some());
+}
+
+#[tokio::test]
+async fn write_is_refused_without_sending_while_budget_blocked() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body("serviceInstanceRedeploy")))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let api = write_api(
+        &server,
+        FakeTokens::new("tok", "tok2"),
+        Duration::from_secs(5),
+    );
+    api.budget()
+        .lock()
+        .unwrap()
+        .on_rate_limited(Some(Duration::from_secs(60)), std::time::Instant::now());
+
+    let err = api.redeploy_service("e1", "s1").await.unwrap_err();
+
+    assert!(
+        matches!(err, WriteError::Refused(ApiError::RateLimited { .. })),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn write_connect_failure_is_refused() {
+    // A local port with nothing listening: the request is never sent.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let endpoint = Url::parse(&format!("http://127.0.0.1:{port}/graphql/v2")).unwrap();
+    let api = Api::with_timeout(
+        endpoint,
+        FakeTokens::new("tok", "tok2"),
+        Arc::new(Mutex::new(RateBudget::new(None))),
+        Duration::from_secs(5),
+    );
+
+    let err = api.redeploy_service("e1", "s1").await.unwrap_err();
+
+    assert!(
+        matches!(err, WriteError::Refused(ApiError::Network(_))),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_sends_name_and_ids() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("variableDelete"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body("variableDelete")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = write_api(
+        &server,
+        FakeTokens::new("tok", "tok2"),
+        Duration::from_secs(5),
+    );
+
+    api.delete_variable("p1", "e1", "s1", "OLD").await.unwrap();
+
+    let bodies = sent_bodies(&server).await;
+    let input = &bodies[0]["variables"]["input"];
+    assert_eq!(input["name"], json!("OLD"));
+    assert_eq!(input["projectId"], json!("p1"));
+    assert_eq!(input["environmentId"], json!("e1"));
+    assert_eq!(input["serviceId"], json!("s1"));
+}
+
+#[tokio::test]
+async fn delete_not_found_is_ok() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!({"data": null, "errors": [{"message": "Variable Not Found"}]}),
+            ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = write_api(
+        &server,
+        FakeTokens::new("tok", "tok2"),
+        Duration::from_secs(5),
+    );
+
+    api.delete_variable("p1", "e1", "s1", "GONE").await.unwrap();
+}
+
+#[tokio::test]
+async fn delete_other_graphql_error_is_refused() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"data": null, "errors": [{"message": "Problem processing request"}]}),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = write_api(
+        &server,
+        FakeTokens::new("tok", "tok2"),
+        Duration::from_secs(5),
+    );
+
+    let err = api
+        .delete_variable("p1", "e1", "s1", "OLD")
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, WriteError::Refused(ApiError::GraphQl(_))),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn redeploy_sends_env_and_service() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("serviceInstanceRedeploy"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body("serviceInstanceRedeploy")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = write_api(
+        &server,
+        FakeTokens::new("tok", "tok2"),
+        Duration::from_secs(5),
+    );
+
+    api.redeploy_service("e1", "s1").await.unwrap();
+
+    let bodies = sent_bodies(&server).await;
+    assert_eq!(bodies[0]["variables"]["environmentId"], json!("e1"));
+    assert_eq!(bodies[0]["variables"]["serviceId"], json!("s1"));
 }

@@ -1,4 +1,5 @@
-//! Railway's public GraphQL API over HTTP (queries only).
+//! Railway's public GraphQL API over HTTP. Reads live here; the only writes
+//! (three allowlisted mutations) live in [`write`].
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,6 +18,7 @@ use crate::model::{
 };
 
 pub mod subscribe;
+pub mod write;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Build events can be timestamped just before the deployment is created (CLI behaviour).
@@ -119,8 +121,10 @@ pub struct BuildSnapshot {
 }
 
 /// Outcome of one HTTP attempt; `Rejected` means the token was refused.
-enum Attempt {
+pub(crate) enum Attempt {
     Rejected,
+    /// The connection could not be made, so the request never reached Railway.
+    Unsent(ApiError),
     Failed(ApiError),
 }
 
@@ -137,8 +141,19 @@ impl Api {
         tokens: Arc<dyn TokenSource>,
         budget: Arc<Mutex<RateBudget>>,
     ) -> Self {
+        Self::with_timeout(endpoint, tokens, budget, REQUEST_TIMEOUT)
+    }
+
+    /// Like [`Api::new`] with a custom per-request timeout. Exists for tests:
+    /// a short timeout lets a slow mock server time a request out quickly.
+    pub fn with_timeout(
+        endpoint: Url,
+        tokens: Arc<dyn TokenSource>,
+        budget: Arc<Mutex<RateBudget>>,
+        timeout: Duration,
+    ) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(timeout)
             .build()
             .expect("reqwest client with a timeout builds");
         Self {
@@ -424,7 +439,7 @@ impl Api {
         let token = self.auth(|t| t.token()).await?;
         match self.attempt::<Q>(&body, &token).await {
             Ok(data) => return Ok(data),
-            Err(Attempt::Failed(e)) => return Err(e),
+            Err(Attempt::Failed(e) | Attempt::Unsent(e)) => return Err(e),
             Err(Attempt::Rejected) => {}
         }
         let token = self
@@ -432,19 +447,21 @@ impl Api {
             .await?;
         match self.attempt::<Q>(&body, &token).await {
             Ok(data) => Ok(data),
-            Err(Attempt::Failed(e)) => Err(e),
+            Err(Attempt::Failed(e) | Attempt::Unsent(e)) => Err(e),
             Err(Attempt::Rejected) => Err(ApiError::Auth(AuthError::Rejected)),
         }
     }
 
-    async fn auth<F>(&self, f: F) -> Result<String, ApiError>
+    pub(crate) async fn auth<F>(&self, f: F) -> Result<String, ApiError>
     where
         F: FnOnce(&dyn TokenSource) -> Result<String, AuthError> + Send + 'static,
     {
         blocking_token(&self.tokens, f).await
     }
 
-    async fn attempt<Q: GraphQLQuery>(
+    /// One HTTP attempt with rate-budget bookkeeping; never retries. Reads go
+    /// through [`Api::query`]; writes go through `Api::send_write`, which never resends.
+    pub(crate) async fn attempt<Q: GraphQLQuery>(
         &self,
         body: &QueryBody<Q::Variables>,
         token: &str,
@@ -456,7 +473,14 @@ impl Api {
             .json(body)
             .send()
             .await
-            .map_err(|e| Attempt::Failed(ApiError::Network(e.to_string())))?;
+            .map_err(|e| {
+                let err = ApiError::Network(e.to_string());
+                if e.is_connect() {
+                    Attempt::Unsent(err)
+                } else {
+                    Attempt::Failed(err)
+                }
+            })?;
         let status = resp.status();
         {
             let mut budget = self.budget.lock().unwrap_or_else(|e| e.into_inner());

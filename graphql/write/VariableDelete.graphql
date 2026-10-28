@@ -1,0 +1,3 @@
+mutation VariableDelete($input: VariableDeleteInput!) {
+  variableDelete(input: $input)
+}
