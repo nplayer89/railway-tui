@@ -2,6 +2,8 @@
 
 mod keys;
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::KeyEvent;
@@ -11,8 +13,9 @@ use crate::logs::buffer::{LogBuffer, LOG_CAP};
 use crate::logs::follow::{FollowEvent, StreamState};
 use crate::model::{
     DeploymentStatus, DeploymentSummary, Environment, Instance, LogKind, ProjectRef,
-    ServiceInstance, Workspace,
+    ServiceInstance, Variables, Workspace,
 };
+use crate::pending::{Pending, PendingVar};
 use crate::remember::Remembered;
 use crate::status::{default_log_kind, deployment_rows, DeploymentRow};
 use crate::theme::{self, Theme, THEMES};
@@ -46,6 +49,16 @@ pub enum View {
     Deployments { service_id: String },
     Instances { service_id: String },
     Logs(LogsView),
+    Variables(VarsView),
+}
+
+/// The Variables view of one service. Dropping it re-hides every value.
+#[derive(Debug)]
+pub struct VarsView {
+    pub service_id: String,
+    /// Names whose value is shown.
+    pub revealed: BTreeSet<String>,
+    pub reveal_all: bool,
 }
 
 #[derive(Debug)]
@@ -70,7 +83,6 @@ pub enum AppEvent {
     Data(DataEvent),
 }
 
-#[derive(Debug)]
 pub enum DataEvent {
     Workspaces(Result<Vec<Workspace>, String>),
     Environments {
@@ -87,6 +99,13 @@ pub enum DataEvent {
         env_id: String,
         result: Result<Vec<DeploymentSummary>, String>,
     },
+    Variables {
+        env_id: String,
+        service_id: String,
+        result: Result<Variables, String>,
+    },
+    /// Saving the pending file failed; the text never holds a value.
+    SaveFailed(String),
     StatusChanged {
         deployment_id: String,
         status: DeploymentStatus,
@@ -119,6 +138,12 @@ pub enum Command {
         env_id: String,
         service_id: String,
     },
+    LoadVariables {
+        project_id: String,
+        env_id: String,
+        service_id: String,
+    },
+    SavePending(Pending),
     /// Replaces the previous watch set; empty means stop.
     WatchDeployments {
         ids: Vec<String>,
@@ -145,6 +170,9 @@ pub struct StartPrefs {
     /// Configured theme id or name.
     pub theme: Option<String>,
     pub remembered: Remembered,
+    pub pending: Pending,
+    /// Why the pending file could not be read, shown at start.
+    pub pending_error: Option<String>,
 }
 
 /// Selected row per table view, by id, so it survives reloads and filtering.
@@ -154,9 +182,9 @@ pub struct Selection {
     pub service: Option<String>,
     pub deployment: Option<String>,
     pub instance: Option<String>,
+    pub variable: Option<String>,
 }
 
-#[derive(Debug)]
 pub struct App {
     pub prefs: StartPrefs,
     /// Never empty; the root is always `View::Projects`.
@@ -169,6 +197,10 @@ pub struct App {
     pub services: Loaded<Vec<ServiceInstance>>,
     /// History for the service of the `Deployments` view in the stack.
     pub deployments: Loaded<Vec<DeploymentSummary>>,
+    /// Railway's variables for the service of the open `Variables` view.
+    pub variables: Loaded<Variables>,
+    /// Edits not deployed yet, for every service.
+    pub pending: Pending,
     pub selection: Selection,
     /// Applied name filter for the current table view (cleared on view change).
     pub table_filter: Option<String>,
@@ -200,11 +232,14 @@ struct Requested {
     environments: Option<Instant>,
     services: Option<Instant>,
     deployments: Option<Instant>,
+    variables: Option<Instant>,
 }
 
 impl App {
     pub fn new(prefs: StartPrefs) -> (App, Vec<Command>) {
-        let (theme, message) = start_theme(&prefs);
+        let (theme, theme_message) = start_theme(&prefs);
+        let message = prefs.pending_error.clone().or(theme_message);
+        let pending = prefs.pending.clone();
         let mut app = App {
             prefs,
             stack: vec![View::Projects],
@@ -215,6 +250,8 @@ impl App {
             environments: Loaded::default(),
             services: Loaded::default(),
             deployments: Loaded::default(),
+            variables: Loaded::default(),
+            pending,
             selection: Selection::default(),
             table_filter: None,
             filter_input: None,
@@ -315,6 +352,38 @@ impl App {
             .collect()
     }
 
+    /// Railway's variables for the open service merged with its pending edits,
+    /// by name, narrowed by the name filter (never the values).
+    pub fn variable_rows(&self) -> Vec<VarRow<'_>> {
+        let Some(service_id) = self.view_service_id(Kind::Variables) else {
+            return Vec::new();
+        };
+        let mut rows: BTreeMap<&str, VarRow> = BTreeMap::new();
+        for (name, value) in self.variables.value.iter().flatten() {
+            let row = VarRow {
+                name,
+                current: Some(value),
+                pending: None,
+            };
+            rows.insert(name, row);
+        }
+        let pending = self
+            .env_id()
+            .and_then(|env| self.pending.service(env, service_id));
+        for (name, change) in pending.iter().flat_map(|p| &p.vars) {
+            rows.entry(name)
+                .or_insert(VarRow {
+                    name,
+                    current: None,
+                    pending: None,
+                })
+                .pending = Some(change);
+        }
+        rows.into_values()
+            .filter(|r| self.passes_filter(&[r.name]))
+            .collect()
+    }
+
     /// The active theme (the previewed one while the picker is open).
     pub fn theme(&self) -> &'static Theme {
         &THEMES[self.theme]
@@ -378,6 +447,19 @@ impl App {
                 }
                 self.deployments.finish(result, now);
             }
+            DataEvent::Variables {
+                env_id,
+                service_id,
+                result,
+            } => {
+                if self.env_id() != Some(env_id.as_str())
+                    || self.view_service_id(Kind::Variables) != Some(service_id.as_str())
+                {
+                    return;
+                }
+                self.variables.finish(result, now);
+            }
+            DataEvent::SaveFailed(message) => self.message = Some(message),
             DataEvent::StatusChanged {
                 deployment_id,
                 status,
@@ -551,6 +633,11 @@ impl App {
                 self.requested.deployments,
                 self.deployments.loading,
             ),
+            Kind::Variables => (
+                self.variables.fetched_at,
+                self.requested.variables,
+                self.variables.loading,
+            ),
             Kind::Logs => return,
         };
         let last = fetched_at.max(requested);
@@ -571,6 +658,11 @@ impl App {
             Kind::Deployments => {
                 if let Some(id) = self.view_service_id(Kind::Deployments).map(String::from) {
                     self.load_deployments(id, now, out);
+                }
+            }
+            Kind::Variables => {
+                if let Some(id) = self.view_service_id(Kind::Variables).map(String::from) {
+                    self.load_variables(id, now, out);
                 }
             }
             Kind::Logs => self.reopen_logs(None, out),
@@ -617,6 +709,19 @@ impl App {
         self.requested.deployments = Some(now);
     }
 
+    fn load_variables(&mut self, service_id: String, now: Instant, out: &mut Vec<Command>) {
+        let (Some(project_id), Some(env_id)) = (self.project_id(), self.env_id()) else {
+            return;
+        };
+        out.push(Command::LoadVariables {
+            project_id: project_id.to_string(),
+            env_id: env_id.to_string(),
+            service_id,
+        });
+        self.variables.loading = true;
+        self.requested.variables = Some(now);
+    }
+
     // ---- navigation ----
 
     fn open_project(
@@ -653,6 +758,20 @@ impl App {
             out,
         );
         self.load_deployments(service_id, now, out);
+    }
+
+    fn open_variables(&mut self, service_id: String, now: Instant, out: &mut Vec<Command>) {
+        self.variables = Loaded::default();
+        self.selection.variable = None;
+        self.push(
+            View::Variables(VarsView {
+                service_id: service_id.clone(),
+                revealed: BTreeSet::new(),
+                reveal_all: false,
+            }),
+            out,
+        );
+        self.load_variables(service_id, now, out);
     }
 
     /// Logs of the selected service's latest deployment (the failed one, if it failed).
@@ -850,6 +969,11 @@ impl App {
                 .iter()
                 .map(|(_, i)| i.id.clone())
                 .collect(),
+            Kind::Variables => self
+                .variable_rows()
+                .iter()
+                .map(|r| r.name.to_string())
+                .collect(),
             Kind::Logs => Vec::new(),
         }
     }
@@ -860,6 +984,7 @@ impl App {
             Kind::Services => Some(&self.selection.service),
             Kind::Deployments => Some(&self.selection.deployment),
             Kind::Instances => Some(&self.selection.instance),
+            Kind::Variables => Some(&self.selection.variable),
             Kind::Logs => None,
         }
     }
@@ -870,6 +995,7 @@ impl App {
             Kind::Services => Some(&mut self.selection.service),
             Kind::Deployments => Some(&mut self.selection.deployment),
             Kind::Instances => Some(&mut self.selection.instance),
+            Kind::Variables => Some(&mut self.selection.variable),
             Kind::Logs => None,
         }
     }
@@ -912,6 +1038,7 @@ impl App {
             Some(View::Deployments { .. }) => Kind::Deployments,
             Some(View::Instances { .. }) => Kind::Instances,
             Some(View::Logs(_)) => Kind::Logs,
+            Some(View::Variables(_)) => Kind::Variables,
         }
     }
 
@@ -927,6 +1054,7 @@ impl App {
         self.stack.iter().rev().find_map(|v| match (v, kind) {
             (View::Deployments { service_id }, Kind::Deployments)
             | (View::Instances { service_id }, Kind::Instances) => Some(service_id.as_str()),
+            (View::Variables(v), Kind::Variables) => Some(v.service_id.as_str()),
             _ => None,
         })
     }
@@ -1003,7 +1131,100 @@ enum Kind {
     Services,
     Deployments,
     Instances,
+    Variables,
     Logs,
+}
+
+/// One line of the Variables view.
+pub struct VarRow<'a> {
+    pub name: &'a str,
+    /// The value on Railway, if the variable exists there.
+    pub current: Option<&'a str>,
+    pub pending: Option<&'a PendingVar>,
+}
+
+/// Values must never reach a log or panic message, so `Variables` is left out.
+impl fmt::Debug for App {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("App")
+            .field("stack", &self.stack)
+            .field("project", &self.project)
+            .field("environment", &self.environment)
+            .field("selection", &self.selection)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Written by hand so a loaded `Variables` prints as a count, not its values.
+impl fmt::Debug for DataEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DataEvent::Workspaces(r) => f.debug_tuple("Workspaces").field(r).finish(),
+            DataEvent::Environments { project_id, result } => f
+                .debug_struct("Environments")
+                .field("project_id", project_id)
+                .field("result", result)
+                .finish(),
+            DataEvent::Services {
+                project_id,
+                env_id,
+                result,
+            } => f
+                .debug_struct("Services")
+                .field("project_id", project_id)
+                .field("env_id", env_id)
+                .field("result", result)
+                .finish(),
+            DataEvent::Deployments {
+                service_id,
+                env_id,
+                result,
+            } => f
+                .debug_struct("Deployments")
+                .field("service_id", service_id)
+                .field("env_id", env_id)
+                .field("result", result)
+                .finish(),
+            DataEvent::Variables {
+                env_id,
+                service_id,
+                result,
+            } => {
+                let shown = match result {
+                    Ok(vars) => format!("Ok({} variables)", vars.len()),
+                    Err(e) => format!("Err({e:?})"),
+                };
+                f.debug_struct("Variables")
+                    .field("env_id", env_id)
+                    .field("service_id", service_id)
+                    .field("result", &format_args!("{shown}"))
+                    .finish()
+            }
+            DataEvent::SaveFailed(m) => f.debug_tuple("SaveFailed").field(m).finish(),
+            DataEvent::StatusChanged {
+                deployment_id,
+                status,
+            } => f
+                .debug_struct("StatusChanged")
+                .field("deployment_id", deployment_id)
+                .field("status", status)
+                .finish(),
+            DataEvent::Log { session, event } => f
+                .debug_struct("Log")
+                .field("session", session)
+                .field("event", event)
+                .finish(),
+            DataEvent::Budget {
+                interval,
+                blocked_until,
+            } => f
+                .debug_struct("Budget")
+                .field("interval", interval)
+                .field("blocked_until", blocked_until)
+                .finish(),
+            DataEvent::LiveUpdates { ok } => f.debug_struct("LiveUpdates").field("ok", ok).finish(),
+        }
+    }
 }
 
 /// Index of `selected` in `ids`, or 0 when it is unset or filtered out.
@@ -1867,5 +2088,188 @@ mod tests {
         assert!(!app.help);
         app.update(key('/'), now);
         assert_eq!(app.update(ctrl('c'), now), vec![Command::Quit]);
+    }
+
+    // ---- variables ----
+
+    fn vars(pairs: &[(&str, &str)]) -> Variables {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn vars_event(service_id: &str, result: Result<Variables, String>) -> DataEvent {
+        DataEvent::Variables {
+            env_id: "e-prod".into(),
+            service_id: service_id.into(),
+            result,
+        }
+    }
+
+    fn names(app: &App) -> Vec<String> {
+        app.variable_rows()
+            .iter()
+            .map(|r| r.name.to_string())
+            .collect()
+    }
+
+    /// Variables view of svc-a, loaded with a few variables.
+    fn app_in_variables(now: Instant) -> App {
+        let mut app = app_in_services(now);
+        app.update(key('v'), now);
+        let loaded = vars(&[
+            ("DB_URL", "postgres://x"),
+            ("PORT", "has db inside"),
+            ("REDIS_DB", "1"),
+        ]);
+        data(&mut app, vars_event("svc-a", Ok(loaded)), now);
+        app
+    }
+
+    #[test]
+    fn v_opens_variables_and_loads() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        let cmds = app.update(key('v'), now);
+        // Leaving Services stops its deployment watch first.
+        assert_eq!(
+            cmds,
+            vec![
+                Command::WatchDeployments { ids: Vec::new() },
+                Command::LoadVariables {
+                    project_id: "p2".into(),
+                    env_id: "e-prod".into(),
+                    service_id: "svc-a".into(),
+                },
+            ]
+        );
+        assert!(matches!(app.stack.last(), Some(View::Variables(_))));
+        assert!(app.variables.loading);
+        let cmds = app.update(code(KeyCode::Esc), now);
+        assert!(matches!(app.stack.as_slice(), [.., View::Services]));
+        assert_eq!(
+            cmds,
+            vec![Command::WatchDeployments {
+                ids: vec!["d2".into(), "d3".into()]
+            }]
+        );
+        typed(&mut app, ":vars", now);
+        let cmds = app.update(code(KeyCode::Enter), now);
+        assert!(matches!(
+            cmds.last(),
+            Some(Command::LoadVariables { service_id, .. }) if service_id == "svc-a"
+        ));
+    }
+
+    #[test]
+    fn ctrl_r_reloads_variables_and_stale_replies_are_ignored() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        let cmds = app.update(ctrl('r'), now);
+        assert!(matches!(cmds.as_slice(), [Command::LoadVariables { .. }]));
+        data(
+            &mut app,
+            vars_event("svc-b", Ok(vars(&[("OTHER", "1")]))),
+            now,
+        );
+        assert_eq!(names(&app), ["DB_URL", "PORT", "REDIS_DB"]);
+        data(&mut app, vars_event("svc-a", Err("boom".into())), now);
+        assert_eq!(app.variables.error.as_deref(), Some("boom"));
+        assert_eq!(names(&app).len(), 3, "a failed reload keeps the old rows");
+    }
+
+    #[test]
+    fn variable_rows_merge_railway_and_pending_sorted() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        let target = crate::pending::Target {
+            project_id: "p2",
+            env_id: "e-prod",
+            env_name: "production",
+            service_id: "svc-a",
+            service_name: "svc-a-name",
+        };
+        app.pending.set(&target, "ALPHA_NEW", "v".into(), None);
+        app.pending.delete(&target, "PORT", Some("has db inside"));
+        app.pending.set(&target, "REDIS_DB", "2".into(), Some("1"));
+        let rows = app.variable_rows();
+        let got: Vec<_> = rows
+            .iter()
+            .map(|r| (r.name, r.current, r.pending.is_some()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("ALPHA_NEW", None, true),
+                ("DB_URL", Some("postgres://x"), false),
+                ("PORT", Some("has db inside"), true),
+                ("REDIS_DB", Some("1"), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn slash_filters_variables_live_by_name_only() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        app.update(key('/'), now);
+        typed(&mut app, "db", now);
+        assert_eq!(names(&app), ["DB_URL", "REDIS_DB"]);
+        assert!(!names(&app).contains(&"PORT".to_string()));
+        app.update(code(KeyCode::Esc), now);
+        assert_eq!(names(&app), ["DB_URL", "PORT", "REDIS_DB"]);
+    }
+
+    #[test]
+    fn search_survives_reload() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        app.update(key('/'), now);
+        typed(&mut app, "db", now);
+        app.update(code(KeyCode::Enter), now);
+        let reloaded = vars(&[("DB_URL", "y"), ("PORT", "db"), ("REDIS_DB", "z")]);
+        data(&mut app, vars_event("svc-a", Ok(reloaded)), now);
+        assert_eq!(names(&app), ["DB_URL", "REDIS_DB"]);
+    }
+
+    #[test]
+    fn leaving_variables_rehides_values() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        if let Some(View::Variables(v)) = app.stack.last_mut() {
+            v.reveal_all = true;
+            v.revealed.insert("PORT".into());
+        }
+        app.update(code(KeyCode::Esc), now);
+        assert!(!app.stack.iter().any(|v| matches!(v, View::Variables(_))));
+        app.update(key('v'), now);
+        match app.stack.last() {
+            Some(View::Variables(v)) => assert!(!v.reveal_all && v.revealed.is_empty()),
+            other => panic!("expected variables, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_error_is_shown_at_start() {
+        let (app, _) = App::new(StartPrefs {
+            pending_error: Some("pending.toml was unreadable".into()),
+            ..StartPrefs::default()
+        });
+        assert_eq!(app.message.as_deref(), Some("pending.toml was unreadable"));
+    }
+
+    #[test]
+    fn save_failed_is_shown_and_debug_hides_values() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        data(
+            &mut app,
+            DataEvent::SaveFailed("could not save".into()),
+            now,
+        );
+        assert_eq!(app.message.as_deref(), Some("could not save"));
+        let event = vars_event("svc-a", Ok(vars(&[("K", "s3cret-value")])));
+        assert!(!format!("{event:?}").contains("s3cret-value"));
     }
 }

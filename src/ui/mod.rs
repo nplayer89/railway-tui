@@ -55,6 +55,8 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
         Some(View::Deployments { .. }) => tables::deployments(frame, body, app, wall),
         Some(View::Instances { .. }) => tables::instances(frame, body, app),
         Some(View::Logs(l)) => logs::draw(frame, body, l, t),
+        // Drawn by a later task.
+        Some(View::Variables(_)) => {}
         Some(View::Projects) | None => tables::projects(frame, body, app),
     }
     draw_footer(frame, foot, app);
@@ -78,6 +80,7 @@ fn hints(app: &App) -> &'static str {
         Some(View::Deployments { .. }) | Some(View::Instances { .. }) => {
             "<enter> logs  </> filter  <esc> back  <?> help"
         }
+        Some(View::Variables(_)) => "</> filter  <esc> back  <?> help",
         Some(View::Logs(_)) => "<b> build/runtime  <f> follow  </> filter  <esc> back  <?> help",
         _ => "<enter> open  </> filter  <:> command  <t> theme  <?> help",
     }
@@ -98,6 +101,7 @@ fn freshness_source(app: &App) -> Option<Freshness<'_>> {
             of(&app.environments)
         }
         Some(View::Services) | Some(View::Instances { .. }) => of(&app.services),
+        Some(View::Variables(_)) => of(&app.variables),
         Some(View::Logs(_)) => None,
     }
 }
@@ -182,6 +186,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 .map_or("services".into(), |p| clean(&p.name)),
             View::Deployments { .. } => "deployments".into(),
             View::Instances { .. } => "instances".into(),
+            View::Variables(_) => "variables".into(),
             View::Logs(_) => "logs".into(),
         });
     }

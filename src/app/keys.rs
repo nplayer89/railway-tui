@@ -88,6 +88,14 @@ impl App {
                     self.open_latest_logs(out);
                 }
             }
+            "vars" => {
+                if self.goto_services(out) {
+                    match self.selected_service().map(|s| s.service_id.clone()) {
+                        Some(id) => self.open_variables(id, now, out),
+                        None => self.message = Some("no service selected".into()),
+                    }
+                }
+            }
             "theme" => self.theme_picker = Some(self.theme),
             "" => {}
             other => self.message = Some(format!("unknown command: {other}")),
@@ -172,6 +180,7 @@ impl App {
             Kind::Services => self.services_key(code, now, out),
             Kind::Deployments => self.deployments_key(code, out),
             Kind::Instances => self.instances_key(code, out),
+            Kind::Variables => false,
             Kind::Logs => self.logs_key(code, out),
         };
         if handled {
@@ -211,6 +220,10 @@ impl App {
                     self.push(View::Instances { service_id }, out);
                 }
             }
+            KeyCode::Char('v') => match selected {
+                Some(id) => self.open_variables(id, now, out),
+                None => self.message = Some("no service selected".into()),
+            },
             KeyCode::Char('e') => self.open_env_picker(now, out),
             _ => return false,
         }

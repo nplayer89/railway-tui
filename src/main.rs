@@ -23,6 +23,7 @@ use railway_tui::app::{App, AppEvent, Command, StartPrefs};
 use railway_tui::auth::{token_source_from_env, TokenSource};
 use railway_tui::budget::RateBudget;
 use railway_tui::config::{config_path, load_config, Config};
+use railway_tui::pending::{load_pending, pending_path, Pending};
 use railway_tui::remember::{load_remembered, remembered_path};
 use railway_tui::ui;
 use railway_tui::worker::{run_worker, HTTP_ENDPOINT, WS_ENDPOINT};
@@ -53,21 +54,28 @@ fn run() -> Result<(), String> {
     let tokens = token_source_from_env().map_err(|e| e.to_string())?;
     tokens.token().map_err(|e| e.to_string())?;
     let state_path = remembered_path(xdg("XDG_STATE_HOME").as_deref(), &home);
-    let prefs = start_prefs(&config, &state_path);
+    let pending_file = pending_path(xdg("XDG_STATE_HOME").as_deref(), &home);
+    let prefs = start_prefs(&config, &state_path, &pending_file);
 
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-    let result = runtime.block_on(tui(config, tokens, state_path, prefs));
+    let result = runtime.block_on(tui(config, tokens, state_path, pending_file, prefs));
     runtime.shutdown_timeout(SHUTDOWN_GRACE);
     result
 }
 
-fn start_prefs(config: &Config, state_path: &Path) -> StartPrefs {
+fn start_prefs(config: &Config, state_path: &Path, pending_file: &Path) -> StartPrefs {
+    let (pending, pending_error) = match load_pending(pending_file) {
+        Ok(pending) => (pending, None),
+        Err(e) => (Pending::default(), Some(e)),
+    };
     StartPrefs {
         workspace: config.default_workspace.clone(),
         project: config.default_project.clone(),
         environment: config.default_environment.clone(),
         theme: config.theme.clone(),
         remembered: load_remembered(state_path),
+        pending,
+        pending_error,
     }
 }
 
@@ -75,6 +83,7 @@ async fn tui(
     config: Config,
     tokens: Arc<dyn TokenSource>,
     state_path: PathBuf,
+    pending_file: PathBuf,
     prefs: StartPrefs,
 ) -> Result<(), String> {
     let http = Url::parse(HTTP_ENDPOINT).expect("valid endpoint");
@@ -88,6 +97,7 @@ async fn tui(
         ws,
         tokens,
         state_path,
+        pending_file,
         config.refresh_interval_secs,
         cmd_rx,
         event_tx,

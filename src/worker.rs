@@ -21,6 +21,7 @@ use crate::app::{AppEvent, Command, DataEvent};
 use crate::auth::TokenSource;
 use crate::budget::{backstop_interval, RateBudget};
 use crate::logs::follow::{follow_logs, FollowEvent, LogSource, RailwayLogSource, StreamState};
+use crate::pending::save_pending;
 use crate::remember::save_remembered;
 
 /// Railway's public GraphQL API over HTTP.
@@ -33,11 +34,13 @@ const DEPLOYMENT_HISTORY: i64 = 50;
 /// Buffer between one log follower and its forwarding loop.
 const FOLLOW_BUFFER: usize = 64;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_worker(
     api: Arc<Api>,
     ws: Url,
     tokens: Arc<dyn TokenSource>,
     remembered_path: PathBuf,
+    pending_path: PathBuf,
     configured_interval: Option<u64>,
     mut cmds: mpsc::Receiver<Command>,
     events: mpsc::Sender<AppEvent>,
@@ -47,6 +50,7 @@ pub async fn run_worker(
         ws,
         tokens,
         remembered_path,
+        pending_path,
         configured_interval,
         events,
         followers: HashMap::new(),
@@ -99,6 +103,7 @@ struct Worker {
     ws: Url,
     tokens: Arc<dyn TokenSource>,
     remembered_path: PathBuf,
+    pending_path: PathBuf,
     configured_interval: Option<u64>,
     events: mpsc::Sender<AppEvent>,
     followers: HashMap<u64, JoinHandle<()>>,
@@ -152,6 +157,38 @@ impl Worker {
                     env_id,
                     result,
                 })
+            }
+            Command::LoadVariables {
+                project_id,
+                env_id,
+                service_id,
+            } => {
+                let (e, s) = (env_id.clone(), service_id.clone());
+                self.load(
+                    async move { api.variables(&project_id, &e, &s).await },
+                    |result| DataEvent::Variables {
+                        env_id,
+                        service_id,
+                        result,
+                    },
+                )
+            }
+            Command::SavePending(pending) => {
+                let path = self.pending_path.clone();
+                let events = self.events.clone();
+                tokio::spawn(async move {
+                    let saved =
+                        tokio::task::spawn_blocking(move || save_pending(&path, &pending)).await;
+                    // The message names the failure, never a value.
+                    let failure = match saved {
+                        Ok(Ok(())) => return,
+                        Ok(Err(e)) => format!("could not save pending changes: {e}"),
+                        Err(_) => "could not save pending changes".to_string(),
+                    };
+                    let _ = events
+                        .send(AppEvent::Data(DataEvent::SaveFailed(failure)))
+                        .await;
+                });
             }
             Command::WatchDeployments { ids } => self.watch(ids),
             Command::OpenLogs {
@@ -506,6 +543,7 @@ mod tests {
                 ws,
                 tokens,
                 state_dir.path().join("state.toml"),
+                state_dir.path().join("pending.toml"),
                 configured_interval,
                 cmd_rx,
                 ev_tx,
@@ -551,6 +589,7 @@ mod tests {
             api,
             ws,
             tokens,
+            PathBuf::from("unused"),
             PathBuf::from("unused"),
             Some(42),
             cmd_rx,
@@ -683,6 +722,54 @@ mod tests {
         while load_remembered(&path) != r {
             assert!(Instant::now() < deadline, "state file never written");
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_pending_save_reports_without_values() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let tokens: Arc<dyn TokenSource> = Arc::new(EnvTokenSource("t".into()));
+        let budget = Arc::new(Mutex::new(RateBudget::new(None)));
+        let api = Arc::new(Api::new(
+            Url::parse("http://127.0.0.1:1/").unwrap(),
+            tokens.clone(),
+            budget,
+        ));
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let dir = tempfile::tempdir().unwrap();
+        // A file where the directory should be makes the save fail.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        tokio::spawn(run_worker(
+            api,
+            Url::parse("ws://127.0.0.1:1/").unwrap(),
+            tokens,
+            PathBuf::from("unused"),
+            blocker.join("pending.toml"),
+            None,
+            cmd_rx,
+            tx,
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(AppEvent::Data(DataEvent::Budget { .. }))
+        ));
+        let target = crate::pending::Target {
+            project_id: "p",
+            env_id: "e",
+            env_name: "prod",
+            service_id: "s",
+            service_name: "svc",
+        };
+        let mut pending = crate::pending::Pending::default();
+        pending.set(&target, "KEY", "s3cret-value".into(), None);
+        cmd_tx.send(Command::SavePending(pending)).await.unwrap();
+        match rx.recv().await {
+            Some(AppEvent::Data(DataEvent::SaveFailed(m))) => {
+                assert!(m.starts_with("could not save pending changes"), "{m}");
+                assert!(!m.contains("s3cret-value"));
+            }
+            other => panic!("expected SaveFailed, got {other:?}"),
         }
     }
 }
