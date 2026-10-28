@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use url::Url;
 
 use crate::api::subscribe::{build_logs_stream, connect_authed, deployment_logs_stream};
-use crate::api::{Api, ApiError};
+use crate::api::{Api, ApiError, BuildSnapshot};
 use crate::auth::TokenSource;
 use crate::model::{LogKind, LogLine};
 
@@ -24,6 +24,8 @@ const HEALTHY_AFTER: Duration = Duration::from_secs(30);
 pub const GAP_MARKER: &str = "[railway-tui] some log lines may be missing here";
 /// Attribute that identifies the gap marker line, so filters never hide it.
 pub const GAP_ATTR: (&str, &str) = ("railway-tui", "gap");
+/// Shown in place of build logs for a deployment that had no build.
+pub const NO_BUILD_LOGS: &str = "[railway-tui] no build logs for this deployment (image-based)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamState {
@@ -59,12 +61,46 @@ pub trait LogSource: Send + Sync {
 }
 
 pub struct RailwayLogSource {
-    pub api: Arc<Api>,
-    pub ws: Url,
-    pub tokens: Arc<dyn TokenSource>,
-    pub env_id: String,
-    pub deployment_id: String,
-    pub kind: LogKind,
+    api: Arc<Api>,
+    ws: Url,
+    tokens: Arc<dyn TokenSource>,
+    env_id: String,
+    deployment_id: String,
+    kind: LogKind,
+    /// A deployment's build snapshot never changes, so reconnects reuse it.
+    snapshot: tokio::sync::OnceCell<BuildSnapshot>,
+}
+
+impl RailwayLogSource {
+    pub fn new(
+        api: Arc<Api>,
+        ws: Url,
+        tokens: Arc<dyn TokenSource>,
+        env_id: String,
+        deployment_id: String,
+        kind: LogKind,
+    ) -> Self {
+        Self {
+            api,
+            ws,
+            tokens,
+            env_id,
+            deployment_id,
+            kind,
+            snapshot: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// The build snapshot, looked up until it is found and cached from then on.
+    /// `None` (no build yet, or an image-based deployment) is not cached.
+    async fn snapshot(&self) -> Result<Option<&BuildSnapshot>, ApiError> {
+        if self.snapshot.get().is_none() {
+            if let Some(found) = self.api.build_snapshot(&self.deployment_id).await? {
+                let _ = self.snapshot.set(found);
+            }
+        }
+        Ok(self.snapshot.get())
+    }
 }
 
 impl LogSource for RailwayLogSource {
@@ -75,11 +111,14 @@ impl LogSource for RailwayLogSource {
                     .deployment_logs(&self.deployment_id, since, HISTORY_LIMIT)
                     .await
             }
-            LogKind::Build => {
-                self.api
-                    .build_logs(&self.env_id, &self.deployment_id, since, HISTORY_LIMIT)
-                    .await
-            }
+            LogKind::Build => match self.snapshot().await? {
+                Some(snapshot) => {
+                    self.api
+                        .snapshot_logs(&self.env_id, snapshot, since, HISTORY_LIMIT)
+                        .await
+                }
+                None => Ok(Vec::new()),
+            },
         }
     }
 
@@ -92,15 +131,22 @@ impl LogSource for RailwayLogSource {
                 Ok(deployment_logs_stream(&client, &self.deployment_id))
             }
             LogKind::Build => {
-                // No snapshot means no build, so there is nothing to stream.
-                let Some(snapshot_id) = self.api.snapshot_id(&self.deployment_id).await? else {
-                    return Ok(futures::stream::pending().boxed());
+                // No snapshot means no build: say so, then there is nothing to stream.
+                let Some(snapshot) = self.snapshot().await? else {
+                    let note = LogLine {
+                        timestamp: Utc::now(),
+                        message: NO_BUILD_LOGS.to_string(),
+                        attributes: Vec::new(),
+                    };
+                    return Ok(futures::stream::once(async { Ok(vec![note]) })
+                        .chain(futures::stream::pending())
+                        .boxed());
                 };
                 let client = connect_authed(&self.ws, &self.tokens).await?;
                 Ok(build_logs_stream(
                     &client,
                     &self.env_id,
-                    &snapshot_id,
+                    &snapshot.id,
                     Utc::now(),
                 ))
             }
@@ -787,6 +833,100 @@ mod tests {
                 StreamState::Live,
             ]
         );
+    }
+
+    // ---- RailwayLogSource, against a wiremock server (never the live API) ----
+
+    mod railway {
+        use std::sync::Mutex;
+
+        use serde_json::json;
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::*;
+        use crate::auth::EnvTokenSource;
+        use crate::budget::RateBudget;
+
+        fn build_source(server: &MockServer) -> RailwayLogSource {
+            let tokens: Arc<dyn TokenSource> = Arc::new(EnvTokenSource("t".into()));
+            let http = Url::parse(&format!("{}/graphql/v2", server.uri())).unwrap();
+            let ws = Url::parse(&server.uri().replace("http", "ws")).unwrap();
+            let budget = Arc::new(Mutex::new(RateBudget::new(None)));
+            let api = Arc::new(Api::new(http, tokens.clone(), budget));
+            RailwayLogSource::new(
+                api,
+                ws,
+                tokens,
+                "env1".into(),
+                "dep1".into(),
+                LogKind::Build,
+            )
+        }
+
+        async fn snapshot_mock(server: &MockServer, snapshot_id: Option<&str>, times: u64) {
+            Mock::given(method("POST"))
+                .and(body_string_contains("DeploymentSnapshot"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"deployment": {
+                        "snapshotId": snapshot_id,
+                        "createdAt": "2026-10-28T10:00:00Z"
+                    }}
+                })))
+                .expect(times)
+                .named("DeploymentSnapshot")
+                .mount(server)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn build_snapshot_is_looked_up_once_across_reconnects() {
+            let server = MockServer::start().await;
+            snapshot_mock(&server, Some("snap1"), 1).await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("EnvironmentLogs"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"data": {"environmentLogs": []}})),
+                )
+                .mount(&server)
+                .await;
+            let source = build_source(&server);
+
+            // First connection, then a reconnect. The websocket upgrade is
+            // refused by the mock server, which is fine here.
+            source.history(None).await.unwrap();
+            let _ = source.subscribe().await;
+            source.history(Some(Utc::now())).await.unwrap();
+            let _ = source.subscribe().await;
+            // `expect(1)` on the snapshot mock is verified when the server drops.
+        }
+
+        #[tokio::test]
+        async fn image_based_deployment_says_it_has_no_build_logs() {
+            let server = MockServer::start().await;
+            snapshot_mock(&server, None, 2).await;
+            let (tx, mut rx) = mpsc::channel(16);
+            let _h = tokio::spawn(follow_logs(build_source(&server), tx));
+
+            let mut events = Vec::new();
+            while events.len() < 3 {
+                let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .expect("timed out")
+                    .expect("follower ended");
+                events.push(ev);
+            }
+            assert_eq!(events[0], FollowEvent::State(StreamState::Connecting));
+            assert_eq!(events[1], FollowEvent::State(StreamState::Live));
+            match &events[2] {
+                FollowEvent::Lines(lines) => {
+                    assert_eq!(lines.len(), 1);
+                    assert_eq!(lines[0].message, NO_BUILD_LOGS);
+                }
+                other => panic!("expected the explanatory line, got {other:?}"),
+            }
+        }
     }
 
     #[test]

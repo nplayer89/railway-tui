@@ -102,6 +102,13 @@ pub enum ApiError {
     Decode(String),
 }
 
+/// The build snapshot of a deployment; it never changes once it exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildSnapshot {
+    pub id: String,
+    pub deployment_created_at: DateTime<Utc>,
+}
+
 /// Outcome of one HTTP attempt; `Rejected` means the token was refused.
 enum Attempt {
     Rejected,
@@ -308,15 +315,21 @@ impl Api {
     }
 
     /// The snapshot a deployment was built from; build logs are scoped by it.
-    /// `None` when the deployment had no build.
-    pub async fn snapshot_id(&self, deployment_id: &str) -> Result<Option<String>, ApiError> {
-        Ok(self
+    /// `None` when the deployment had no build (an image-based deployment).
+    pub async fn build_snapshot(
+        &self,
+        deployment_id: &str,
+    ) -> Result<Option<BuildSnapshot>, ApiError> {
+        let deployment = self
             .query::<ops::DeploymentSnapshot>(ops::deployment_snapshot::Variables {
                 id: deployment_id.to_string(),
             })
             .await?
-            .deployment
-            .snapshot_id)
+            .deployment;
+        Ok(deployment.snapshot_id.map(|id| BuildSnapshot {
+            id,
+            deployment_created_at: deployment.created_at,
+        }))
     }
 
     /// Build logs, scoped the way the Railway CLI and dashboard do it: by the
@@ -329,22 +342,28 @@ impl Api {
         since: Option<DateTime<Utc>>,
         limit: i64,
     ) -> Result<Vec<LogLine>, ApiError> {
-        let deployment = self
-            .query::<ops::DeploymentSnapshot>(ops::deployment_snapshot::Variables {
-                id: deployment_id.to_string(),
-            })
-            .await?
-            .deployment;
-        let Some(snapshot_id) = deployment.snapshot_id else {
-            return Ok(Vec::new());
-        };
-        let start = since.unwrap_or(deployment.created_at - BUILD_LOG_LEAD);
+        match self.build_snapshot(deployment_id).await? {
+            Some(snapshot) => self.snapshot_logs(env_id, &snapshot, since, limit).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Build logs of a known `snapshot` (see [`Api::build_logs`]).
+    pub async fn snapshot_logs(
+        &self,
+        env_id: &str,
+        snapshot: &BuildSnapshot,
+        since: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<LogLine>, ApiError> {
+        let snapshot_id = &snapshot.id;
+        let start = since.unwrap_or(snapshot.deployment_created_at - BUILD_LOG_LEAD);
         let now = Utc::now();
         let stamp = |d: DateTime<Utc>| d.to_rfc3339_opts(SecondsFormat::Nanos, true);
         let data = self
             .query::<ops::EnvironmentLogs>(ops::environment_logs::Variables {
                 environment_id: env_id.to_string(),
-                filter: build_log_filter(&snapshot_id),
+                filter: build_log_filter(snapshot_id),
                 before_limit: limit,
                 before_date: stamp(start),
                 anchor_date: stamp(now),

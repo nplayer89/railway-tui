@@ -151,14 +151,14 @@ impl Worker {
                 kind,
             } => {
                 self.followers.retain(|_, h| !h.is_finished());
-                let source = RailwayLogSource {
+                let source = RailwayLogSource::new(
                     api,
-                    ws: self.ws.clone(),
-                    tokens: self.tokens.clone(),
+                    self.ws.clone(),
+                    self.tokens.clone(),
                     env_id,
                     deployment_id,
                     kind,
-                };
+                );
                 let handle = spawn_follower(session, source, self.events.clone());
                 if let Some(old) = self.followers.insert(session, handle) {
                     old.abort();
