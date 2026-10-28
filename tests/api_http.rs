@@ -33,7 +33,11 @@ impl TokenSource for FakeTokens {
     fn token(&self) -> Result<String, AuthError> {
         Ok(self.token.clone())
     }
-    fn refresh_after_rejection(&self) -> Result<String, AuthError> {
+    fn refresh_after_rejection_of(&self, rejected_token: &str) -> Result<String, AuthError> {
+        assert_eq!(
+            rejected_token, self.token,
+            "refresh must name the refused token"
+        );
         self.refreshes.fetch_add(1, Ordering::SeqCst);
         Ok(self.refreshed.clone())
     }

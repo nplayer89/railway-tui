@@ -400,7 +400,9 @@ impl Api {
             Err(Attempt::Failed(e)) => return Err(e),
             Err(Attempt::Rejected) => {}
         }
-        let token = self.auth(|t| t.refresh_after_rejection()).await?;
+        let token = self
+            .auth(move |t| t.refresh_after_rejection_of(&token))
+            .await?;
         match self.attempt::<Q>(&body, &token).await {
             Ok(data) => Ok(data),
             Err(Attempt::Failed(e)) => Err(e),

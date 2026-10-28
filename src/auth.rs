@@ -30,8 +30,10 @@ pub enum AuthError {
 
 pub trait TokenSource: Send + Sync {
     fn token(&self) -> Result<String, AuthError>;
-    /// Called after the API returned 401: obtain a fresh token if possible.
-    fn refresh_after_rejection(&self) -> Result<String, AuthError>;
+    /// Called after the API returned 401 for `rejected_token`: obtain a fresh
+    /// token if possible. If another caller has already replaced that token,
+    /// the current one is returned without refreshing again.
+    fn refresh_after_rejection_of(&self, rejected_token: &str) -> Result<String, AuthError>;
 }
 
 /// A static token from `RAILWAY_API_TOKEN`; it cannot be refreshed.
@@ -41,7 +43,7 @@ impl TokenSource for EnvTokenSource {
     fn token(&self) -> Result<String, AuthError> {
         Ok(self.0.clone())
     }
-    fn refresh_after_rejection(&self) -> Result<String, AuthError> {
+    fn refresh_after_rejection_of(&self, _rejected_token: &str) -> Result<String, AuthError> {
         Err(AuthError::Rejected)
     }
 }
@@ -205,18 +207,16 @@ impl<R: CliRunner> TokenSource for CliTokenSource<R> {
         self.whoami_and_reread()
     }
 
-    fn refresh_after_rejection(&self) -> Result<String, AuthError> {
-        // The token the caller just had rejected.
-        let rejected = self.read_creds().ok().map(|c| c.token);
+    fn refresh_after_rejection_of(&self, rejected_token: &str) -> Result<String, AuthError> {
         let _guard = self.lock();
-        // Another caller may have refreshed while we waited for the lock.
+        // Another caller may already have replaced the rejected token.
         if let Ok(creds) = self.read_creds() {
-            if Some(&creds.token) != rejected.as_ref() && !self.is_expired(&creds) {
+            if creds.token != rejected_token && !self.is_expired(&creds) {
                 return Ok(creds.token);
             }
         }
         let token = self.whoami_and_reread()?;
-        if Some(&token) == rejected.as_ref() {
+        if token == rejected_token {
             // The CLI only refreshes expired tokens, so this one was revoked server-side.
             return Err(AuthError::Rejected);
         }
@@ -410,7 +410,7 @@ mod tests {
         let content = cfg(Some("acc"), Some(NOW - 10), None);
         let (d, s, _) = source(Some(&content), None, false);
         let _ = s.token();
-        let _ = s.refresh_after_rejection();
+        let _ = s.refresh_after_rejection_of("acc");
         let after = std::fs::read(d.path().join("config.json")).unwrap();
         assert_eq!(after, content.as_bytes());
     }
@@ -423,7 +423,7 @@ mod tests {
             Some(new),
             false,
         );
-        assert_eq!(s.refresh_after_rejection().unwrap(), "new");
+        assert_eq!(s.refresh_after_rejection_of("old").unwrap(), "new");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -440,7 +440,7 @@ mod tests {
         let handles: Vec<_> = (0..2)
             .map(|_| {
                 let s = s.clone();
-                std::thread::spawn(move || s.refresh_after_rejection())
+                std::thread::spawn(move || s.refresh_after_rejection_of("old"))
             })
             .collect();
         for h in handles {
@@ -472,9 +472,25 @@ mod tests {
     }
 
     #[test]
+    fn late_rejection_of_an_already_replaced_token_does_not_refresh_again() {
+        let new = cfg(Some("new"), Some(NOW + 3600), None);
+        let (_d, s, calls) = source(
+            Some(&cfg(Some("old"), Some(NOW + 3600), None)),
+            Some(new),
+            false,
+        );
+        // A's request with "old" was refused; A refreshes.
+        assert_eq!(s.refresh_after_rejection_of("old").unwrap(), "new");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // B's request, also sent with "old", is refused only now.
+        assert_eq!(s.refresh_after_rejection_of("old").unwrap(), "new");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn unchanged_token_after_rejection_is_rejected() {
         let (_d, s, calls) = source(Some(&cfg(Some("acc"), Some(NOW + 3600), None)), None, false);
-        let err = s.refresh_after_rejection().unwrap_err();
+        let err = s.refresh_after_rejection_of("acc").unwrap_err();
         assert!(matches!(err, AuthError::Rejected));
         assert!(err.to_string().contains("railway login"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -485,7 +501,7 @@ mod tests {
         let s = EnvTokenSource("t".into());
         assert_eq!(s.token().unwrap(), "t");
         assert!(matches!(
-            s.refresh_after_rejection(),
+            s.refresh_after_rejection_of("t"),
             Err(AuthError::Rejected)
         ));
     }

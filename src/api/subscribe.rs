@@ -126,7 +126,7 @@ pub async fn connect_authed(ws: &Url, tokens: &Arc<dyn TokenSource>) -> Result<C
         Err(ApiError::Auth(AuthError::Rejected)) => {}
         other => return other,
     }
-    let token = blocking_token(tokens, |t| t.refresh_after_rejection()).await?;
+    let token = blocking_token(tokens, move |t| t.refresh_after_rejection_of(&token)).await?;
     connect(ws, &token).await
 }
 
