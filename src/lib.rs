@@ -4,6 +4,7 @@ pub mod api;
 pub mod auth;
 pub mod budget;
 pub mod config;
+pub mod logs;
 pub mod model;
 pub mod remember;
 pub mod status;
