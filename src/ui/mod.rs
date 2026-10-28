@@ -4,6 +4,7 @@ mod logs;
 mod tables;
 #[cfg(test)]
 mod tests;
+mod vars;
 
 use std::time::Instant;
 
@@ -38,6 +39,11 @@ fn clean(s: &str) -> String {
         .collect()
 }
 
+/// Whether an environment name looks like production (case-insensitive `prod` anywhere).
+pub fn is_production(env_name: &str) -> bool {
+    env_name.to_lowercase().contains("prod")
+}
+
 pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
     let t = app.theme();
     frame.render_widget(Block::new().style(base(t)), frame.area());
@@ -55,8 +61,7 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
         Some(View::Deployments { .. }) => tables::deployments(frame, body, app, wall),
         Some(View::Instances { .. }) => tables::instances(frame, body, app),
         Some(View::Logs(l)) => logs::draw(frame, body, l, t),
-        // Drawn by a later task.
-        Some(View::Variables(_)) => {}
+        Some(View::Variables(v)) => vars::draw(frame, body, app, v),
         Some(View::Projects) | None => tables::projects(frame, body, app),
     }
     draw_footer(frame, foot, app);
@@ -75,7 +80,7 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
 fn hints(app: &App) -> &'static str {
     match app.stack.last() {
         Some(View::Services) => {
-            "<e> env  <l> logs  <i> instances  <enter> deploys  </> filter  <?> help"
+            "<e> env  <l> logs  <i> instances  <v> vars  <enter> deploys  </> filter  <?> help"
         }
         Some(View::Deployments { .. }) | Some(View::Instances { .. }) => {
             "<enter> logs  </> filter  <esc> back  <?> help"
@@ -153,6 +158,16 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
             (None, None, false) => spans.push(Span::styled("not loaded", dim)),
         }
     }
+    let pending = app
+        .project
+        .as_ref()
+        .map_or(0, |p| app.pending.count_for_project(&p.id));
+    if pending > 0 {
+        spans.push(Span::styled(
+            format!("  {pending} pending"),
+            Style::new().fg(t.busy),
+        ));
+    }
     if !app.live_updates {
         spans.push(Span::styled("  live updates off", Style::new().fg(t.busy)));
     }
@@ -168,6 +183,14 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let t = app.theme();
+    if let Some(input) = &app.var_input {
+        let line = match &input.name {
+            None => format!("name: {}▏", clean(&input.text)),
+            Some(name) => format!("{} = {}▏", clean(name), clean(&input.text)),
+        };
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
     if let Some(text) = &app.command_line {
         frame.render_widget(Paragraph::new(format!(":{}▏", clean(text))), area);
         return;

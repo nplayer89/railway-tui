@@ -666,3 +666,186 @@ fn selected_rows_are_readable_in_every_theme() {
         assert_readable(&buf, y);
     }
 }
+
+fn vars_app(env: &str, vars: &[(&str, &str)]) -> App {
+    let mut app = services_app(vec![service(
+        "api",
+        deploy("d", DeploymentStatus::Success, &[InstanceStatus::Running]),
+        vec![],
+    )]);
+    app.services.value.as_mut().unwrap()[0].service_id = "svc-1".into();
+    app.project = Some(crate::model::ProjectRef {
+        id: "p1".into(),
+        name: "proj".into(),
+    });
+    app.environment = Some(crate::model::Environment {
+        id: "e1".into(),
+        name: env.into(),
+    });
+    app.stack = vec![
+        View::Projects,
+        View::Services,
+        View::Variables(crate::app::VarsView {
+            service_id: "svc-1".into(),
+            revealed: Default::default(),
+            reveal_all: false,
+        }),
+    ];
+    app.variables.value = Some(
+        vars.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    );
+    app.variables.fetched_at = Some(Instant::now());
+    app
+}
+
+fn press(app: &mut App, c: char) {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    app.update(
+        crate::app::AppEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+        Instant::now(),
+    );
+}
+
+fn add_pending(app: &mut App, name: &str, change: crate::pending::Change, base: Option<&str>) {
+    let sp = app
+        .pending
+        .envs
+        .entry("e1".into())
+        .or_default()
+        .entry("svc-1".into())
+        .or_default();
+    sp.project_id = "p1".into();
+    sp.vars.insert(
+        name.into(),
+        crate::pending::PendingVar {
+            change,
+            base: base.map(Into::into),
+            applied: false,
+        },
+    );
+}
+
+#[test]
+fn values_hidden_until_revealed() {
+    let mut app = vars_app("staging", &[("KEY", "s3cret")]);
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("••••••"), "{t}");
+    assert!(!t.contains("s3cret"), "{t}");
+    assert!(t.contains("api · variables · ENV staging"), "{t}");
+    press(&mut app, 'r');
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("s3cret"), "{t}");
+}
+
+#[test]
+fn revealed_value_strips_escapes() {
+    let mut app = vars_app("staging", &[("KEY", "a\x1b[31mb")]);
+    press(&mut app, 'R');
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("a[31mb"), "{t}");
+    assert!(!t.contains('\x1b'));
+}
+
+#[test]
+fn multiline_value_shows_first_line_and_ellipsis() {
+    let mut app = vars_app("staging", &[("KEY", "line1\nline2")]);
+    press(&mut app, 'R');
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("line1…"), "{t}");
+    assert!(!t.contains("line2"), "{t}");
+}
+
+#[test]
+fn production_env_title_is_bad_colour() {
+    let app = vars_app("production", &[("KEY", "v")]);
+    let buf = render(&app, Instant::now());
+    let y = (0..30)
+        .find(|y| row_text(&buf, *y).contains("· variables ·"))
+        .unwrap();
+    let x = row_text(&buf, y).find("production").unwrap() as u16;
+    assert_eq!(buf[(x, y)].fg, T.bad);
+    let app = vars_app("staging", &[("KEY", "v")]);
+    let buf = render(&app, Instant::now());
+    let x = row_text(&buf, y).find("staging").unwrap() as u16;
+    assert_eq!(buf[(x, y)].fg, T.accent);
+}
+
+#[test]
+fn is_production_matches_prod_names() {
+    assert!(super::is_production("production"));
+    assert!(super::is_production("Prod-eu"));
+    assert!(!super::is_production("staging"));
+}
+
+#[test]
+fn markers_and_strikethrough() {
+    use crate::pending::Change;
+    let mut app = vars_app("staging", &[("CHG", "old"), ("DEL", "gone"), ("SAME", "x")]);
+    add_pending(&mut app, "ADD", Change::Set { value: "n".into() }, None);
+    add_pending(
+        &mut app,
+        "CHG",
+        Change::Set {
+            value: "new".into(),
+        },
+        Some("old"),
+    );
+    add_pending(&mut app, "DEL", Change::Delete, Some("gone"));
+    if let Some(View::Variables(v)) = app.stack.last_mut() {
+        v.reveal_all = true;
+    }
+    let buf = render(&app, Instant::now());
+    let find_row = |name: &str| {
+        (0..30)
+            .find(|y| row_text(&buf, *y).contains(name))
+            .unwrap_or_else(|| panic!("no row {name}\n{}", text(&buf)))
+    };
+    let marker = |name: &str| row_text(&buf, find_row(name)).chars().next().unwrap();
+    assert_eq!(marker("ADD"), '+');
+    assert_eq!(marker("CHG"), '~');
+    assert_eq!(marker("DEL"), '-');
+    assert_eq!(marker("SAME"), ' ');
+    let chg = row_text(&buf, find_row("CHG"));
+    assert!(chg.contains("new") && !chg.contains("old"), "{chg}");
+    let y = find_row("DEL");
+    let x = row_text(&buf, y).find("DEL").unwrap() as u16;
+    assert!(buf[(x, y)]
+        .modifier
+        .contains(ratatui::style::Modifier::CROSSED_OUT));
+    let y = find_row("SAME");
+    let x = row_text(&buf, y).find("SAME").unwrap() as u16;
+    assert!(!buf[(x, y)]
+        .modifier
+        .contains(ratatui::style::Modifier::CROSSED_OUT));
+}
+
+#[test]
+fn header_shows_pending_count() {
+    use crate::pending::Change;
+    let mut app = vars_app("staging", &[("A", "1")]);
+    assert!(!text(&render(&app, Instant::now())).contains("pending"));
+    add_pending(&mut app, "A", Change::Delete, Some("1"));
+    add_pending(&mut app, "B", Change::Set { value: "2".into() }, None);
+    let buf = render(&app, Instant::now());
+    let line = row_text(&buf, 1);
+    assert!(line.contains("2 pending"), "{line}");
+    let x = line.find("2 pending").unwrap() as u16;
+    assert_eq!(buf[(x, 1)].fg, T.busy);
+}
+
+#[test]
+fn footer_shows_variable_input() {
+    let mut app = vars_app("staging", &[("A", "1")]);
+    app.var_input = Some(crate::app::VarInput {
+        name: None,
+        text: "NEW".into(),
+    });
+    assert!(row_text(&render(&app, Instant::now()), 29).contains("name: NEW▏"));
+    app.var_input = Some(crate::app::VarInput {
+        name: Some("A".into()),
+        text: "val".into(),
+    });
+    assert!(row_text(&render(&app, Instant::now()), 29).contains("A = val▏"));
+}
