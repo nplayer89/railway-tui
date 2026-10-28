@@ -16,6 +16,8 @@ use crate::model::{
     ProjectRef, ServiceInstance, Workspace,
 };
 
+pub mod subscribe;
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Build events can be timestamped just before the deployment is created (CLI behaviour).
 const BUILD_LOG_LEAD: chrono::Duration = chrono::Duration::minutes(5);
@@ -301,6 +303,18 @@ impl Api {
             .collect()
     }
 
+    /// The snapshot a deployment was built from; build logs are scoped by it.
+    /// `None` when the deployment had no build.
+    pub async fn snapshot_id(&self, deployment_id: &str) -> Result<Option<String>, ApiError> {
+        Ok(self
+            .query::<ops::DeploymentSnapshot>(ops::deployment_snapshot::Variables {
+                id: deployment_id.to_string(),
+            })
+            .await?
+            .deployment
+            .snapshot_id)
+    }
+
     /// Build logs, scoped the way the Railway CLI and dashboard do it: by the
     /// deployment's snapshot id via `environmentLogs`. A deployment without a
     /// snapshot (no build) has no build logs.
@@ -326,7 +340,7 @@ impl Api {
         let data = self
             .query::<ops::EnvironmentLogs>(ops::environment_logs::Variables {
                 environment_id: env_id.to_string(),
-                filter: format!("(@snapshot:{snapshot_id} OR @replica:{snapshot_id})"),
+                filter: build_log_filter(&snapshot_id),
                 before_limit: limit,
                 before_date: stamp(start),
                 anchor_date: stamp(now),
@@ -371,16 +385,11 @@ impl Api {
         }
     }
 
-    /// Token calls may run a subprocess, so they go to the blocking pool.
     async fn auth<F>(&self, f: F) -> Result<String, ApiError>
     where
         F: FnOnce(&dyn TokenSource) -> Result<String, AuthError> + Send + 'static,
     {
-        let tokens = self.tokens.clone();
-        tokio::task::spawn_blocking(move || f(tokens.as_ref()))
-            .await
-            .map_err(|e| ApiError::Auth(AuthError::Io(e.to_string())))?
-            .map_err(ApiError::Auth)
+        blocking_token(&self.tokens, f).await
     }
 
     async fn attempt<Q: GraphQLQuery>(
@@ -432,6 +441,23 @@ impl Api {
             .data
             .ok_or_else(|| Attempt::Failed(ApiError::Decode("response has no data".into())))
     }
+}
+
+/// Token calls may run a subprocess, so they go to the blocking pool.
+async fn blocking_token<F>(tokens: &Arc<dyn TokenSource>, f: F) -> Result<String, ApiError>
+where
+    F: FnOnce(&dyn TokenSource) -> Result<String, AuthError> + Send + 'static,
+{
+    let tokens = tokens.clone();
+    tokio::task::spawn_blocking(move || f(tokens.as_ref()))
+        .await
+        .map_err(|e| ApiError::Auth(AuthError::Io(e.to_string())))?
+        .map_err(ApiError::Auth)
+}
+
+/// Scopes `environmentLogs` to one build, as the CLI and dashboard do.
+fn build_log_filter(snapshot_id: &str) -> String {
+    format!("(@snapshot:{snapshot_id} OR @replica:{snapshot_id})")
 }
 
 /// The raw API spelling of a generated enum value, including its `Other(raw)` variant.
