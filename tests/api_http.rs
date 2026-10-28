@@ -262,6 +262,24 @@ async fn http_429_without_retry_after_defaults_to_60s() {
         matches!(err, ApiError::RateLimited { retry_after } if retry_after == Duration::from_secs(60)),
         "{err:?}"
     );
+    assert!(api.budget().lock().unwrap().blocked_until().is_some());
+}
+
+#[tokio::test]
+async fn http_429_with_huge_retry_after_is_clamped() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "999999999"))
+        .mount(&server)
+        .await;
+    let api = api_for(&server, FakeTokens::new("tok", "tok2"));
+
+    let err = api.service_instances("proj1", "env1").await.unwrap_err();
+
+    assert!(
+        matches!(err, ApiError::RateLimited { retry_after } if retry_after <= Duration::from_secs(3600)),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]

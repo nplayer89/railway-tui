@@ -9,6 +9,9 @@ pub const DEFAULT_HOURLY_LIMIT: u32 = 100;
 /// Longest block honoured from a server-supplied Retry-After.
 const MAX_BLOCK_SECS: u64 = 3600;
 
+/// How long to back off after a 429 that carries no Retry-After.
+const DEFAULT_RATE_LIMIT_BLOCK: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitSource {
     Default,
@@ -42,11 +45,21 @@ impl RateBudget {
         {
             self.remaining = Some(rem);
         }
-        // Only the seconds form of Retry-After is understood; an HTTP-date is ignored.
-        if let Some(secs) = header_str(headers, "retry-after").and_then(|s| s.parse::<u64>().ok()) {
-            let block = Duration::from_secs(secs.min(MAX_BLOCK_SECS));
-            self.blocked_until = now.checked_add(block);
+        if let Some(retry_after) = parse_retry_after(headers) {
+            self.block_for(retry_after, now);
         }
+    }
+
+    /// Records an HTTP 429 and returns how long to wait: `retry_after` (from
+    /// [`parse_retry_after`]) or 60s when absent, clamped to the maximum block.
+    pub fn on_rate_limited(&mut self, retry_after: Option<Duration>, now: Instant) -> Duration {
+        self.block_for(retry_after.unwrap_or(DEFAULT_RATE_LIMIT_BLOCK), now)
+    }
+
+    fn block_for(&mut self, wait: Duration, now: Instant) -> Duration {
+        let block = wait.min(Duration::from_secs(MAX_BLOCK_SECS));
+        self.blocked_until = now.checked_add(block);
+        block
     }
 
     pub fn hourly_limit(&self) -> (u32, LimitSource) {
@@ -66,6 +79,13 @@ impl RateBudget {
     pub fn blocked_until(&self) -> Option<Instant> {
         self.blocked_until
     }
+}
+
+/// The seconds form of `Retry-After`; an HTTP-date is ignored.
+pub fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    header_str(headers, "retry-after")
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -168,6 +188,32 @@ mod tests {
         assert_eq!(b.blocked_until(), Some(now + Duration::from_secs(30)));
         b.observe(&HeaderMap::new(), now);
         assert_eq!(b.blocked_until(), Some(now + Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn rate_limited_defaults_to_60s_and_blocks() {
+        let now = Instant::now();
+        let mut b = RateBudget::new(None);
+        assert_eq!(b.on_rate_limited(None, now), Duration::from_secs(60));
+        assert_eq!(b.blocked_until(), Some(now + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn rate_limited_clamps_huge_retry_after() {
+        let now = Instant::now();
+        let mut b = RateBudget::new(None);
+        let d = b.on_rate_limited(Some(Duration::from_secs(999_999_999)), now);
+        assert_eq!(d, Duration::from_secs(3600));
+        assert_eq!(b.blocked_until(), Some(now + d));
+    }
+
+    #[test]
+    fn rate_limited_uses_given_retry_after() {
+        let now = Instant::now();
+        let mut b = RateBudget::new(None);
+        let d = b.on_rate_limited(Some(Duration::from_secs(30)), now);
+        assert_eq!(d, Duration::from_secs(30));
+        assert_eq!(b.blocked_until(), Some(now + d));
     }
 
     #[test]

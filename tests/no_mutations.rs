@@ -26,9 +26,10 @@ fn graphql_files_contain_no_mutations() {
     for file in files {
         let text = fs::read_to_string(&file).unwrap();
         for (i, line) in text.lines().enumerate() {
-            let is_mutation = line.trim_start().strip_prefix("mutation").is_some_and(|rest| {
-                !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_')
-            });
+            let is_mutation = line
+                .trim_start()
+                .strip_prefix("mutation")
+                .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'));
             assert!(
                 !is_mutation,
                 "mutation found in {}:{}: {}",

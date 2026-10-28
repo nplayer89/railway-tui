@@ -10,13 +10,12 @@ use serde::Serialize;
 use url::Url;
 
 use crate::auth::{AuthError, TokenSource};
-use crate::budget::RateBudget;
+use crate::budget::{parse_retry_after, RateBudget};
 use crate::model::{
     DeploymentStatus, DeploymentSummary, Environment, Instance, InstanceStatus, LogLine,
     ProjectRef, ServiceInstance, Workspace,
 };
 
-const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Build events can be timestamped just before the deployment is created (CLI behaviour).
 const BUILD_LOG_LEAD: chrono::Duration = chrono::Duration::minutes(5);
@@ -123,7 +122,7 @@ impl Api {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
-            .unwrap_or_default();
+            .expect("reqwest client with a timeout builds");
         Self {
             http,
             endpoint,
@@ -397,21 +396,16 @@ impl Api {
             .send()
             .await
             .map_err(|e| Attempt::Failed(ApiError::Network(e.to_string())))?;
-        self.budget
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .observe(resp.headers(), Instant::now());
-
         let status = resp.status();
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = resp
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .map(Duration::from_secs)
-                .unwrap_or(DEFAULT_RETRY_AFTER);
-            return Err(Attempt::Failed(ApiError::RateLimited { retry_after }));
+        {
+            let mut budget = self.budget.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            budget.observe(resp.headers(), now);
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                // The budget owns the default and the clamp, so the gate and the error agree.
+                let retry_after = budget.on_rate_limited(parse_retry_after(resp.headers()), now);
+                return Err(Attempt::Failed(ApiError::RateLimited { retry_after }));
+            }
         }
         if status == StatusCode::UNAUTHORIZED {
             return Err(Attempt::Rejected);
