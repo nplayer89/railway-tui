@@ -58,7 +58,7 @@ On launch it reopens the last-used project and environment.
 | `b` | switch between build and runtime logs (Logs) |
 | `f`, `G` | resume following the log (Logs) |
 | `PageUp` / `PageDown` | scroll the log by a page (Logs) |
-| `ctrl-r` | reload |
+| `ctrl-r` | reload (in the log view: reconnect the stream) |
 | `?` | toggle the help overlay |
 | `q`, `ctrl-c` | quit |
 

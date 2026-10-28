@@ -539,7 +539,8 @@ impl App {
         }
     }
 
-    /// The top view's load command (backstop and Ctrl-R). The log view streams instead.
+    /// The top view's load command (backstop and Ctrl-R). The log view streams
+    /// instead; Ctrl-R there reopens its stream (the backstop skips Logs).
     fn reload_current(&mut self, now: Instant, out: &mut Vec<Command>) {
         match self.kind() {
             Kind::Projects => self.load_workspaces(now, out),
@@ -552,7 +553,7 @@ impl App {
                     self.load_deployments(id, now, out);
                 }
             }
-            Kind::Logs => {}
+            Kind::Logs => self.reopen_logs(None, out),
         }
     }
 
@@ -690,6 +691,17 @@ impl App {
 
     /// `b` in the log view: close the session and reopen with the other log kind.
     fn toggle_log_kind(&mut self, out: &mut Vec<Command>) {
+        let other = match self.logs_mut().map(|l| l.kind) {
+            Some(LogKind::Build) => LogKind::Runtime,
+            Some(LogKind::Runtime) => LogKind::Build,
+            None => return,
+        };
+        self.reopen_logs(Some(other), out);
+    }
+
+    /// Closes the log view's session and opens a new one for the same
+    /// deployment, as `kind` (or the current kind), starting from empty.
+    fn reopen_logs(&mut self, kind: Option<LogKind>, out: &mut Vec<Command>) {
         let Some(env_id) = self.env_id().map(String::from) else {
             return;
         };
@@ -702,10 +714,7 @@ impl App {
             session: logs.session,
         });
         logs.session = session;
-        logs.kind = match logs.kind {
-            LogKind::Build => LogKind::Runtime,
-            LogKind::Runtime => LogKind::Build,
-        };
+        logs.kind = kind.unwrap_or(logs.kind);
         logs.buffer = LogBuffer::new(LOG_CAP);
         logs.follow = true;
         logs.scroll = 0;
@@ -1391,6 +1400,44 @@ mod tests {
             ]
         );
         assert_eq!(logs_view(&app).kind, LogKind::Runtime);
+    }
+
+    #[test]
+    fn ctrl_r_in_logs_reopens_the_same_stream_as_a_new_session() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        app.update(key('l'), now);
+        data(
+            &mut app,
+            log_event(
+                1,
+                FollowEvent::State(StreamState::Failed("Railway rejected".into())),
+            ),
+            now,
+        );
+        let cmds = app.update(ctrl('r'), now);
+        assert_eq!(
+            cmds,
+            vec![
+                Command::CloseLogs { session: 1 },
+                Command::OpenLogs {
+                    session: 2,
+                    env_id: "e-prod".into(),
+                    deployment_id: "d2".into(),
+                    kind: LogKind::Build,
+                },
+            ]
+        );
+        let l = logs_view(&app);
+        assert_eq!((l.session, l.kind), (2, LogKind::Build));
+        assert_eq!(l.state, StreamState::Connecting);
+        // Events for the old session no longer land.
+        data(
+            &mut app,
+            log_event(1, FollowEvent::Lines(vec![line(1, "old")])),
+            now,
+        );
+        assert!(logs_view(&app).buffer.is_empty());
     }
 
     #[test]

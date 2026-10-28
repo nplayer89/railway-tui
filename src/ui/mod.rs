@@ -223,7 +223,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         "l            latest logs   i  instances",
         "b            build/runtime logs",
         "f, G         follow logs",
-        "ctrl-r       reload",
+        "ctrl-r       reload (in logs: reconnect)",
         "?            toggle help",
         "q            quit",
     ];
