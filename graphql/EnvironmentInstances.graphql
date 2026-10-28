@@ -1,0 +1,30 @@
+query EnvironmentInstances($environmentId: String!, $projectId: String!) {
+  environment(id: $environmentId, projectId: $projectId) {
+    serviceInstances {
+      edges {
+        node {
+          serviceId
+          serviceName
+          numReplicas
+          latestDeployment {
+            ...DeploymentFields
+          }
+          activeDeployments {
+            ...DeploymentFields
+          }
+        }
+      }
+    }
+  }
+}
+
+fragment DeploymentFields on Deployment {
+  id
+  status
+  createdAt
+  meta
+  instances {
+    id
+    status
+  }
+}

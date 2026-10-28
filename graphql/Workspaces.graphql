@@ -1,0 +1,24 @@
+query Workspaces {
+  me {
+    workspaces {
+      id
+      name
+      projects {
+        edges {
+          node {
+            id
+            name
+          }
+        }
+      }
+    }
+  }
+  externalWorkspaces {
+    id
+    name
+    projects {
+      id
+      name
+    }
+  }
+}
