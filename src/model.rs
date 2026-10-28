@@ -2,6 +2,9 @@
 
 use chrono::{DateTime, Utc};
 
+/// A service's variables, name to (unrendered) value.
+pub type Variables = std::collections::BTreeMap<String, String>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeploymentStatus {
     Building,

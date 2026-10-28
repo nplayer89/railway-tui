@@ -1,0 +1,13 @@
+query Variables(
+  $projectId: String!
+  $environmentId: String!
+  $serviceId: String
+  $unrendered: Boolean
+) {
+  variables(
+    projectId: $projectId
+    environmentId: $environmentId
+    serviceId: $serviceId
+    unrendered: $unrendered
+  )
+}

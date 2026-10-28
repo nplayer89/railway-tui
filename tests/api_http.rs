@@ -498,3 +498,48 @@ async fn deployment_logs_map_lines() {
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].message, "hello");
 }
+
+#[tokio::test]
+async fn variables_request_is_unrendered_and_parses_map() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"variables": {"A": "1", "REF": "${{Postgres.DATABASE_URL}}"}}
+        })))
+        .mount(&server)
+        .await;
+    let api = api_for(&server, FakeTokens::new("tok", "tok2"));
+
+    let vars = api.variables("p1", "e1", "s1").await.unwrap();
+
+    let mut want = std::collections::BTreeMap::new();
+    want.insert("A".to_string(), "1".to_string());
+    want.insert("REF".to_string(), "${{Postgres.DATABASE_URL}}".to_string());
+    assert_eq!(vars, want);
+    let reqs = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    let v = &body["variables"];
+    assert_eq!(v["unrendered"], json!(true));
+    assert_eq!(v["projectId"], json!("p1"));
+    assert_eq!(v["environmentId"], json!("e1"));
+    assert_eq!(v["serviceId"], json!("s1"));
+}
+
+#[tokio::test]
+async fn variables_error_message_has_no_values() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"data": null, "errors": [{"message": "Problem processing request"}]}),
+        ))
+        .mount(&server)
+        .await;
+    let api = api_for(&server, FakeTokens::new("tok", "tok2"));
+
+    let err = api.variables("p1", "e1", "s1").await.unwrap_err();
+
+    let text = err.to_string();
+    for secret in ["tok", "p1", "e1", "s1"] {
+        assert!(!text.contains(secret), "{text}");
+    }
+}

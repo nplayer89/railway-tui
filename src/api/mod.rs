@@ -13,7 +13,7 @@ use crate::auth::{AuthError, TokenSource};
 use crate::budget::{parse_retry_after, RateBudget};
 use crate::model::{
     DeploymentStatus, DeploymentSummary, Environment, Instance, InstanceStatus, LogLine,
-    ProjectRef, ServiceInstance, Workspace,
+    ProjectRef, ServiceInstance, Variables, Workspace,
 };
 
 pub mod subscribe;
@@ -28,6 +28,15 @@ mod ops {
     // Custom scalars referenced by the queries below.
     type DateTime = chrono::DateTime<chrono::Utc>;
     type DeploymentMeta = serde_json::Value;
+    type EnvironmentVariables = crate::model::Variables;
+
+    #[derive(GraphQLQuery)]
+    #[graphql(
+        schema_path = "graphql/schema.json",
+        query_path = "graphql/Variables.graphql",
+        response_derives = "Debug"
+    )]
+    pub struct Variables;
 
     #[derive(GraphQLQuery)]
     #[graphql(
@@ -204,6 +213,24 @@ impl Api {
                 name: e.node.name,
             })
             .collect())
+    }
+
+    /// A service's variables, unrendered (references like `${{X.Y}}` kept as written).
+    pub async fn variables(
+        &self,
+        project_id: &str,
+        env_id: &str,
+        service_id: &str,
+    ) -> Result<Variables, ApiError> {
+        let data = self
+            .query::<ops::Variables>(ops::variables::Variables {
+                project_id: project_id.to_string(),
+                environment_id: env_id.to_string(),
+                service_id: Some(service_id.to_string()),
+                unrendered: Some(true),
+            })
+            .await?;
+        Ok(data.variables)
     }
 
     pub async fn service_instances(
