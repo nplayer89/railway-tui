@@ -4,12 +4,13 @@ mod logs;
 mod tables;
 #[cfg(test)]
 mod tests;
+mod theme;
 
 use std::time::Instant;
 
 use chrono::Utc;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
@@ -17,15 +18,12 @@ use ratatui::Frame;
 use crate::app::{App, Loaded, View};
 use crate::status::BoxColour;
 
-/// Selection background; no foreground colour used anywhere may equal it.
-const SELECT_BG: Color = Color::Indexed(236);
-
 fn box_style(c: &BoxColour) -> Style {
     Style::new().fg(match c {
-        BoxColour::Green => Color::Green,
-        BoxColour::Red => Color::Red,
-        BoxColour::Yellow => Color::Yellow,
-        BoxColour::Grey => Color::Gray,
+        BoxColour::Green => theme::OK,
+        BoxColour::Red => theme::BAD,
+        BoxColour::Yellow => theme::BUSY,
+        BoxColour::Grey => theme::IDLE,
     })
 }
 
@@ -114,22 +112,23 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
         .unwrap_or("-");
     let project = app.project.as_ref().map_or("-", |p| p.name.as_str());
     let env = app.environment.as_ref().map_or("-", |e| e.name.as_str());
-    let dim = Style::new().fg(Color::DarkGray);
+    let dim = Style::new().fg(theme::MUTED);
+    let text = Style::new().fg(theme::TEXT);
     let line1 = Line::from(vec![
         Span::styled("Workspace: ", dim),
-        Span::raw(clean(workspace)),
+        Span::styled(clean(workspace), text),
         Span::styled("  Project: ", dim),
-        Span::raw(clean(project)),
+        Span::styled(clean(project), text),
         Span::styled("  Env: ", dim),
-        Span::raw(clean(env)),
+        Span::styled(clean(env), text),
         Span::raw("    "),
-        Span::styled(hints(app), Style::new().fg(Color::Magenta)),
+        Span::styled(hints(app), Style::new().fg(theme::HINT)),
     ]);
 
     let mut spans: Vec<Span> = Vec::new();
     if let Some((loading, fetched_at, error)) = freshness_source(app) {
         let age = fetched_at.map(|at| now.saturating_duration_since(at).as_secs());
-        let red = Style::new().fg(Color::Red);
+        let red = Style::new().fg(theme::BAD);
         match (error, age, loading) {
             (Some(err), Some(a), _) => spans.push(Span::styled(
                 format!("STALE: {} (last ok {a}s ago)", clean(err)),
@@ -147,14 +146,14 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
     if !app.live_updates {
         spans.push(Span::styled(
             "  live updates off",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme::BUSY),
         ));
     }
     if let Some(until) = app.blocked_until.filter(|u| *u > now) {
         let secs = until.saturating_duration_since(now).as_secs();
         spans.push(Span::styled(
             format!("  rate limited, retrying in {secs}s"),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme::BUSY),
         ));
     }
     frame.render_widget(Paragraph::new(vec![line1, Line::from(spans)]), area);
@@ -184,18 +183,18 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     }
     let mut spans = vec![Span::styled(
         format!(" {} ", crumbs.join(" > ")),
-        Style::new().fg(Color::Black).bg(Color::Blue),
+        Style::new().fg(theme::ON_BADGE).bg(theme::ACCENT),
     )];
     if let Some(filter) = &app.table_filter {
         spans.push(Span::styled(
             format!(" filter: {}", clean(filter)),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme::HINT),
         ));
     }
     if let Some(msg) = &app.message {
         spans.push(Span::styled(
             format!("  {}", clean(msg)),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme::BUSY),
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -245,7 +244,9 @@ fn draw_env_picker(frame: &mut Frame, area: Rect, app: &App, index: usize) {
         .enumerate()
         .map(|(i, e)| {
             let style = if i == index {
-                Style::new().bg(SELECT_BG).add_modifier(Modifier::BOLD)
+                Style::new()
+                    .bg(theme::SELECT_BG)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::new()
             };

@@ -246,13 +246,17 @@ impl App {
             .collect()
     }
 
+    /// Services in alphabetical order (ignoring case), narrowed by the filter.
     pub fn service_rows(&self) -> Vec<&ServiceInstance> {
-        self.services
+        let mut rows: Vec<&ServiceInstance> = self
+            .services
             .value
             .iter()
             .flatten()
             .filter(|s| self.passes_filter(&[&s.service_name]))
-            .collect()
+            .collect();
+        rows.sort_by_cached_key(|s| (s.service_name.to_lowercase(), s.service_id.clone()));
+        rows
     }
 
     /// The Deployments view: failed latest, then active, then history (see `deployment_rows`).
@@ -940,8 +944,14 @@ impl App {
         first
     }
 
+    /// Table filter: the text still being typed after `/` narrows the rows live,
+    /// otherwise the applied filter does.
     fn passes_filter(&self, fields: &[&str]) -> bool {
-        let Some(filter) = self.table_filter.as_deref() else {
+        let typing = self
+            .filter_input
+            .as_deref()
+            .filter(|_| self.kind() != Kind::Logs);
+        let Some(filter) = typing.or(self.table_filter.as_deref()) else {
             return true;
         };
         let needle = filter.to_lowercase();
@@ -1600,6 +1610,43 @@ mod tests {
         assert_eq!(app.selected_index(), Some(0));
         app.update(code(KeyCode::Esc), now);
         assert_eq!(app.table_filter, None);
+        assert!(matches!(app.stack.last(), Some(View::Services)));
+    }
+
+    #[test]
+    fn services_are_listed_alphabetically_ignoring_case() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        let named = |id: &str, name: &str| ServiceInstance {
+            service_name: name.into(),
+            ..service(id, deploy("d", DeploymentStatus::Success), vec![])
+        };
+        let list = vec![named("1", "worker"), named("2", "Api"), named("3", "db")];
+        data(&mut app, services_event("e-prod", Ok(list)), now);
+        let names: Vec<_> = app
+            .service_rows()
+            .iter()
+            .map(|s| s.service_name.clone())
+            .collect();
+        assert_eq!(names, ["Api", "db", "worker"]);
+    }
+
+    #[test]
+    fn table_filter_narrows_rows_while_typing() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        typed(&mut app, "/b", now);
+        assert_eq!(app.filter_input.as_deref(), Some("b"));
+        let ids: Vec<_> = app
+            .service_rows()
+            .iter()
+            .map(|s| s.service_id.clone())
+            .collect();
+        assert_eq!(ids, ["svc-b"]);
+        assert_eq!(app.selected_index(), Some(0));
+        // Esc while typing abandons the search and the full list returns.
+        app.update(code(KeyCode::Esc), now);
+        assert_eq!(app.service_rows().len(), 2);
         assert!(matches!(app.stack.last(), Some(View::Services)));
     }
 

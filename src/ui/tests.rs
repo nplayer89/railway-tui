@@ -6,7 +6,7 @@ use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 use ratatui::Terminal;
 
-use super::draw;
+use super::{draw, theme};
 use crate::app::{App, LogsView, StartPrefs, View};
 use crate::logs::buffer::{LogBuffer, LOG_CAP};
 use crate::logs::follow::StreamState;
@@ -145,8 +145,8 @@ fn services_row_shows_coloured_boxes() {
     let buf = render(&app, Instant::now());
     let cells = find(&buf, "■");
     assert_eq!(cells.len(), 2, "{}", text(&buf));
-    assert_eq!(buf[cells[0]].fg, Color::Green);
-    assert_eq!(buf[cells[1]].fg, Color::Red);
+    assert_eq!(buf[cells[0]].fg, theme::OK);
+    assert_eq!(buf[cells[1]].fg, theme::BAD);
     // Boxes sit in the INSTANCES column, on the service's row.
     let header_y = (0..30)
         .find(|y| row_text(&buf, *y).contains("INSTANCES"))
@@ -168,8 +168,8 @@ fn failed_but_serving_has_striped_marker() {
     let cells = find(&buf, "▚");
     assert_eq!(cells.len(), 2, "{}", text(&buf));
     for c in cells {
-        assert_eq!(buf[c].fg, Color::Red);
-        assert_eq!(buf[c].bg, Color::Green);
+        assert_eq!(buf[c].fg, theme::BAD);
+        assert_eq!(buf[c].bg, theme::OK);
     }
 }
 
@@ -189,15 +189,17 @@ fn row_colours_follow_health() {
     ]);
     app.selection.service = Some("removed-id".into());
     let buf = render(&app, Instant::now());
+    // The name stays in plain text; only the STATUS label carries the health colour.
     let fg_of = |name: &str| {
         let y = (0..30)
             .find(|y| row_text(&buf, *y).trim_start().starts_with(name))
             .unwrap();
-        buf[(0, y)].fg
+        let status_x = row_text(&buf, 2).find("STATUS").unwrap() as u16;
+        (buf[(0, y)].fg, buf[(status_x, y)].fg)
     };
-    assert_eq!(fg_of("healthy"), Color::Green);
-    assert_eq!(fg_of("building"), Color::Yellow);
-    assert_eq!(fg_of("removed"), Color::Gray);
+    assert_eq!(fg_of("healthy"), (theme::TEXT, theme::OK));
+    assert_eq!(fg_of("building"), (theme::TEXT, theme::BUSY));
+    assert_eq!(fg_of("removed"), (theme::TEXT, theme::IDLE));
 }
 
 #[test]
@@ -218,7 +220,7 @@ fn error_shows_stale_marker() {
         .into_iter()
         .find(|(x, y)| row_text(&buf, *y)[*x as usize..].starts_with("STALE: boom"))
         .expect("STALE marker");
-    assert_eq!(buf[at].fg, Color::Red);
+    assert_eq!(buf[at].fg, theme::BAD);
 }
 
 #[test]
@@ -251,8 +253,8 @@ fn reconnecting_banner_visible() {
         .find(|y| row_text(&buf, *y).contains("RECONNECTING"))
         .expect("banner");
     assert!(row_text(&buf, y).contains("RECONNECTING (attempt 3, retry in 4s)"));
-    assert_eq!(buf[(0, y)].bg, Color::Yellow);
-    assert_eq!(buf[(99, y)].bg, Color::Yellow);
+    assert_eq!(buf[(0, y)].bg, theme::BUSY);
+    assert_eq!(buf[(99, y)].bg, theme::BUSY);
 }
 
 #[test]
@@ -262,8 +264,8 @@ fn disconnected_banner_is_red_across_the_width() {
     let y = (0..30)
         .find(|y| row_text(&buf, *y).contains("DISCONNECTED: nope"))
         .unwrap();
-    assert_eq!(buf[(0, y)].bg, Color::Red);
-    assert_eq!(buf[(99, y)].bg, Color::Red);
+    assert_eq!(buf[(0, y)].bg, theme::BAD);
+    assert_eq!(buf[(99, y)].bg, theme::BAD);
 }
 
 #[test]
@@ -276,7 +278,7 @@ fn live_badge_and_follow_state() {
         "{t}"
     );
     let live = find(&buf, "●")[0];
-    assert_eq!(buf[live].fg, Color::Green);
+    assert_eq!(buf[live].fg, theme::OK);
     assert!(t.contains("10:20:00 hi"), "{t}");
     logs_mut(&mut app).follow = false;
     assert!(text(&render(&app, Instant::now())).contains("PAUSED"));
@@ -475,7 +477,7 @@ fn instances_view_lists_columns() {
     assert!(row_text(&buf, y).contains("d1"));
     assert_eq!(
         buf[(row_text(&buf, y).find("CRASHED").unwrap() as u16, y)].fg,
-        Color::Red
+        theme::BAD
     );
 }
 
@@ -532,7 +534,7 @@ fn projects_heading_row_is_styled_and_projects_indented() {
     let h = (0..30)
         .find(|y| row_text(&buf, *y).starts_with("team"))
         .unwrap();
-    assert_eq!(buf[(0, h)].fg, Color::Blue);
+    assert_eq!(buf[(0, h)].fg, theme::ACCENT);
     assert!(row_text(&buf, h + 1).starts_with("  alpha"));
 }
 
