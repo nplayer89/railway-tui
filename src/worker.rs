@@ -21,7 +21,7 @@ use crate::app::{AppEvent, Command, DataEvent};
 use crate::auth::TokenSource;
 use crate::budget::{backstop_interval, RateBudget};
 use crate::logs::follow::{follow_logs, FollowEvent, LogSource, RailwayLogSource, StreamState};
-use crate::pending::save_pending;
+use crate::pending::{save_pending, Pending};
 use crate::remember::save_remembered;
 
 /// Railway's public GraphQL API over HTTP.
@@ -45,12 +45,13 @@ pub async fn run_worker(
     mut cmds: mpsc::Receiver<Command>,
     events: mpsc::Sender<AppEvent>,
 ) {
+    let save_pending = spawn_pending_saver(pending_path, events.clone());
     let mut worker = Worker {
         api,
         ws,
         tokens,
         remembered_path,
-        pending_path,
+        save_pending,
         configured_interval,
         events,
         followers: HashMap::new(),
@@ -98,12 +99,41 @@ pub fn spawn_follower<S: LogSource + 'static>(
     })
 }
 
+/// Saves pending snapshots one at a time, in the order sent, skipping any that a
+/// newer one has already replaced. A failure comes back as `SaveFailed`, with a
+/// message that names the error, never a value.
+fn spawn_pending_saver(
+    path: PathBuf,
+    events: mpsc::Sender<AppEvent>,
+) -> mpsc::UnboundedSender<Pending> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Pending>();
+    tokio::spawn(async move {
+        while let Some(mut latest) = rx.recv().await {
+            while let Ok(newer) = rx.try_recv() {
+                latest = newer;
+            }
+            let target = path.clone();
+            let saved = tokio::task::spawn_blocking(move || save_pending(&target, &latest)).await;
+            let failure = match saved {
+                Ok(Ok(())) => continue,
+                Ok(Err(e)) => format!("could not save pending changes: {e}"),
+                Err(_) => "could not save pending changes".to_string(),
+            };
+            let event = AppEvent::Data(DataEvent::SaveFailed(failure));
+            if events.send(event).await.is_err() {
+                return;
+            }
+        }
+    });
+    tx
+}
+
 struct Worker {
     api: Arc<Api>,
     ws: Url,
     tokens: Arc<dyn TokenSource>,
     remembered_path: PathBuf,
-    pending_path: PathBuf,
+    save_pending: mpsc::UnboundedSender<Pending>,
     configured_interval: Option<u64>,
     events: mpsc::Sender<AppEvent>,
     followers: HashMap<u64, JoinHandle<()>>,
@@ -173,22 +203,9 @@ impl Worker {
                     },
                 )
             }
+            // One task saves in order, so snapshots never race on the temp file.
             Command::SavePending(pending) => {
-                let path = self.pending_path.clone();
-                let events = self.events.clone();
-                tokio::spawn(async move {
-                    let saved =
-                        tokio::task::spawn_blocking(move || save_pending(&path, &pending)).await;
-                    // The message names the failure, never a value.
-                    let failure = match saved {
-                        Ok(Ok(())) => return,
-                        Ok(Err(e)) => format!("could not save pending changes: {e}"),
-                        Err(_) => "could not save pending changes".to_string(),
-                    };
-                    let _ = events
-                        .send(AppEvent::Data(DataEvent::SaveFailed(failure)))
-                        .await;
-                });
+                let _ = self.save_pending.send(pending);
             }
             Command::WatchDeployments { ids } => self.watch(ids),
             Command::OpenLogs {
@@ -771,5 +788,35 @@ mod tests {
             }
             other => panic!("expected SaveFailed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn save_pending_keeps_the_last_snapshot() {
+        let h = Harness::start(None).await;
+        let path = h.state_dir.path().join("pending.toml");
+        let target = crate::pending::Target {
+            project_id: "p",
+            env_id: "e",
+            env_name: "prod",
+            service_id: "s",
+            service_name: "svc",
+        };
+        let mut pending = Pending::default();
+        for n in 0..20 {
+            pending.set(&target, "KEY", format!("v{n}"), None);
+            h.send(Command::SavePending(pending.clone())).await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let loaded = crate::pending::load_pending(&path);
+            if loaded.as_ref().is_ok_and(|p| *p == pending) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "last snapshot never written");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Let any trailing save finish; the file must still be the last one.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(crate::pending::load_pending(&path).unwrap(), pending);
     }
 }
