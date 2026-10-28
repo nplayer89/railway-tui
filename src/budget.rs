@@ -6,6 +6,9 @@ use reqwest::header::HeaderMap;
 
 pub const DEFAULT_HOURLY_LIMIT: u32 = 100;
 
+/// Longest block honoured from a server-supplied Retry-After.
+const MAX_BLOCK_SECS: u64 = 3600;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitSource {
     Default,
@@ -41,7 +44,8 @@ impl RateBudget {
         }
         // Only the seconds form of Retry-After is understood; an HTTP-date is ignored.
         if let Some(secs) = header_str(headers, "retry-after").and_then(|s| s.parse::<u64>().ok()) {
-            self.blocked_until = Some(now + Duration::from_secs(secs));
+            let block = Duration::from_secs(secs.min(MAX_BLOCK_SECS));
+            self.blocked_until = now.checked_add(block);
         }
     }
 
@@ -74,9 +78,15 @@ pub fn parse_hourly_limit(headers: &HeaderMap) -> Option<u32> {
     header_str(headers, "ratelimit-policy")?
         .split(',')
         .find_map(|entry| {
-            let mut parts = entry.split(';').map(str::trim);
-            let quota = parts.next()?.parse::<u32>().ok()?;
-            parts.any(|p| p == "w=3600").then_some(quota)
+            let parts: Vec<&str> = entry.split(';').map(str::trim).collect();
+            if !parts.contains(&"w=3600") {
+                return None;
+            }
+            // IETF draft form carries `q=<quota>`; the bare form leads with the quota.
+            parts
+                .iter()
+                .find_map(|p| p.strip_prefix("q=").and_then(|q| q.parse().ok()))
+                .or_else(|| parts.first()?.parse().ok())
         })
 }
 
@@ -110,6 +120,24 @@ mod tests {
     fn policy_header_hourly_entry() {
         let h = hm(&[("RateLimit-Policy", "10;w=1, 1000;w=3600")]);
         assert_eq!(parse_hourly_limit(&h), Some(1000));
+    }
+
+    #[test]
+    fn policy_header_q_form() {
+        let h = hm(&[(
+            "RateLimit-Policy",
+            "\"burst\";q=10;w=1, \"hourly\";q=1000;w=3600",
+        )]);
+        assert_eq!(parse_hourly_limit(&h), Some(1000));
+    }
+
+    #[test]
+    fn huge_retry_after_is_clamped() {
+        let now = Instant::now();
+        let mut b = RateBudget::new(None);
+        b.observe(&hm(&[("Retry-After", "18446744073709551615")]), now);
+        let until = b.blocked_until().unwrap();
+        assert!(until <= now + Duration::from_secs(3600));
     }
 
     #[test]
