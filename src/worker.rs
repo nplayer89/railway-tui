@@ -4,11 +4,12 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use graphql_ws_client::Client;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -19,7 +20,7 @@ use crate::api::{Api, ApiError};
 use crate::app::{AppEvent, Command, DataEvent};
 use crate::auth::TokenSource;
 use crate::budget::{backstop_interval, RateBudget};
-use crate::logs::follow::{follow_logs, LogSource, RailwayLogSource};
+use crate::logs::follow::{follow_logs, FollowEvent, LogSource, RailwayLogSource, StreamState};
 use crate::remember::save_remembered;
 
 /// Railway's public GraphQL API over HTTP.
@@ -64,6 +65,8 @@ pub async fn run_worker(
 
 /// Runs `follow_logs` and forwards each `FollowEvent` as `DataEvent::Log`.
 /// Both run on the returned task, so aborting it ends the session's events.
+/// If the follower panics, the session is marked failed rather than left
+/// showing its last state.
 pub fn spawn_follower<S: LogSource + 'static>(
     session: u64,
     source: S,
@@ -71,16 +74,23 @@ pub fn spawn_follower<S: LogSource + 'static>(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let (tx, mut rx) = mpsc::channel(FOLLOW_BUFFER);
+        let forward_to = events.clone();
         let forward = async move {
             while let Some(event) = rx.recv().await {
                 let data = DataEvent::Log { session, event };
-                if events.send(AppEvent::Data(data)).await.is_err() {
+                if forward_to.send(AppEvent::Data(data)).await.is_err() {
                     // Dropping `rx` here makes `follow_logs` stop too.
                     return;
                 }
             }
         };
-        futures::join!(follow_logs(source, tx), forward);
+        let both = async { futures::join!(follow_logs(source, tx), forward) };
+        if AssertUnwindSafe(both).catch_unwind().await.is_err() {
+            let event = FollowEvent::State(StreamState::Failed("internal error".into()));
+            let _ = events
+                .send(AppEvent::Data(DataEvent::Log { session, event }))
+                .await;
+        }
     })
 }
 
@@ -210,13 +220,14 @@ impl Worker {
         if ids.is_empty() {
             return;
         }
-        self.watch.task = Some(tokio::spawn(watch_statuses(
+        let task = watch_statuses(
             ids,
             self.watch.client.clone(),
             self.ws.clone(),
             self.tokens.clone(),
             self.events.clone(),
-        )));
+        );
+        self.watch.task = Some(spawn_watch(task, self.events.clone()));
     }
 
     fn shutdown(&mut self) {
@@ -279,6 +290,21 @@ fn budget_event(budget: &Mutex<RateBudget>, configured_interval: Option<u64>) ->
 
 fn lock(budget: &Mutex<RateBudget>) -> MutexGuard<'_, RateBudget> {
     budget.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Runs the status watch on its own task. If it panics, live updates are
+/// reported off, so the polling backstop is seen to be all there is.
+fn spawn_watch<F>(task: F, events: mpsc::Sender<AppEvent>) -> JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if AssertUnwindSafe(task).catch_unwind().await.is_err() {
+            let _ = events
+                .send(AppEvent::Data(DataEvent::LiveUpdates { ok: false }))
+                .await;
+        }
+    })
 }
 
 /// Subscribes to each deployment's status on the shared client, connecting it
@@ -395,6 +421,59 @@ mod tests {
         while rx.try_recv().is_ok() {}
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Disconnected)));
+    }
+
+    /// A source whose code panics, standing in for a bug in the follower.
+    struct Panicky;
+
+    impl LogSource for Panicky {
+        async fn history(&self, _since: Option<DateTime<Utc>>) -> Result<Vec<LogLine>, ApiError> {
+            panic!("follower bug")
+        }
+
+        async fn subscribe(
+            &self,
+        ) -> Result<BoxStream<'static, Result<Vec<LogLine>, ApiError>>, ApiError> {
+            Ok(futures::stream::pending().boxed())
+        }
+    }
+
+    async fn next_event(rx: &mut mpsc::Receiver<AppEvent>) -> Option<AppEvent> {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for an event")
+    }
+
+    #[tokio::test]
+    async fn panicking_follower_reports_failed() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let handle = spawn_follower(3, Panicky, tx);
+        let mut states = Vec::new();
+        while let Some(AppEvent::Data(DataEvent::Log { session, event })) =
+            next_event(&mut rx).await
+        {
+            assert_eq!(session, 3);
+            if let FollowEvent::State(s) = event {
+                states.push(s);
+            }
+        }
+        // Events queued before the panic may be lost with it; the last word is Failed.
+        assert_eq!(
+            states.last(),
+            Some(&StreamState::Failed("internal error".into()))
+        );
+        assert!(handle.await.is_ok(), "the panic must not escape the task");
+    }
+
+    #[tokio::test]
+    async fn panicking_watch_turns_live_updates_off() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let handle = spawn_watch(async { panic!("watch bug") }, tx);
+        assert!(matches!(
+            next_event(&mut rx).await,
+            Some(AppEvent::Data(DataEvent::LiveUpdates { ok: false }))
+        ));
+        assert!(handle.await.is_ok(), "the panic must not escape the task");
     }
 
     // ---- run_worker, against a wiremock server (never the live API) ----
