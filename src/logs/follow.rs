@@ -149,8 +149,10 @@ pub async fn follow_logs<S: LogSource>(source: S, out: mpsc::Sender<FollowEvent>
 
 /// One connection: backfill history since `last_seen`, then forward the live
 /// stream until it drops. `attempt` resets only once the stream proves
-/// healthy (a non-empty batch, or `HEALTHY_AFTER` of uptime), so a
-/// subscription the server ends at once still backs off.
+/// healthy: a line newer than everything the backfill brought (a fresh
+/// subscription replays recent lines, which proves nothing), or
+/// `HEALTHY_AFTER` of uptime. So a subscription that replays and then ends
+/// at once still backs off.
 async fn connection<S: LogSource>(
     source: &S,
     out: &mpsc::Sender<FollowEvent>,
@@ -186,6 +188,7 @@ async fn connection<S: LogSource>(
     if let Err(outcome) = forward(out, last_seen, history).await {
         return outcome;
     }
+    let backfilled_to = *last_seen;
     let mut stream = match source.subscribe().await {
         Ok(stream) => stream,
         Err(e) => return failure(e),
@@ -201,11 +204,11 @@ async fn connection<S: LogSource>(
     let outcome = loop {
         match stream.next().await {
             Some(Ok(lines)) => {
-                if !lines.is_empty() {
-                    *attempt = 0;
-                }
                 if let Err(outcome) = forward(out, last_seen, lines).await {
                     break outcome;
+                }
+                if *last_seen > backfilled_to {
+                    *attempt = 0;
                 }
             }
             Some(Err(e)) => break failure(e),
@@ -504,10 +507,15 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn lines_reset_backoff() {
+    async fn new_lines_reset_backoff() {
+        // The second connection replays the backfilled line, then sends a newer one.
         let fake = Fake::default()
             .sub(Sub::Fail(ApiError::Http(502)))
-            .sub(Sub::Items(vec![Ok(vec![line(1, "a")])], End::Close));
+            .history(Ok(vec![line(1, "a")]))
+            .sub(Sub::Items(
+                vec![Ok(vec![line(1, "a")]), Ok(vec![line(2, "b")])],
+                End::Close,
+            ));
         let (mut rx, _h) = start(&fake);
 
         let events = collect_states(&mut rx, 6).await;
@@ -520,6 +528,34 @@ mod tests {
                 StreamState::Live,
                 reconnecting(1, 1),
                 StreamState::Connecting,
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replayed_lines_do_not_reset_backoff() {
+        // Every subscription replays lines already seen, then closes at once.
+        let replay = || Sub::Items(vec![Ok(vec![line(1, "a"), line(2, "b")])], End::Close);
+        let fake = Fake::default()
+            .history(Ok(vec![line(1, "a"), line(2, "b")]))
+            .sub(replay())
+            .sub(replay())
+            .sub(replay());
+        let (mut rx, _h) = start(&fake);
+
+        let events = collect_states(&mut rx, 9).await;
+        assert_eq!(
+            states(&events),
+            vec![
+                StreamState::Connecting,
+                StreamState::Live,
+                reconnecting(1, 1),
+                StreamState::Connecting,
+                StreamState::Live,
+                reconnecting(2, 2),
+                StreamState::Connecting,
+                StreamState::Live,
+                reconnecting(3, 4),
             ]
         );
     }
