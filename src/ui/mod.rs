@@ -17,12 +17,15 @@ use ratatui::Frame;
 use crate::app::{App, Loaded, View};
 use crate::status::BoxColour;
 
+/// Selection background; no foreground colour used anywhere may equal it.
+const SELECT_BG: Color = Color::Indexed(236);
+
 fn box_style(c: &BoxColour) -> Style {
     Style::new().fg(match c {
         BoxColour::Green => Color::Green,
         BoxColour::Red => Color::Red,
         BoxColour::Yellow => Color::Yellow,
-        BoxColour::Grey => Color::DarkGray,
+        BoxColour::Grey => Color::Gray,
     })
 }
 
@@ -121,16 +124,20 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
 
     let mut spans: Vec<Span> = Vec::new();
     if let Some((loading, fetched_at, error)) = freshness_source(app) {
-        if let Some(err) = error {
-            spans.push(Span::styled(
-                format!("STALE: {}", clean(err)),
-                Style::new().fg(Color::Red),
-            ));
-        } else if loading {
-            spans.push(Span::styled("loading…", dim));
-        } else if let Some(at) = fetched_at {
-            let secs = now.saturating_duration_since(at).as_secs();
-            spans.push(Span::styled(format!("updated {secs}s ago"), dim));
+        let age = fetched_at.map(|at| now.saturating_duration_since(at).as_secs());
+        let red = Style::new().fg(Color::Red);
+        match (error, age, loading) {
+            (Some(err), Some(a), _) => spans.push(Span::styled(
+                format!("STALE: {} (last ok {a}s ago)", clean(err)),
+                red,
+            )),
+            (Some(err), None, _) => spans.push(Span::styled(format!("STALE: {}", clean(err)), red)),
+            (None, Some(a), true) => {
+                spans.push(Span::styled(format!("updated {a}s ago · refreshing…"), dim))
+            }
+            (None, Some(a), false) => spans.push(Span::styled(format!("updated {a}s ago"), dim)),
+            (None, None, true) => spans.push(Span::styled("loading…", dim)),
+            (None, None, false) => spans.push(Span::styled("not loaded", dim)),
         }
     }
     if !app.live_updates {
@@ -234,9 +241,7 @@ fn draw_env_picker(frame: &mut Frame, area: Rect, app: &App, index: usize) {
         .enumerate()
         .map(|(i, e)| {
             let style = if i == index {
-                Style::new()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD)
+                Style::new().bg(SELECT_BG).add_modifier(Modifier::BOLD)
             } else {
                 Style::new()
             };

@@ -18,7 +18,7 @@ const HEADER: Style = Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD);
 /// highlight overrides the explicit background of the `▚▚` marker.
 fn row_style(fg: Style, selected: bool) -> Style {
     if selected {
-        fg.bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+        fg.bg(super::SELECT_BG).add_modifier(Modifier::BOLD)
     } else {
         fg
     }
@@ -29,7 +29,7 @@ fn health_colour(h: Health) -> Color {
         Health::Healthy => Color::Green,
         Health::Degraded | Health::Failing | Health::FailedButServing => Color::Red,
         Health::Progressing => Color::Yellow,
-        Health::Inactive => Color::DarkGray,
+        Health::Inactive => Color::Gray,
     }
 }
 
@@ -44,7 +44,7 @@ fn deployment_colour(s: &DeploymentStatus) -> Color {
         | D::Waiting
         | D::Initializing
         | D::NeedsApproval => Color::Yellow,
-        _ => Color::DarkGray,
+        _ => Color::Gray,
     }
 }
 
@@ -161,7 +161,7 @@ pub fn services(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
             ));
             status.push(Span::raw(" "));
         }
-        status.push(Span::raw(row.label.clone()));
+        status.push(Span::raw(clean(&row.label)));
         let latest = svc.latest.as_ref();
         rows.push(
             Row::new([
@@ -223,7 +223,7 @@ pub fn deployments(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>)
             };
             Row::new([
                 Cell::from(tag),
-                Cell::from(d.status.label()),
+                Cell::from(clean(&d.status.label())),
                 Cell::from(relative(d.created_at, now)),
                 Cell::from(short_sha(d)),
                 Cell::from(message(d)),
@@ -264,7 +264,7 @@ pub fn instances(frame: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .map(|(n, (d, i))| {
             let status = match &i.status {
-                InstanceStatus::Unknown(raw) => raw.clone(),
+                InstanceStatus::Unknown(raw) => clean(raw),
                 other => format!("{other:?}").to_uppercase(),
             };
             Row::new([

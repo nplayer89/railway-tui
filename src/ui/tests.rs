@@ -193,7 +193,7 @@ fn row_colours_follow_health() {
     };
     assert_eq!(fg_of("healthy"), Color::Green);
     assert_eq!(fg_of("building"), Color::Yellow);
-    assert_eq!(fg_of("removed"), Color::DarkGray);
+    assert_eq!(fg_of("removed"), Color::Gray);
 }
 
 #[test]
@@ -221,6 +221,7 @@ fn error_shows_stale_marker() {
 fn loading_and_live_off_and_rate_limit_are_shown() {
     let now = Instant::now();
     let mut app = services_app(vec![]);
+    app.services.fetched_at = None;
     app.services.loading = true;
     app.live_updates = false;
     app.blocked_until = Some(now + Duration::from_secs(7));
@@ -404,4 +405,169 @@ fn tiny_terminals_do_not_panic() {
     for (w, h) in [(20, 5), (1, 1), (0, 0), (10, 3)] {
         render_sized(&logs, Instant::now(), w, h);
     }
+}
+
+fn assert_readable(buf: &Buffer, y: u16) {
+    for x in 0..buf.area.width {
+        let c = &buf[(x, y)];
+        // Terminal-default on terminal-default (unselected cells) is readable by definition.
+        if c.symbol().trim().is_empty() || c.bg == Color::Reset {
+            continue;
+        }
+        assert_ne!(c.fg, c.bg, "unreadable cell {:?} at ({x},{y})", c.symbol());
+    }
+}
+
+#[test]
+fn selected_grey_rows_stay_readable() {
+    let removed = deploy("c", DeploymentStatus::Removed, &[InstanceStatus::Stopped]);
+    let app = services_app(vec![service("removed", removed, vec![])]);
+    let buf = render(&app, Instant::now());
+    let y = (0..30)
+        .find(|y| row_text(&buf, *y).starts_with("removed"))
+        .unwrap();
+    assert_readable(&buf, y);
+    assert!(!find(&buf, "■").is_empty());
+    // Same for a grey instance row.
+    let d = deploy("d", DeploymentStatus::Success, &[InstanceStatus::Stopped]);
+    let mut app = services_app(vec![service("api", d.clone(), vec![d])]);
+    app.stack.push(View::Instances {
+        service_id: "api-id".into(),
+    });
+    let buf = render(&app, Instant::now());
+    let y = (0..30)
+        .find(|y| row_text(&buf, *y).contains("STOPPED"))
+        .unwrap();
+    assert_readable(&buf, y);
+}
+
+#[test]
+fn instances_view_lists_columns() {
+    let d = deploy(
+        "d1",
+        DeploymentStatus::Success,
+        &[InstanceStatus::Running, InstanceStatus::Crashed],
+    );
+    let mut app = services_app(vec![service("api", d.clone(), vec![d])]);
+    app.stack.push(View::Instances {
+        service_id: "api-id".into(),
+    });
+    let buf = render(&app, Instant::now());
+    let t = text(&buf);
+    for want in [
+        "ID",
+        "STATUS",
+        "DEPLOYMENT",
+        "d1-i0",
+        "d1-i1",
+        "RUNNING",
+        "CRASHED",
+    ] {
+        assert!(t.contains(want), "missing {want}\n{t}");
+    }
+    let y = (0..30)
+        .find(|y| row_text(&buf, *y).contains("CRASHED"))
+        .unwrap();
+    assert!(row_text(&buf, y).contains("d1"));
+    assert_eq!(
+        buf[(row_text(&buf, y).find("CRASHED").unwrap() as u16, y)].fg,
+        Color::Red
+    );
+}
+
+fn envs(n: usize) -> Vec<crate::model::Environment> {
+    (0..n)
+        .map(|i| crate::model::Environment {
+            id: format!("e{i}"),
+            name: format!("env-{i}"),
+        })
+        .collect()
+}
+
+#[test]
+fn env_picker_lists_and_highlights_selected() {
+    let mut app = services_app(vec![]);
+    app.environments.value = Some(envs(3));
+    app.env_picker = Some(1);
+    let buf = render(&app, Instant::now());
+    let t = text(&buf);
+    assert!(
+        t.contains("env-0") && t.contains("env-1") && t.contains("env-2"),
+        "{t}"
+    );
+    let at = |name: &str| {
+        let y = (0..30).find(|y| row_text(&buf, *y).contains(name)).unwrap();
+        (row_text(&buf, y).find(name).unwrap() as u16, y)
+    };
+    assert_ne!(buf[at("env-1")].bg, buf[at("env-0")].bg);
+    assert_readable(&buf, at("env-1").1);
+}
+
+#[test]
+fn env_picker_with_more_environments_than_fit_does_not_panic() {
+    let mut app = services_app(vec![]);
+    app.environments.value = Some(envs(80));
+    app.env_picker = Some(79);
+    render(&app, Instant::now());
+    render_sized(&app, Instant::now(), 20, 5);
+}
+
+#[test]
+fn projects_heading_row_is_styled_and_projects_indented() {
+    use crate::model::{ProjectRef, Workspace};
+    let (mut app, _) = App::new(StartPrefs::default());
+    app.workspaces.value = Some(vec![Workspace {
+        id: "w1".into(),
+        name: "team".into(),
+        projects: vec![ProjectRef {
+            id: "p".into(),
+            name: "alpha".into(),
+        }],
+    }]);
+    let buf = render(&app, Instant::now());
+    let h = (0..30)
+        .find(|y| row_text(&buf, *y).starts_with("team"))
+        .unwrap();
+    assert_eq!(buf[(0, h)].fg, Color::Blue);
+    assert!(row_text(&buf, h + 1).starts_with("  alpha"));
+}
+
+#[test]
+fn freshness_variants_are_never_silent() {
+    let now = Instant::now();
+    let ago = Some(now - Duration::from_secs(9));
+    let mut app = services_app(vec![]);
+    // Reload in flight over existing data keeps the age.
+    app.services.fetched_at = ago;
+    app.services.loading = true;
+    assert!(text(&render(&app, now)).contains("updated 9s ago · refreshing…"));
+    // Error over old data says how old.
+    app.services.loading = false;
+    app.services.error = Some("boom".into());
+    assert!(text(&render(&app, now)).contains("STALE: boom (last ok 9s ago)"));
+    // Error with nothing ever loaded.
+    app.services.fetched_at = None;
+    assert!(text(&render(&app, now)).contains("STALE: boom"));
+    // Never loaded, idle.
+    app.services.error = None;
+    assert!(text(&render(&app, now)).contains("not loaded"));
+}
+
+#[test]
+fn server_labels_are_cleaned() {
+    let mut d = deploy("d", DeploymentStatus::Unknown("WEI\u{1b}RD".into()), &[]);
+    d.instances = vec![Instance {
+        id: "i".into(),
+        status: InstanceStatus::Unknown("BA\u{1b}D".into()),
+    }];
+    let mut app = services_app(vec![service("api", d.clone(), vec![d])]);
+    let buf = render(&app, Instant::now());
+    assert!(buf.content().iter().all(|c| !c.symbol().contains('\u{1b}')));
+    assert!(text(&buf).contains("UNKNOWN(WEIRD)"));
+    app.stack.push(View::Instances {
+        service_id: "api-id".into(),
+    });
+    let buf = render(&app, Instant::now());
+    assert!(buf.content().iter().all(|c| !c.symbol().contains('\u{1b}')));
+    assert!(text(&buf).contains("BAD"));
 }
