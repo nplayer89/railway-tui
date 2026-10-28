@@ -90,6 +90,10 @@ fn freshness_source(app: &App) -> Option<Freshness<'_>> {
     match app.stack.last() {
         Some(View::Projects) | None => of(&app.workspaces),
         Some(View::Deployments { .. }) => of(&app.deployments),
+        // Until an environment is chosen, its list is what these views wait on.
+        Some(View::Services) | Some(View::Instances { .. }) if app.environment.is_none() => {
+            of(&app.environments)
+        }
         Some(View::Services) | Some(View::Instances { .. }) => of(&app.services),
         Some(View::Logs(_)) => None,
     }

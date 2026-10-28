@@ -138,6 +138,23 @@ pub fn projects(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// What an empty Services or Instances table says; before an environment is
+/// chosen it reports on the environments load instead.
+fn service_empty_text(app: &App, none: &'static str) -> &'static str {
+    if app.environment.is_some() {
+        return if app.services.loading {
+            "loading…"
+        } else {
+            none
+        };
+    }
+    match &app.environments.value {
+        _ if app.environments.loading => "loading…",
+        Some(envs) if envs.is_empty() => "no environments",
+        _ => "no environment selected",
+    }
+}
+
 pub fn services(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
     let mut rows = Vec::new();
     let mut box_width = "INSTANCES".len() as u16;
@@ -176,11 +193,7 @@ pub fn services(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
             .style(row_style(Style::new().fg(colour), selected == Some(i))),
         );
     }
-    let empty = if app.services.loading {
-        "loading…"
-    } else {
-        "no services"
-    };
+    let empty = service_empty_text(app, "no services");
     render_table(
         frame,
         area,
@@ -278,11 +291,7 @@ pub fn instances(frame: &mut Frame, area: Rect, app: &App) {
             ))
         })
         .collect();
-    let empty = if app.services.loading {
-        "loading…"
-    } else {
-        "no instances"
-    };
+    let empty = service_empty_text(app, "no instances");
     render_table(
         frame,
         area,

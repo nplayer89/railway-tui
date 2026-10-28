@@ -86,6 +86,10 @@ fn service(
 fn services_app(services: Vec<ServiceInstance>) -> App {
     let (mut app, _) = App::new(StartPrefs::default());
     app.stack = vec![View::Projects, View::Services];
+    app.environment = Some(crate::model::Environment {
+        id: "e-prod".into(),
+        name: "production".into(),
+    });
     app.services.value = Some(services);
     app.services.fetched_at = Some(Instant::now());
     app
@@ -570,4 +574,54 @@ fn server_labels_are_cleaned() {
     let buf = render(&app, Instant::now());
     assert!(buf.content().iter().all(|c| !c.symbol().contains('\u{1b}')));
     assert!(text(&buf).contains("UNKNOWN(BAD)"), "{}", text(&buf));
+}
+
+/// Services (or Instances) before any environment is chosen.
+fn no_env_app(instances_view: bool) -> App {
+    let (mut app, _) = App::new(StartPrefs::default());
+    app.stack = vec![View::Projects, View::Services];
+    if instances_view {
+        app.stack.push(View::Instances {
+            service_id: "api-id".into(),
+        });
+    }
+    app
+}
+
+#[test]
+fn failed_environments_load_is_shown_not_hidden() {
+    let now = Instant::now();
+    for instances_view in [false, true] {
+        let mut app = no_env_app(instances_view);
+        app.environments.error = Some("Railway API returned HTTP 500".into());
+        let t = text(&render(&app, now));
+        assert!(t.contains("STALE: Railway API returned HTTP 500"), "{t}");
+        assert!(!t.contains("not loaded"), "{t}");
+    }
+}
+
+#[test]
+fn project_without_environments_says_so() {
+    let now = Instant::now();
+    for instances_view in [false, true] {
+        let mut app = no_env_app(instances_view);
+        app.environments.value = Some(Vec::new());
+        app.environments.fetched_at = Some(now - Duration::from_secs(3));
+        let t = text(&render(&app, now));
+        assert!(t.contains("no environments"), "{t}");
+        assert!(t.contains("updated 3s ago"), "{t}");
+        assert!(
+            !t.contains("no services") && !t.contains("no instances"),
+            "{t}"
+        );
+    }
+}
+
+#[test]
+fn environments_loading_shows_loading() {
+    let mut app = no_env_app(false);
+    app.environments.loading = true;
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("loading…"), "{t}");
+    assert!(!t.contains("no services"), "{t}");
 }
