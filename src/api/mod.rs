@@ -294,10 +294,14 @@ impl Api {
         data.deployment_logs
             .into_iter()
             .map(|l| {
+                let replica = l.tags.and_then(|t| t.deployment_instance_id);
                 log_line(
                     &l.timestamp,
                     l.message,
-                    l.attributes.into_iter().map(|a| (a.key, a.value)),
+                    l.attributes
+                        .into_iter()
+                        .map(|a| (a.key, a.value))
+                        .chain(replica_attribute(replica)),
                 )
             })
             .collect()
@@ -458,6 +462,15 @@ where
 /// Scopes `environmentLogs` to one build, as the CLI and dashboard do.
 fn build_log_filter(snapshot_id: &str) -> String {
     format!("(@snapshot:{snapshot_id} OR @replica:{snapshot_id})")
+}
+
+/// Attribute key under which a runtime log line carries its replica id.
+pub const REPLICA_ATTR_KEY: &str = "deploymentInstanceId";
+
+/// Railway reports the replica in `tags.deploymentInstanceId`, not in the
+/// line's attributes; it is folded into the attributes under [`REPLICA_ATTR_KEY`].
+fn replica_attribute(instance_id: Option<String>) -> Option<(String, String)> {
+    instance_id.map(|id| (REPLICA_ATTR_KEY.to_string(), id))
 }
 
 /// The raw API spelling of a generated enum value, including its `Other(raw)` variant.

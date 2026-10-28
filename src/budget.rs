@@ -152,6 +152,13 @@ mod tests {
     }
 
     #[test]
+    fn policy_header_as_railway_sends_it() {
+        // Observed live (Task 12): the only rate-limit header Railway returns.
+        let h = hm(&[("ratelimit-policy", "\"default\";q=1000;w=3600")]);
+        assert_eq!(parse_hourly_limit(&h), Some(1000));
+    }
+
+    #[test]
     fn huge_retry_after_is_clamped() {
         let now = Instant::now();
         let mut b = RateBudget::new(None);

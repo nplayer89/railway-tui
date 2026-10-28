@@ -15,7 +15,7 @@ use reqwest::StatusCode;
 use reqwest_websocket::{RequestBuilderExt, WebSocket};
 use url::Url;
 
-use super::{blocking_token, build_log_filter, log_line, raw_enum, ApiError};
+use super::{blocking_token, build_log_filter, log_line, raw_enum, replica_attribute, ApiError};
 use crate::auth::{AuthError, TokenSource};
 use crate::model::{DeploymentStatus, LogLine};
 
@@ -166,10 +166,14 @@ pub fn deployment_logs_stream(
                 .deployment_logs
                 .into_iter()
                 .map(|l| {
+                    let replica = l.tags.and_then(|t| t.deployment_instance_id);
                     log_line(
                         &l.timestamp,
                         l.message,
-                        l.attributes.into_iter().map(|a| (a.key, a.value)),
+                        l.attributes
+                            .into_iter()
+                            .map(|a| (a.key, a.value))
+                            .chain(replica_attribute(replica)),
                     )
                 })
                 .collect()

@@ -7,8 +7,10 @@ use chrono::{DateTime, Utc};
 use crate::model::LogLine;
 
 pub const LOG_CAP: usize = 10_000;
-/// Attribute keys that identify the replica a line came from. Task 12 confirms the real key.
-pub const REPLICA_ATTR_KEYS: &[&str] = &["deploymentInstanceId", "replica"];
+/// Attribute keys that identify the replica a line came from. Confirmed live
+/// (Task 12): Railway sends it as `tags.deploymentInstanceId`, which the API
+/// layer stores under this key.
+pub const REPLICA_ATTR_KEYS: &[&str] = &[crate::api::REPLICA_ATTR_KEY];
 
 type Key = (DateTime<Utc>, String);
 
@@ -165,13 +167,16 @@ mod tests {
 
     #[test]
     fn replica_filter_uses_attributes() {
+        // Live check (Task 12): the replica id is `tags.deploymentInstanceId`,
+        // which the API layer folds into the attributes under that key.
+        assert_eq!(REPLICA_ATTR_KEYS, &["deploymentInstanceId"]);
         let mut b = LogBuffer::new(10);
         let mut l1 = line(1, "a");
-        l1.attributes = vec![("replica".into(), "r1".into())];
+        l1.attributes = vec![("deploymentInstanceId".into(), "r1".into())];
         let mut l2 = line(2, "b");
         l2.attributes = vec![("deploymentInstanceId".into(), "r2".into())];
         let mut l3 = line(3, "c");
-        l3.attributes = vec![("other".into(), "r1".into())];
+        l3.attributes = vec![("replica".into(), "r1".into())];
         b.extend([l1, l2, l3]);
         let v = b.visible(None, Some("r1"));
         assert_eq!(v.len(), 1);

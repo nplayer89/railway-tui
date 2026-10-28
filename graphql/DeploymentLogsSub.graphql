@@ -10,5 +10,8 @@ subscription DeploymentLogsSub(
       key
       value
     }
+    tags {
+      deploymentInstanceId
+    }
   }
 }

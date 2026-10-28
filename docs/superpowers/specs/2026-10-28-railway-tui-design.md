@@ -238,5 +238,35 @@ implementation (own OAuth login, own token store) without touching the rest of t
 
 ## Open questions
 
-None blocking. To be learned during the build: whether subscriptions count against the rate
-limit, and whether `deployment(id)` subscriptions report replica-level changes.
+None blocking. Answered by the live read-only checks (`tests/live_readonly.rs`, run 2026-10-28
+against Neil's Hobby account):
+
+- **Rate-limit headers — answered.** A successful response carries exactly one rate-limit header:
+  `ratelimit-policy: "default";q=1000;w=3600`. `parse_hourly_limit` reads it as 1000/hour (unit
+  test `policy_header_as_railway_sends_it` pins the real value). There is **no**
+  `X-RateLimit-Remaining` (and no `Retry-After`) on 2xx responses, so the "keep adjusting from
+  `X-RateLimit-Remaining`" idea above has nothing to read in normal operation; the budget relies
+  on the policy quota and on `Retry-After` from a 429.
+- **Do subscriptions count against the rate limit — still unknown, not measurable from headers.**
+  The plan was to compare `X-RateLimit-Remaining` before and after holding a `deploymentLogs`
+  subscription open for 60s (it received 5 batches / 10 lines and stayed up); since that header is
+  absent, the difference cannot be observed. Railway's rate-limit docs remain the only source.
+- **Replica attribute — answered, code fixed.** Runtime log `attributes` hold only the app's own
+  structured-log fields plus `level`; none identifies the replica. The replica id is in
+  `tags.deploymentInstanceId`, and it equalled the deployment's `instances.id` on 10/10 lines.
+  `DeploymentLogs` and `DeploymentLogsSub` now request `tags { deploymentInstanceId }` and the API
+  layer folds it into the line's attributes under `deploymentInstanceId`; `REPLICA_ATTR_KEYS` is
+  `["deploymentInstanceId"]`. So Instances → Enter can filter to one replica.
+- **`deployments(first: N)` order — answered.** Newest first: `first: 3` returned exactly the three
+  newest of `first: 20` (17 deployments). `Api::deployments` still sorts defensively.
+- **`deploymentLogs(startDate, limit)` window — answered.** Returns the **newest** `limit` lines
+  (after `startDate` when given), in ascending time order, and can return `limit + 1` lines
+  (asked for 5, got 6). This matches the reconnect backfill's assumption that a full page means the
+  oldest part of the gap was cut. `startDate` is inclusive and effectively millisecond-granular:
+  with `startDate` set to a line's nanosecond timestamp, the page also included earlier lines from
+  the same millisecond. The log buffer's de-duplication absorbs the overlap.
+- **Build logs — answered.** For a recent successful deployment `Api::build_logs` returned 88 lines
+  (snapshot upload through build), the first one 529s after the deployment's `createdAt` (it sat
+  queued), so the `createdAt - 5min` start of the window comfortably covers the build.
+- **Still open:** whether `deployment(id)` subscriptions report replica-level changes (not checked;
+  the polling backstop covers it either way).

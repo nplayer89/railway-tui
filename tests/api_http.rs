@@ -373,6 +373,38 @@ async fn build_logs_uses_snapshot_filter() {
 }
 
 #[tokio::test]
+async fn deployment_logs_carry_replica_tag_as_attribute() {
+    // Railway puts the replica id in `tags.deploymentInstanceId`, not in `attributes`.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("deploymentInstanceId"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"deploymentLogs": [
+                {"timestamp": "2026-10-28T10:00:00Z", "message": "a",
+                 "attributes": [{"key": "level", "value": "info"}],
+                 "tags": {"deploymentInstanceId": "inst-1"}},
+                {"timestamp": "2026-10-28T10:00:01Z", "message": "b",
+                 "attributes": [], "tags": null}
+            ]}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = api_for(&server, FakeTokens::new("tok", "tok2"));
+
+    let logs = api.deployment_logs("dep1", None, 100).await.unwrap();
+
+    assert_eq!(
+        logs[0].attributes,
+        vec![
+            ("level".to_string(), "info".to_string()),
+            ("deploymentInstanceId".to_string(), "inst-1".to_string()),
+        ]
+    );
+    assert!(logs[1].attributes.is_empty());
+}
+
+#[tokio::test]
 async fn deployments_are_newest_first() {
     let server = MockServer::start().await;
     let node = |id: &str, at: &str| json!({"node": {"id": id, "status": "SUCCESS", "createdAt": at, "meta": {"image": "nginx"}, "instances": []}});
