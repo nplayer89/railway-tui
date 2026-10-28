@@ -111,6 +111,9 @@ enum Outcome {
     /// Dropped, ended or failed to start: reconnect, waiting at least
     /// `retry_after` if the API asked for that.
     Dropped { retry_after: Option<Duration> },
+    /// The live stream reported an auth error. One reconnect is worth trying:
+    /// it fetches the token again, which may have been refreshed meanwhile.
+    StreamAuth(String),
     /// Retrying cannot help.
     Fatal(String),
     /// The receiver is gone.
@@ -118,17 +121,28 @@ enum Outcome {
 }
 
 /// Runs until `out` is closed, or until an auth error makes retrying pointless.
+/// An auth error inside a running stream gets one reconnect; it is final only
+/// if it recurs before the stream has proved healthy again.
 pub async fn follow_logs<S: LogSource>(source: S, out: mpsc::Sender<FollowEvent>) {
     let mut attempt: u32 = 0;
     let mut last_seen: Option<DateTime<Utc>> = None;
+    let mut auth_retry_spent = false;
     loop {
         let outcome = tokio::select! {
             _ = out.closed() => Outcome::Closed,
             outcome = connection(&source, &out, &mut last_seen, &mut attempt) => outcome,
         };
+        if attempt == 0 {
+            // Healthy since the last auth retry (or never retried).
+            auth_retry_spent = false;
+        }
         let retry_after = match outcome {
             Outcome::Closed => return,
-            Outcome::Fatal(msg) => {
+            Outcome::StreamAuth(_) if !auth_retry_spent => {
+                auth_retry_spent = true;
+                None
+            }
+            Outcome::Fatal(msg) | Outcome::StreamAuth(msg) => {
                 let _ = out.send(FollowEvent::State(StreamState::Failed(msg))).await;
                 return;
             }
@@ -211,6 +225,7 @@ async fn connection<S: LogSource>(
                     *attempt = 0;
                 }
             }
+            Some(Err(ApiError::Auth(e))) => break Outcome::StreamAuth(e.to_string()),
             Some(Err(e)) => break failure(e),
             None => break Outcome::Dropped { retry_after: None },
         }
@@ -685,17 +700,91 @@ mod tests {
         assert_eq!(fake.since_calls().len(), 1);
     }
 
+    fn stream_auth_error() -> Sub {
+        Sub::Items(vec![Err(ApiError::Auth(AuthError::Rejected))], End::Hang)
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn auth_error_on_stream_fails_without_retry() {
-        let fake = Fake::default().sub(Sub::Items(
-            vec![Err(ApiError::Auth(AuthError::Rejected))],
-            End::Hang,
-        ));
+    async fn auth_error_on_stream_reconnects_once() {
+        let fake = Fake::default().sub(stream_auth_error());
+        let (mut rx, _h) = start(&fake);
+
+        let events = collect_states(&mut rx, 5).await;
+        assert_eq!(
+            states(&events),
+            vec![
+                StreamState::Connecting,
+                StreamState::Live,
+                reconnecting(1, 1),
+                StreamState::Connecting,
+                StreamState::Live,
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auth_error_on_stream_after_its_reconnect_fails() {
+        let fake = Fake::default()
+            .sub(stream_auth_error())
+            .sub(stream_auth_error());
         let (mut rx, handle) = start(&fake);
 
-        let events = collect_states(&mut rx, 3).await;
-        assert!(matches!(states(&events)[2], StreamState::Failed(_)));
+        let events = collect_states(&mut rx, 6).await;
+        assert_eq!(
+            states(&events),
+            vec![
+                StreamState::Connecting,
+                StreamState::Live,
+                reconnecting(1, 1),
+                StreamState::Connecting,
+                StreamState::Live,
+                StreamState::Failed(AuthError::Rejected.to_string()),
+            ]
+        );
         handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auth_error_on_the_reconnect_itself_fails() {
+        let fake = Fake::default()
+            .sub(stream_auth_error())
+            .history(Ok(Vec::new()))
+            .history(Err(ApiError::Auth(AuthError::Rejected)));
+        let (mut rx, handle) = start(&fake);
+
+        let events = collect_states(&mut rx, 5).await;
+        assert_eq!(
+            states(&events)[4],
+            StreamState::Failed(AuthError::Rejected.to_string())
+        );
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn healthy_stream_earns_a_new_auth_retry() {
+        let fake = Fake::default().sub(stream_auth_error()).sub(Sub::Items(
+            vec![
+                Ok(vec![line(1, "new")]),
+                Err(ApiError::Auth(AuthError::Rejected)),
+            ],
+            End::Hang,
+        ));
+        let (mut rx, _h) = start(&fake);
+
+        let events = collect_states(&mut rx, 8).await;
+        assert_eq!(
+            states(&events),
+            vec![
+                StreamState::Connecting,
+                StreamState::Live,
+                reconnecting(1, 1),
+                StreamState::Connecting,
+                StreamState::Live,
+                reconnecting(1, 1),
+                StreamState::Connecting,
+                StreamState::Live,
+            ]
+        );
     }
 
     #[test]
