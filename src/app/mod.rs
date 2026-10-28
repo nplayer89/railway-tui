@@ -106,6 +106,11 @@ pub enum DataEvent {
     },
     /// Saving the pending file failed; the text never holds a value.
     SaveFailed(String),
+    /// The external editor finished: the new value, or why it could not run.
+    Edited {
+        name: String,
+        result: Result<String, String>,
+    },
     StatusChanged {
         deployment_id: String,
         status: DeploymentStatus,
@@ -123,7 +128,7 @@ pub enum DataEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Command {
     LoadWorkspaces,
     LoadEnvironments {
@@ -144,6 +149,11 @@ pub enum Command {
         service_id: String,
     },
     SavePending(Pending),
+    /// Handled by the main loop, not the worker: edit `initial` in `$VISUAL`/`$EDITOR`.
+    EditExternal {
+        name: String,
+        initial: String,
+    },
     /// Replaces the previous watch set; empty means stop.
     WatchDeployments {
         ids: Vec<String>,
@@ -159,6 +169,14 @@ pub enum Command {
     },
     SaveRemembered(Remembered),
     Quit,
+}
+
+/// A one-line variable input. `name: None` means the name of a new variable is being typed;
+/// otherwise `text` is the value of `name`.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct VarInput {
+    pub name: Option<String>,
+    pub text: String,
 }
 
 /// Start-up preferences: config defaults (id or case-insensitive name) and remembered ids.
@@ -202,6 +220,8 @@ pub struct App {
     /// Edits not deployed yet, for every service.
     pub pending: Pending,
     pub selection: Selection,
+    /// The variable name or value being typed in the Variables view.
+    pub var_input: Option<VarInput>,
     /// Applied name filter for the current table view (cleared on view change).
     pub table_filter: Option<String>,
     /// Filter text being typed after `/` (table or logs, by the top view).
@@ -253,6 +273,7 @@ impl App {
             variables: Loaded::default(),
             pending,
             selection: Selection::default(),
+            var_input: None,
             table_filter: None,
             filter_input: None,
             command_line: None,
@@ -460,6 +481,10 @@ impl App {
                 self.variables.finish(result, now);
             }
             DataEvent::SaveFailed(message) => self.message = Some(message),
+            DataEvent::Edited { name, result } => match result {
+                Ok(value) => self.set_variable(&name, value, out),
+                Err(message) => self.message = Some(message),
+            },
             DataEvent::StatusChanged {
                 deployment_id,
                 status,
@@ -1201,6 +1226,11 @@ impl fmt::Debug for DataEvent {
                     .finish()
             }
             DataEvent::SaveFailed(m) => f.debug_tuple("SaveFailed").field(m).finish(),
+            DataEvent::Edited { name, result } => f
+                .debug_struct("Edited")
+                .field("name", name)
+                .field("result", &result.as_ref().map(|_| "<redacted>"))
+                .finish(),
             DataEvent::StatusChanged {
                 deployment_id,
                 status,
@@ -1223,6 +1253,81 @@ impl fmt::Debug for DataEvent {
                 .field("blocked_until", blocked_until)
                 .finish(),
             DataEvent::LiveUpdates { ok } => f.debug_struct("LiveUpdates").field("ok", ok).finish(),
+        }
+    }
+}
+
+impl fmt::Debug for VarInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VarInput")
+            .field("name", &self.name)
+            .field("text", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Written by hand so `EditExternal` never prints the value being edited.
+impl fmt::Debug for Command {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Command::LoadWorkspaces => f.write_str("LoadWorkspaces"),
+            Command::LoadEnvironments { project_id } => f
+                .debug_struct("LoadEnvironments")
+                .field("project_id", project_id)
+                .finish(),
+            Command::LoadServices { project_id, env_id } => f
+                .debug_struct("LoadServices")
+                .field("project_id", project_id)
+                .field("env_id", env_id)
+                .finish(),
+            Command::LoadDeployments {
+                project_id,
+                env_id,
+                service_id,
+            } => f
+                .debug_struct("LoadDeployments")
+                .field("project_id", project_id)
+                .field("env_id", env_id)
+                .field("service_id", service_id)
+                .finish(),
+            Command::LoadVariables {
+                project_id,
+                env_id,
+                service_id,
+            } => f
+                .debug_struct("LoadVariables")
+                .field("project_id", project_id)
+                .field("env_id", env_id)
+                .field("service_id", service_id)
+                .finish(),
+            Command::SavePending(p) => f.debug_tuple("SavePending").field(p).finish(),
+            Command::EditExternal { name, .. } => f
+                .debug_struct("EditExternal")
+                .field("name", name)
+                .field("initial", &"<redacted>")
+                .finish(),
+            Command::WatchDeployments { ids } => f
+                .debug_struct("WatchDeployments")
+                .field("ids", ids)
+                .finish(),
+            Command::OpenLogs {
+                session,
+                env_id,
+                deployment_id,
+                kind,
+            } => f
+                .debug_struct("OpenLogs")
+                .field("session", session)
+                .field("env_id", env_id)
+                .field("deployment_id", deployment_id)
+                .field("kind", kind)
+                .finish(),
+            Command::CloseLogs { session } => f
+                .debug_struct("CloseLogs")
+                .field("session", session)
+                .finish(),
+            Command::SaveRemembered(r) => f.debug_tuple("SaveRemembered").field(r).finish(),
+            Command::Quit => f.write_str("Quit"),
         }
     }
 }
@@ -2271,5 +2376,222 @@ mod tests {
         assert_eq!(app.message.as_deref(), Some("could not save"));
         let event = vars_event("svc-a", Ok(vars(&[("K", "s3cret-value")])));
         assert!(!format!("{event:?}").contains("s3cret-value"));
+    }
+
+    // ---- editing ----
+
+    fn pending_of(app: &App, name: &str) -> Option<PendingVar> {
+        app.pending
+            .service("e-prod", "svc-a")
+            .and_then(|s| s.vars.get(name))
+            .cloned()
+    }
+
+    fn select_var(app: &mut App, name: &str, now: Instant) {
+        for _ in 0..10 {
+            if app.selection.variable.as_deref() == Some(name) {
+                return;
+            }
+            app.update(key('j'), now);
+            if app.selection.variable.is_none() {
+                app.selection.variable = app.variable_rows().first().map(|r| r.name.into());
+            }
+        }
+        panic!("variable not found");
+    }
+
+    #[test]
+    fn edit_commits_set_and_saves() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        select_var(&mut app, "REDIS_DB", now);
+        assert!(app.update(key('e'), now).is_empty());
+        let input = app.var_input.as_ref().unwrap();
+        assert_eq!(input.name.as_deref(), Some("REDIS_DB"));
+        assert_eq!(input.text, "1");
+        app.update(key('0'), now);
+        let cmds = app.update(code(KeyCode::Enter), now);
+        assert!(app.var_input.is_none());
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(_)]));
+        let p = pending_of(&app, "REDIS_DB").unwrap();
+        assert_eq!(p.change, crate::pending::Change::Set { value: "10".into() });
+        assert_eq!(p.base.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn esc_cancels_inline_edit() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        select_var(&mut app, "REDIS_DB", now);
+        app.update(key('e'), now);
+        app.update(key('x'), now);
+        assert!(app.update(code(KeyCode::Esc), now).is_empty());
+        assert!(app.var_input.is_none());
+        assert!(app.pending.envs.is_empty());
+    }
+
+    #[test]
+    fn add_validates_name() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        app.update(key('a'), now);
+        assert_eq!(app.var_input.as_ref().unwrap().name, None);
+        typed(&mut app, "1BAD", now);
+        let cmds = app.update(code(KeyCode::Enter), now);
+        assert!(cmds.is_empty());
+        assert!(app.message.is_some());
+        assert_eq!(app.var_input.as_ref().unwrap().name, None);
+        for _ in 0..4 {
+            app.update(code(KeyCode::Backspace), now);
+        }
+        typed(&mut app, "GOOD_1", now);
+        app.update(code(KeyCode::Enter), now);
+        let input = app.var_input.as_ref().unwrap();
+        assert_eq!(input.name.as_deref(), Some("GOOD_1"));
+        assert_eq!(input.text, "");
+        typed(&mut app, "v", now);
+        let cmds = app.update(code(KeyCode::Enter), now);
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(_)]));
+        assert_eq!(pending_of(&app, "GOOD_1").unwrap().base, None);
+    }
+
+    #[test]
+    fn add_existing_name_edits_it() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        app.update(key('a'), now);
+        typed(&mut app, "REDIS_DB", now);
+        app.update(code(KeyCode::Enter), now);
+        let input = app.var_input.as_ref().unwrap();
+        assert_eq!(input.name.as_deref(), Some("REDIS_DB"));
+        assert_eq!(input.text, "1");
+    }
+
+    #[test]
+    fn d_toggles_delete_and_u_undoes() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        select_var(&mut app, "REDIS_DB", now);
+        let cmds = app.update(key('d'), now);
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(_)]));
+        assert_eq!(
+            pending_of(&app, "REDIS_DB").unwrap().change,
+            crate::pending::Change::Delete
+        );
+        let cmds = app.update(key('d'), now);
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(_)]));
+        assert!(pending_of(&app, "REDIS_DB").is_none());
+        app.update(key('d'), now);
+        let cmds = app.update(key('u'), now);
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(_)]));
+        assert!(app.pending.envs.is_empty());
+        // Nothing to undo: no save.
+        assert!(app.update(key('u'), now).is_empty());
+    }
+
+    #[test]
+    fn editing_a_deleted_variable_starts_from_railway_value() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        select_var(&mut app, "REDIS_DB", now);
+        app.update(key('d'), now);
+        app.update(key('e'), now);
+        assert_eq!(app.var_input.as_ref().unwrap().text, "1");
+    }
+
+    #[test]
+    fn multiline_value_refuses_inline_edit() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        data(
+            &mut app,
+            vars_event("svc-a", Ok(vars(&[("KEY", "a\nb")]))),
+            now,
+        );
+        app.selection.variable = Some("KEY".into());
+        assert!(app.update(key('e'), now).is_empty());
+        assert!(app.var_input.is_none());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("multi-line value: press E to edit in $EDITOR")
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn E_emits_edit_external_with_current_value() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        select_var(&mut app, "REDIS_DB", now);
+        let cmds = app.update(key('E'), now);
+        assert_eq!(
+            cmds,
+            vec![Command::EditExternal {
+                name: "REDIS_DB".into(),
+                initial: "1".into()
+            }]
+        );
+        assert!(!format!("{cmds:?}").contains('1'));
+    }
+
+    #[test]
+    fn edited_event_sets_pending() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        let cmds = data(
+            &mut app,
+            DataEvent::Edited {
+                name: "REDIS_DB".into(),
+                result: Ok("7".into()),
+            },
+            now,
+        );
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(_)]));
+        let p = pending_of(&app, "REDIS_DB").unwrap();
+        assert_eq!(p.change, crate::pending::Change::Set { value: "7".into() });
+        assert_eq!(p.base.as_deref(), Some("1"));
+        let cmds = data(
+            &mut app,
+            DataEvent::Edited {
+                name: "REDIS_DB".into(),
+                result: Err("editor exited with status 1".into()),
+            },
+            now,
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(app.message.as_deref(), Some("editor exited with status 1"));
+        let event = DataEvent::Edited {
+            name: "N".into(),
+            result: Ok("s3cret-value".into()),
+        };
+        assert!(!format!("{event:?}").contains("s3cret-value"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn r_and_R_toggle_reveal() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        select_var(&mut app, "PORT", now);
+        let revealed = |app: &App| match app.stack.last() {
+            Some(View::Variables(v)) => (v.revealed.clone(), v.reveal_all),
+            _ => panic!(),
+        };
+        app.update(key('r'), now);
+        assert_eq!(revealed(&app).0.iter().collect::<Vec<_>>(), ["PORT"]);
+        app.update(key('r'), now);
+        assert!(revealed(&app).0.is_empty());
+        app.update(key('R'), now);
+        assert!(revealed(&app).1);
+        app.update(key('R'), now);
+        assert!(!revealed(&app).1);
+    }
+
+    #[test]
+    fn ctrl_c_quits_while_editing() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        app.update(key('a'), now);
+        assert_eq!(app.update(ctrl('c'), now), vec![Command::Quit]);
     }
 }

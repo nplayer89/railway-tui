@@ -241,7 +241,8 @@ impl Worker {
                 });
             }
             // The main loop exits on Quit; it never reaches the worker.
-            Command::Quit => {}
+            // Both are handled by the main loop before commands reach the worker.
+            Command::EditExternal { .. } | Command::Quit => {}
         }
     }
 

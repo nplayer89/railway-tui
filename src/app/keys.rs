@@ -5,8 +5,9 @@ use std::time::Instant;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use super::{App, Command, Kind, LogsView, View};
+use super::{App, Command, Kind, LogsView, VarInput, View};
 use crate::model::LogKind;
+use crate::pending::{Change, Pending, Target};
 use crate::status::default_log_kind;
 use crate::theme::THEMES;
 
@@ -22,6 +23,8 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             out.push(Command::Quit);
+        } else if self.var_input.is_some() {
+            self.var_input_key(key, out);
         } else if self.command_line.is_some() {
             self.command_key(key, now, out);
         } else if self.filter_input.is_some() {
@@ -180,7 +183,7 @@ impl App {
             Kind::Services => self.services_key(code, now, out),
             Kind::Deployments => self.deployments_key(code, out),
             Kind::Instances => self.instances_key(code, out),
-            Kind::Variables => false,
+            Kind::Variables => self.variables_key(code, out),
             Kind::Logs => self.logs_key(code, out),
         };
         if handled {
@@ -307,6 +310,181 @@ impl App {
         true
     }
 
+    fn variables_key(&mut self, code: KeyCode, out: &mut Vec<Command>) -> bool {
+        match code {
+            KeyCode::Char('a') => self.var_input = Some(VarInput::default()),
+            KeyCode::Char('e') | KeyCode::Enter => {
+                if let Some(name) = self.selected_var_name() {
+                    self.start_inline_edit(name);
+                }
+            }
+            KeyCode::Char('E') => {
+                if let Some(name) = self.selected_var_name() {
+                    let initial = self.edit_start_value(&name);
+                    out.push(Command::EditExternal { name, initial });
+                }
+            }
+            KeyCode::Char('d') => {
+                if let Some(name) = self.selected_var_name() {
+                    self.toggle_delete(&name, out);
+                }
+            }
+            KeyCode::Char('u') => {
+                if let Some(name) = self.selected_var_name() {
+                    self.undo_variable(&name, out);
+                }
+            }
+            KeyCode::Char('r') => {
+                if let Some(name) = self.selected_var_name() {
+                    if let Some(View::Variables(v)) = self.stack.last_mut() {
+                        if !v.revealed.remove(&name) {
+                            v.revealed.insert(name);
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('R') => {
+                if let Some(View::Variables(v)) = self.stack.last_mut() {
+                    v.reveal_all = !v.reveal_all;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Keys while a variable name or value is being typed.
+    fn var_input_key(&mut self, key: KeyEvent, out: &mut Vec<Command>) {
+        let Some(input) = self.var_input.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.var_input = None,
+            KeyCode::Enter => match input.name.clone() {
+                None => {
+                    let name = input.text.clone();
+                    if !valid_var_name(&name) {
+                        self.message = Some(
+                            "invalid name: use letters, digits and _, not starting with a digit"
+                                .into(),
+                        );
+                        return;
+                    }
+                    self.var_input = None;
+                    self.selection.variable = Some(name.clone());
+                    self.start_inline_edit(name);
+                }
+                Some(name) => {
+                    let value = std::mem::take(&mut input.text);
+                    self.var_input = None;
+                    self.set_variable(&name, value, out);
+                }
+            },
+            _ => edit_text(&mut input.text, key),
+        }
+    }
+
+    fn selected_var_name(&self) -> Option<String> {
+        let rows = self.variable_rows();
+        let selected = self.selection.variable.as_deref();
+        let index = rows
+            .iter()
+            .position(|r| Some(r.name) == selected)
+            .unwrap_or(0);
+        rows.get(index).map(|r| r.name.to_string())
+    }
+
+    /// The value on Railway and the pending change of `name` (unfiltered).
+    fn var_state(&self, name: &str) -> (Option<String>, Option<Change>) {
+        let current = self
+            .variables
+            .value
+            .as_ref()
+            .and_then(|v| v.get(name))
+            .cloned();
+        let pending = self
+            .env_id()
+            .zip(self.view_service_id(Kind::Variables))
+            .and_then(|(env, svc)| self.pending.service(env, svc))
+            .and_then(|s| s.vars.get(name))
+            .map(|p| p.change.clone());
+        (current, pending)
+    }
+
+    /// Where an edit starts: the pending value, else Railway's (also for a variable
+    /// marked for deletion), else empty.
+    fn edit_start_value(&self, name: &str) -> String {
+        match self.var_state(name) {
+            (_, Some(Change::Set { value })) => value,
+            (current, _) => current.unwrap_or_default(),
+        }
+    }
+
+    fn start_inline_edit(&mut self, name: String) {
+        let text = self.edit_start_value(&name);
+        if text.contains('\n') {
+            self.message = Some("multi-line value: press E to edit in $EDITOR".into());
+            return;
+        }
+        self.var_input = Some(VarInput {
+            name: Some(name),
+            text,
+        });
+    }
+
+    /// Runs `f` with the pending store and the open service as the target; false when
+    /// no service of an open environment is showing.
+    fn with_target(&mut self, f: impl FnOnce(&mut Pending, &Target)) -> bool {
+        let (Some(project), Some(env), Some(service_id)) = (
+            self.project.clone(),
+            self.environment.clone(),
+            self.view_service_id(Kind::Variables).map(String::from),
+        ) else {
+            return false;
+        };
+        let service_name = self
+            .service(&service_id)
+            .map_or_else(|| service_id.clone(), |s| s.service_name.clone());
+        let target = Target {
+            project_id: &project.id,
+            env_id: &env.id,
+            env_name: &env.name,
+            service_id: &service_id,
+            service_name: &service_name,
+        };
+        f(&mut self.pending, &target);
+        true
+    }
+
+    pub(super) fn set_variable(&mut self, name: &str, value: String, out: &mut Vec<Command>) {
+        let (current, _) = self.var_state(name);
+        if self.with_target(|p, t| p.set(t, name, value, current.as_deref())) {
+            out.push(Command::SavePending(self.pending.clone()));
+        }
+    }
+
+    fn toggle_delete(&mut self, name: &str, out: &mut Vec<Command>) {
+        let (current, pending) = self.var_state(name);
+        if pending == Some(Change::Delete) {
+            self.undo_variable(name, out);
+        } else if self.with_target(|p, t| p.delete(t, name, current.as_deref())) {
+            out.push(Command::SavePending(self.pending.clone()));
+        }
+    }
+
+    fn undo_variable(&mut self, name: &str, out: &mut Vec<Command>) {
+        if self.var_state(name).1.is_none() {
+            return;
+        }
+        if let (Some(env), Some(svc)) = (
+            self.env_id().map(String::from),
+            self.view_service_id(Kind::Variables).map(String::from),
+        ) {
+            self.pending.undo(&env, &svc, name);
+            out.push(Command::SavePending(self.pending.clone()));
+        }
+    }
+
     fn view_service_name(&self, kind: Kind) -> String {
         let id = self.view_service_id(kind).unwrap_or_default();
         self.service(id)
@@ -326,6 +504,15 @@ impl LogsView {
     fn scroll_down(&mut self, lines: usize) {
         self.scroll = self.scroll.saturating_sub(lines);
     }
+}
+
+/// A variable name Railway accepts: `^[A-Za-z_][A-Za-z0-9_]*$`.
+fn valid_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Typing into a one-line input: printable characters and Backspace.
