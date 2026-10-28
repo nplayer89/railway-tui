@@ -59,6 +59,7 @@ On launch it reopens the last-used project and environment.
 | `f`, `G` | resume following the log (Logs) |
 | `PageUp` / `PageDown` | scroll the log by a page (Logs) |
 | `ctrl-r` | reload (in the log view: reconnect the stream) |
+| `t` | theme picker (also `:theme`): moving previews, `enter` keeps and remembers, `esc` reverts |
 | `?` | toggle the help overlay |
 | `q`, `ctrl-c` | quit |
 
@@ -74,6 +75,7 @@ Optional, TOML, at `$XDG_CONFIG_HOME/railway-tui/railway-tui.conf` (default
 | `default_workspace` | Workspace to open, by id or name (case-insensitive). |
 | `default_project` | Project to open, by id or name (case-insensitive). |
 | `default_environment` | Environment to open, by id or name (case-insensitive). |
+| `theme` | Colour theme by id or name: `tokyo-night`, `tokyo-night-storm`, `catppuccin-mocha`, `catppuccin-macchiato`, `catppuccin-frappe`, `catppuccin-latte`, `dracula`, `nord`, `gruvbox-dark`, `gruvbox-light`, `solarized-dark`, `solarized-light`, `one-dark`, `rose-pine`, `kanagawa`, `everforest`. Default `tokyo-night`. A theme picked with `t` takes precedence. Themes use 24-bit colour. |
 
 Example:
 
@@ -83,6 +85,7 @@ refresh_interval_secs = 60
 default_workspace = "My Team"
 default_project = "my-api"
 default_environment = "production"
+theme = "catppuccin-mocha"
 ```
 
 ## Development

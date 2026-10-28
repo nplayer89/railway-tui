@@ -6,12 +6,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use super::{clean, theme};
+use super::clean;
 use crate::app::LogsView;
 use crate::logs::follow::StreamState;
 use crate::model::LogKind;
+use crate::theme::Theme;
 
-pub fn draw(frame: &mut Frame, area: Rect, logs: &LogsView) {
+pub fn draw(frame: &mut Frame, area: Rect, logs: &LogsView, t: &Theme) {
     let [title, badges, body] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -38,24 +39,24 @@ pub fn draw(frame: &mut Frame, area: Rect, logs: &LogsView) {
     frame.render_widget(
         Paragraph::new(Span::styled(
             text,
-            Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+            Style::new().fg(t.accent).add_modifier(Modifier::BOLD),
         )),
         title,
     );
 
     let (stream, line_style) = match &logs.state {
-        StreamState::Live => ("● LIVE".to_string(), Style::new().fg(theme::OK)),
-        StreamState::Connecting => ("CONNECTING…".to_string(), Style::new().fg(theme::BUSY)),
+        StreamState::Live => ("● LIVE".to_string(), Style::new().fg(t.ok)),
+        StreamState::Connecting => ("CONNECTING…".to_string(), Style::new().fg(t.busy)),
         StreamState::Reconnecting { attempt, retry_in } => (
             format!(
                 "RECONNECTING (attempt {attempt}, retry in {}s)",
                 retry_in.as_secs()
             ),
-            Style::new().fg(theme::ON_BADGE).bg(theme::BUSY),
+            Style::new().fg(t.bg).bg(t.busy),
         ),
         StreamState::Failed(msg) => (
             format!("DISCONNECTED: {}", clean(msg)),
-            Style::new().fg(theme::ON_BADGE).bg(theme::BAD),
+            Style::new().fg(t.bg).bg(t.bad),
         ),
     };
     let follow = if logs.follow { "FOLLOW" } else { "PAUSED" };
@@ -78,9 +79,9 @@ pub fn draw(frame: &mut Frame, area: Rect, logs: &LogsView) {
             Line::from(vec![
                 Span::styled(
                     l.timestamp.format("%H:%M:%S ").to_string(),
-                    Style::new().fg(theme::MUTED),
+                    Style::new().fg(t.muted),
                 ),
-                Span::styled(clean(&l.message), Style::new().fg(theme::TEXT)),
+                Span::styled(clean(&l.message), Style::new().fg(t.text)),
             ])
         })
         .collect();

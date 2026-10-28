@@ -6,7 +6,11 @@ use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 use ratatui::Terminal;
 
-use super::{draw, theme};
+use super::draw;
+use crate::theme::{Theme, THEMES};
+
+/// The default theme, which the fixtures render with.
+const T: &Theme = &THEMES[0];
 use crate::app::{App, LogsView, StartPrefs, View};
 use crate::logs::buffer::{LogBuffer, LOG_CAP};
 use crate::logs::follow::StreamState;
@@ -145,8 +149,8 @@ fn services_row_shows_coloured_boxes() {
     let buf = render(&app, Instant::now());
     let cells = find(&buf, "■");
     assert_eq!(cells.len(), 2, "{}", text(&buf));
-    assert_eq!(buf[cells[0]].fg, theme::OK);
-    assert_eq!(buf[cells[1]].fg, theme::BAD);
+    assert_eq!(buf[cells[0]].fg, T.ok);
+    assert_eq!(buf[cells[1]].fg, T.bad);
     // Boxes sit in the INSTANCES column, on the service's row.
     let header_y = (0..30)
         .find(|y| row_text(&buf, *y).contains("INSTANCES"))
@@ -168,8 +172,8 @@ fn failed_but_serving_has_striped_marker() {
     let cells = find(&buf, "▚");
     assert_eq!(cells.len(), 2, "{}", text(&buf));
     for c in cells {
-        assert_eq!(buf[c].fg, theme::BAD);
-        assert_eq!(buf[c].bg, theme::OK);
+        assert_eq!(buf[c].fg, T.bad);
+        assert_eq!(buf[c].bg, T.ok);
     }
 }
 
@@ -197,9 +201,9 @@ fn row_colours_follow_health() {
         let status_x = row_text(&buf, 2).find("STATUS").unwrap() as u16;
         (buf[(0, y)].fg, buf[(status_x, y)].fg)
     };
-    assert_eq!(fg_of("healthy"), (theme::TEXT, theme::OK));
-    assert_eq!(fg_of("building"), (theme::TEXT, theme::BUSY));
-    assert_eq!(fg_of("removed"), (theme::TEXT, theme::IDLE));
+    assert_eq!(fg_of("healthy"), (T.text, T.ok));
+    assert_eq!(fg_of("building"), (T.text, T.busy));
+    assert_eq!(fg_of("removed"), (T.text, T.idle));
 }
 
 #[test]
@@ -220,7 +224,7 @@ fn error_shows_stale_marker() {
         .into_iter()
         .find(|(x, y)| row_text(&buf, *y)[*x as usize..].starts_with("STALE: boom"))
         .expect("STALE marker");
-    assert_eq!(buf[at].fg, theme::BAD);
+    assert_eq!(buf[at].fg, T.bad);
 }
 
 #[test]
@@ -253,8 +257,8 @@ fn reconnecting_banner_visible() {
         .find(|y| row_text(&buf, *y).contains("RECONNECTING"))
         .expect("banner");
     assert!(row_text(&buf, y).contains("RECONNECTING (attempt 3, retry in 4s)"));
-    assert_eq!(buf[(0, y)].bg, theme::BUSY);
-    assert_eq!(buf[(99, y)].bg, theme::BUSY);
+    assert_eq!(buf[(0, y)].bg, T.busy);
+    assert_eq!(buf[(99, y)].bg, T.busy);
 }
 
 #[test]
@@ -264,8 +268,8 @@ fn disconnected_banner_is_red_across_the_width() {
     let y = (0..30)
         .find(|y| row_text(&buf, *y).contains("DISCONNECTED: nope"))
         .unwrap();
-    assert_eq!(buf[(0, y)].bg, theme::BAD);
-    assert_eq!(buf[(99, y)].bg, theme::BAD);
+    assert_eq!(buf[(0, y)].bg, T.bad);
+    assert_eq!(buf[(99, y)].bg, T.bad);
 }
 
 #[test]
@@ -278,7 +282,7 @@ fn live_badge_and_follow_state() {
         "{t}"
     );
     let live = find(&buf, "●")[0];
-    assert_eq!(buf[live].fg, theme::OK);
+    assert_eq!(buf[live].fg, T.ok);
     assert!(t.contains("10:20:00 hi"), "{t}");
     logs_mut(&mut app).follow = false;
     assert!(text(&render(&app, Instant::now())).contains("PAUSED"));
@@ -477,7 +481,7 @@ fn instances_view_lists_columns() {
     assert!(row_text(&buf, y).contains("d1"));
     assert_eq!(
         buf[(row_text(&buf, y).find("CRASHED").unwrap() as u16, y)].fg,
-        theme::BAD
+        T.bad
     );
 }
 
@@ -534,7 +538,7 @@ fn projects_heading_row_is_styled_and_projects_indented() {
     let h = (0..30)
         .find(|y| row_text(&buf, *y).starts_with("team"))
         .unwrap();
-    assert_eq!(buf[(0, h)].fg, theme::ACCENT);
+    assert_eq!(buf[(0, h)].fg, T.accent);
     assert!(row_text(&buf, h + 1).starts_with("  alpha"));
 }
 
@@ -626,4 +630,39 @@ fn environments_loading_shows_loading() {
     let t = text(&render(&app, Instant::now()));
     assert!(t.contains("loading…"), "{t}");
     assert!(!t.contains("no services"), "{t}");
+}
+
+#[test]
+fn theme_paints_background_and_status_colours() {
+    let d = deploy("d1", DeploymentStatus::Success, &[InstanceStatus::Running]);
+    let mut app = services_app(vec![service("api", d.clone(), vec![d])]);
+    app.theme = crate::theme::find("catppuccin-latte").unwrap();
+    let latte = app.theme();
+    let buf = render(&app, Instant::now());
+    assert_eq!(buf[(99, 29)].bg, latte.bg);
+    assert_eq!(buf[find(&buf, "■")[0]].fg, latte.ok);
+}
+
+#[test]
+fn theme_picker_lists_every_theme() {
+    let mut app = services_app(vec![]);
+    app.theme_picker = Some(0);
+    let t = text(&render_sized(&app, Instant::now(), 100, 40));
+    for theme in THEMES {
+        assert!(t.contains(theme.name), "missing {}\n{t}", theme.name);
+    }
+}
+
+#[test]
+fn selected_rows_are_readable_in_every_theme() {
+    let removed = deploy("c", DeploymentStatus::Removed, &[InstanceStatus::Stopped]);
+    let mut app = services_app(vec![service("removed", removed, vec![])]);
+    for i in 0..THEMES.len() {
+        app.theme = i;
+        let buf = render(&app, Instant::now());
+        let y = (0..30)
+            .find(|y| row_text(&buf, *y).starts_with("removed"))
+            .unwrap();
+        assert_readable(&buf, y);
+    }
 }

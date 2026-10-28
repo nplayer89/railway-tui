@@ -15,6 +15,7 @@ use crate::model::{
 };
 use crate::remember::Remembered;
 use crate::status::{default_log_kind, deployment_rows, DeploymentRow};
+use crate::theme::{self, Theme, THEMES};
 
 /// A fetched value with its freshness. A failed reload keeps the old value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +142,8 @@ pub struct StartPrefs {
     pub workspace: Option<String>,
     pub project: Option<String>,
     pub environment: Option<String>,
+    /// Configured theme id or name.
+    pub theme: Option<String>,
     pub remembered: Remembered,
 }
 
@@ -175,6 +178,10 @@ pub struct App {
     pub command_line: Option<String>,
     /// Highlighted index into `environments` while the picker is open.
     pub env_picker: Option<usize>,
+    /// Index into `THEMES` of the active (or previewed) theme.
+    pub theme: usize,
+    /// While the theme picker is open: the theme to restore on Esc.
+    pub theme_picker: Option<usize>,
     pub help: bool,
     /// One-shot notice (unknown command, nothing to open); cleared on the next key.
     pub message: Option<String>,
@@ -197,6 +204,7 @@ struct Requested {
 
 impl App {
     pub fn new(prefs: StartPrefs) -> (App, Vec<Command>) {
+        let (theme, message) = start_theme(&prefs);
         let mut app = App {
             prefs,
             stack: vec![View::Projects],
@@ -212,8 +220,10 @@ impl App {
             filter_input: None,
             command_line: None,
             env_picker: None,
+            theme,
+            theme_picker: None,
             help: false,
-            message: None,
+            message,
             backstop: backstop_interval(DEFAULT_HOURLY_LIMIT, None),
             blocked_until: None,
             live_updates: true,
@@ -303,6 +313,11 @@ impl App {
             .flat_map(|d| d.instances.iter().map(move |i| (d, i)))
             .filter(|(_, i)| self.passes_filter(&[&i.id]))
             .collect()
+    }
+
+    /// The active theme (the previewed one while the picker is open).
+    pub fn theme(&self) -> &'static Theme {
+        &THEMES[self.theme]
     }
 
     /// Highlighted row of the top table view, or None for an empty table or the log view.
@@ -442,6 +457,7 @@ impl App {
         let remembered = Remembered {
             last_project_id: self.project_id().map(String::from),
             last_environment_id: Some(env.id.clone()),
+            ..self.prefs.remembered.clone()
         };
         self.environment = Some(env);
         self.services = Loaded::default();
@@ -1001,6 +1017,21 @@ fn same_name(a: &str, b: &str) -> bool {
     a.to_lowercase() == b.to_lowercase()
 }
 
+/// The remembered pick, then the configured theme, then the default; with a
+/// notice when the configured name matches no theme.
+fn start_theme(prefs: &StartPrefs) -> (usize, Option<String>) {
+    if let Some(i) = prefs.remembered.theme.as_deref().and_then(theme::find) {
+        return (i, None);
+    }
+    match prefs.theme.as_deref() {
+        Some(name) => match theme::find(name) {
+            Some(i) => (i, None),
+            None => (0, Some(format!("unknown theme in config: {name}"))),
+        },
+        None => (0, None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1260,6 +1291,7 @@ mod tests {
                 Command::SaveRemembered(Remembered {
                     last_project_id: Some("p2".into()),
                     last_environment_id: Some("e-prod".into()),
+                    theme: None,
                 }),
             ]
         );
@@ -1463,6 +1495,7 @@ mod tests {
         assert!(cmds.contains(&Command::SaveRemembered(Remembered {
             last_project_id: Some("p2".into()),
             last_environment_id: Some("e-stg".into()),
+            theme: None,
         })));
         assert_eq!(app.env_picker, None);
         assert!(app.services.value.is_none());
@@ -1611,6 +1644,68 @@ mod tests {
         app.update(code(KeyCode::Esc), now);
         assert_eq!(app.table_filter, None);
         assert!(matches!(app.stack.last(), Some(View::Services)));
+    }
+
+    #[test]
+    fn theme_picker_previews_and_esc_restores() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        app.update(key('t'), now);
+        assert_eq!(app.theme_picker, Some(0));
+        app.update(key('j'), now);
+        app.update(key('j'), now);
+        assert_eq!(app.theme, 2, "moving previews the theme");
+        let cmds = app.update(code(KeyCode::Esc), now);
+        assert!(cmds.is_empty());
+        assert_eq!((app.theme, app.theme_picker), (0, None));
+        assert!(matches!(app.stack.last(), Some(View::Services)));
+    }
+
+    #[test]
+    fn theme_picker_enter_saves_choice_with_remembered_ids() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        typed(&mut app, ":theme", now);
+        app.update(code(KeyCode::Enter), now);
+        assert!(app.theme_picker.is_some());
+        app.update(code(KeyCode::Down), now);
+        let cmds = app.update(code(KeyCode::Enter), now);
+        assert_eq!(app.theme_picker, None);
+        let Some(Command::SaveRemembered(saved)) = cmds.first() else {
+            panic!("expected a save, got {cmds:?}");
+        };
+        assert_eq!(saved.theme.as_deref(), Some(THEMES[1].id));
+        assert_eq!(saved.last_environment_id.as_deref(), Some("e-prod"));
+        // Keeping the same theme again writes nothing.
+        app.update(key('t'), now);
+        assert!(app.update(code(KeyCode::Enter), now).is_empty());
+    }
+
+    #[test]
+    fn start_theme_prefers_remembered_then_config() {
+        let mut prefs = StartPrefs {
+            theme: Some("Nord".into()),
+            ..StartPrefs::default()
+        };
+        let nord = theme::find("nord").unwrap();
+        assert_eq!(App::new(prefs.clone()).0.theme, nord);
+        prefs.remembered.theme = Some("dracula".into());
+        assert_eq!(
+            App::new(prefs.clone()).0.theme,
+            theme::find("dracula").unwrap()
+        );
+        // A stale remembered id falls back to the config.
+        prefs.remembered.theme = Some("gone".into());
+        assert_eq!(App::new(prefs).0.theme, nord);
+        let (app, _) = App::new(StartPrefs {
+            theme: Some("nope".into()),
+            ..StartPrefs::default()
+        });
+        assert_eq!(app.theme, 0);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("unknown theme in config: nope")
+        );
     }
 
     #[test]

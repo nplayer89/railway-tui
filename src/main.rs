@@ -66,6 +66,7 @@ fn start_prefs(config: &Config, state_path: &Path) -> StartPrefs {
         workspace: config.default_workspace.clone(),
         project: config.default_project.clone(),
         environment: config.default_environment.clone(),
+        theme: config.theme.clone(),
         remembered: load_remembered(state_path),
     }
 }

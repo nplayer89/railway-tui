@@ -13,6 +13,8 @@ pub struct Config {
     pub default_workspace: Option<String>,
     pub default_project: Option<String>,
     pub default_environment: Option<String>,
+    /// Theme id or name; a theme picked in the app takes precedence.
+    pub theme: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
