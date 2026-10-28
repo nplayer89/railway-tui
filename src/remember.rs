@@ -61,7 +61,10 @@ mod tests {
         let p = dir.path().join("state.toml");
         std::fs::write(&p, "this is = = not toml [").unwrap();
         assert_eq!(load_remembered(&p), Remembered::default());
-        assert_eq!(load_remembered(&dir.path().join("missing")), Remembered::default());
+        assert_eq!(
+            load_remembered(&dir.path().join("missing")),
+            Remembered::default()
+        );
     }
 
     #[test]

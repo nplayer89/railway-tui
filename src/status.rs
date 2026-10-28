@@ -1,8 +1,6 @@
 //! Service health derivation and deployment-list ordering.
 
-use crate::model::{
-    DeploymentStatus, DeploymentSummary, InstanceStatus, LogKind, ServiceInstance,
-};
+use crate::model::{DeploymentStatus, DeploymentSummary, InstanceStatus, LogKind, ServiceInstance};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Health {
@@ -33,7 +31,10 @@ pub fn derive_row(svc: &ServiceInstance) -> RowStatus {
         .iter()
         .flat_map(|d| d.instances.iter().map(|i| i.status.clone()))
         .collect();
-    let ready = boxes.iter().filter(|s| **s == InstanceStatus::Running).count() as u32;
+    let ready = boxes
+        .iter()
+        .filter(|s| **s == InstanceStatus::Running)
+        .count() as u32;
     let desired = svc.num_replicas.max(1).max(ready);
 
     let (health, label) = match &svc.latest {
@@ -44,7 +45,9 @@ pub fn derive_row(svc: &ServiceInstance) -> RowStatus {
                 D::Failed | D::Crashed => {
                     let prev_running = svc.active.iter().any(|a| {
                         a.id != latest.id
-                            && a.instances.iter().any(|i| i.status == InstanceStatus::Running)
+                            && a.instances
+                                .iter()
+                                .any(|i| i.status == InstanceStatus::Running)
                     });
                     if prev_running {
                         (
@@ -70,7 +73,13 @@ pub fn derive_row(svc: &ServiceInstance) -> RowStatus {
         }
     };
 
-    RowStatus { health, label, boxes, ready, desired }
+    RowStatus {
+        health,
+        label,
+        boxes,
+        ready,
+        desired,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +127,10 @@ pub fn deployment_rows(svc: &ServiceInstance, history: &[DeploymentSummary]) -> 
     let mut rows: Vec<DeploymentRow> = Vec::new();
     let mut push = |d: &DeploymentSummary, tag: Option<RowTag>| {
         if !rows.iter().any(|r| r.deployment.id == d.id) {
-            rows.push(DeploymentRow { deployment: d.clone(), tag });
+            rows.push(DeploymentRow {
+                deployment: d.clone(),
+                tag,
+            });
         }
     };
     if let Some(latest) = &svc.latest {
@@ -152,12 +164,19 @@ mod tests {
             instances: inst
                 .iter()
                 .enumerate()
-                .map(|(i, s)| Instance { id: format!("{id}-i{i}"), status: s.clone() })
+                .map(|(i, s)| Instance {
+                    id: format!("{id}-i{i}"),
+                    status: s.clone(),
+                })
                 .collect(),
         }
     }
 
-    fn svc(n: u32, latest: Option<DeploymentSummary>, active: Vec<DeploymentSummary>) -> ServiceInstance {
+    fn svc(
+        n: u32,
+        latest: Option<DeploymentSummary>,
+        active: Vec<DeploymentSummary>,
+    ) -> ServiceInstance {
         ServiceInstance {
             service_id: "s".into(),
             service_name: "svc".into(),

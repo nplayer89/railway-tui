@@ -70,12 +70,16 @@ impl CliRunner for RealCliRunner {
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => return Ok(()),
                 Ok(Some(status)) => {
-                    return Err(AuthError::RefreshFailed(format!("`railway whoami` exited with {status}")))
+                    return Err(AuthError::RefreshFailed(format!(
+                        "`railway whoami` exited with {status}"
+                    )))
                 }
                 Ok(None) if start.elapsed() >= WHOAMI_TIMEOUT => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(AuthError::RefreshFailed("`railway whoami` timed out".into()));
+                    return Err(AuthError::RefreshFailed(
+                        "`railway whoami` timed out".into(),
+                    ));
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(50)),
                 Err(e) => return Err(AuthError::Io(e.to_string())),
@@ -111,11 +115,18 @@ pub struct CliTokenSource<R: CliRunner> {
 
 impl<R: CliRunner> CliTokenSource<R> {
     pub fn new(config_path: PathBuf, runner: R, now: Box<dyn Fn() -> i64 + Send + Sync>) -> Self {
-        Self { config_path, runner, now, refresh_lock: Mutex::new(()) }
+        Self {
+            config_path,
+            runner,
+            now,
+            refresh_lock: Mutex::new(()),
+        }
     }
 
     fn not_logged_in(&self) -> AuthError {
-        AuthError::NotLoggedIn { path: self.config_path.clone() }
+        AuthError::NotLoggedIn {
+            path: self.config_path.clone(),
+        }
     }
 
     /// Reads the CLI config from disk (never cached, never written).
@@ -123,23 +134,36 @@ impl<R: CliRunner> CliTokenSource<R> {
         let bytes = match std::fs::read(&self.config_path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(self.not_logged_in()),
-            Err(e) => return Err(AuthError::Io(format!("{}: {e}", self.config_path.display()))),
+            Err(e) => {
+                return Err(AuthError::Io(format!(
+                    "{}: {e}",
+                    self.config_path.display()
+                )))
+            }
         };
         let file: ConfigFile = serde_json::from_slice(&bytes)
             .map_err(|e| AuthError::Io(format!("{}: {e}", self.config_path.display())))?;
         let user = file.user.ok_or_else(|| self.not_logged_in())?;
         let non_empty = |s: Option<String>| s.filter(|s| !s.is_empty());
         if let Some(token) = non_empty(user.access_token) {
-            Ok(Creds { token, expires_at: user.token_expires_at })
+            Ok(Creds {
+                token,
+                expires_at: user.token_expires_at,
+            })
         } else if let Some(token) = non_empty(user.token) {
-            Ok(Creds { token, expires_at: None })
+            Ok(Creds {
+                token,
+                expires_at: None,
+            })
         } else {
             Err(self.not_logged_in())
         }
     }
 
     fn is_expired(&self, creds: &Creds) -> bool {
-        creds.expires_at.is_some_and(|exp| exp <= (self.now)() + EXPIRY_SKEW_SECS)
+        creds
+            .expires_at
+            .is_some_and(|exp| exp <= (self.now)() + EXPIRY_SKEW_SECS)
     }
 
     fn lock(&self) -> MutexGuard<'_, ()> {
@@ -158,7 +182,9 @@ impl<R: CliRunner> CliTokenSource<R> {
             other => other?,
         };
         if self.is_expired(&creds) {
-            return Err(AuthError::RefreshFailed("token still expired after `railway whoami`".into()));
+            return Err(AuthError::RefreshFailed(
+                "token still expired after `railway whoami`".into(),
+            ));
         }
         Ok(creds.token)
     }
@@ -215,7 +241,8 @@ pub fn token_source_from_env() -> Result<Arc<dyn TokenSource>, AuthError> {
             return Ok(Arc::new(EnvTokenSource(token)));
         }
     }
-    let home = dirs::home_dir().ok_or_else(|| AuthError::Io("cannot determine home directory".into()))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| AuthError::Io("cannot determine home directory".into()))?;
     let railway_env = std::env::var("RAILWAY_ENV").ok();
     let path = cli_config_path(railway_env.as_deref(), &home);
     let now = Box::new(|| {
@@ -276,7 +303,11 @@ mod tests {
         content: Option<&str>,
         rewrite: Option<String>,
         cli_missing: bool,
-    ) -> (tempfile::TempDir, CliTokenSource<FakeRunner>, Arc<AtomicUsize>) {
+    ) -> (
+        tempfile::TempDir,
+        CliTokenSource<FakeRunner>,
+        Arc<AtomicUsize>,
+    ) {
         source_delayed(content, rewrite, cli_missing, 0)
     }
 
@@ -285,14 +316,24 @@ mod tests {
         rewrite: Option<String>,
         cli_missing: bool,
         delay_ms: u64,
-    ) -> (tempfile::TempDir, CliTokenSource<FakeRunner>, Arc<AtomicUsize>) {
+    ) -> (
+        tempfile::TempDir,
+        CliTokenSource<FakeRunner>,
+        Arc<AtomicUsize>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         if let Some(c) = content {
             std::fs::write(&path, c).unwrap();
         }
         let calls = Arc::new(AtomicUsize::new(0));
-        let runner = FakeRunner { calls: calls.clone(), path: path.clone(), rewrite, cli_missing, delay_ms };
+        let runner = FakeRunner {
+            calls: calls.clone(),
+            path: path.clone(),
+            rewrite,
+            cli_missing,
+            delay_ms,
+        };
         let src = CliTokenSource::new(path, runner, Box::new(|| NOW));
         (dir, src, calls)
     }
@@ -307,8 +348,11 @@ mod tests {
     #[test]
     fn expired_token_runs_whoami_then_rereads() {
         let new = cfg(Some("new"), Some(NOW + 3600), None);
-        let (_d, s, calls) =
-            source(Some(&cfg(Some("old"), Some(NOW - 10), None)), Some(new), false);
+        let (_d, s, calls) = source(
+            Some(&cfg(Some("old"), Some(NOW - 10), None)),
+            Some(new),
+            false,
+        );
         assert_eq!(s.token().unwrap(), "new");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -316,8 +360,11 @@ mod tests {
     #[test]
     fn within_60s_counts_as_expired() {
         let new = cfg(Some("new"), Some(NOW + 3600), None);
-        let (_d, s, calls) =
-            source(Some(&cfg(Some("old"), Some(NOW + 60), None)), Some(new), false);
+        let (_d, s, calls) = source(
+            Some(&cfg(Some("old"), Some(NOW + 60), None)),
+            Some(new),
+            false,
+        );
         assert_eq!(s.token().unwrap(), "new");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -371,8 +418,11 @@ mod tests {
     #[test]
     fn refresh_after_rejection_runs_whoami_once_and_rereads() {
         let new = cfg(Some("new"), Some(NOW + 3600), None);
-        let (_d, s, calls) =
-            source(Some(&cfg(Some("old"), Some(NOW + 3600), None)), Some(new), false);
+        let (_d, s, calls) = source(
+            Some(&cfg(Some("old"), Some(NOW + 3600), None)),
+            Some(new),
+            false,
+        );
         assert_eq!(s.refresh_after_rejection().unwrap(), "new");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -380,8 +430,12 @@ mod tests {
     #[test]
     fn concurrent_rejections_run_whoami_once() {
         let new = cfg(Some("new"), Some(NOW + 3600), None);
-        let (_d, s, calls) =
-            source_delayed(Some(&cfg(Some("old"), Some(NOW + 3600), None)), Some(new), false, 300);
+        let (_d, s, calls) = source_delayed(
+            Some(&cfg(Some("old"), Some(NOW + 3600), None)),
+            Some(new),
+            false,
+            300,
+        );
         let s = Arc::new(s);
         let handles: Vec<_> = (0..2)
             .map(|_| {
@@ -398,8 +452,12 @@ mod tests {
     #[test]
     fn concurrent_expired_tokens_run_whoami_once() {
         let new = cfg(Some("new"), Some(NOW + 3600), None);
-        let (_d, s, calls) =
-            source_delayed(Some(&cfg(Some("old"), Some(NOW - 10), None)), Some(new), false, 300);
+        let (_d, s, calls) = source_delayed(
+            Some(&cfg(Some("old"), Some(NOW - 10), None)),
+            Some(new),
+            false,
+            300,
+        );
         let s = Arc::new(s);
         let handles: Vec<_> = (0..2)
             .map(|_| {
@@ -426,16 +484,34 @@ mod tests {
     fn env_source_cannot_refresh() {
         let s = EnvTokenSource("t".into());
         assert_eq!(s.token().unwrap(), "t");
-        assert!(matches!(s.refresh_after_rejection(), Err(AuthError::Rejected)));
+        assert!(matches!(
+            s.refresh_after_rejection(),
+            Err(AuthError::Rejected)
+        ));
     }
 
     #[test]
     fn cli_config_path_variants() {
         let h = Path::new("/h");
-        assert_eq!(cli_config_path(Some("staging"), h), Path::new("/h/.railway/config-staging.json"));
-        assert_eq!(cli_config_path(Some("dev"), h), Path::new("/h/.railway/config-dev.json"));
-        assert_eq!(cli_config_path(Some("develop"), h), Path::new("/h/.railway/config-dev.json"));
-        assert_eq!(cli_config_path(Some("production"), h), Path::new("/h/.railway/config.json"));
-        assert_eq!(cli_config_path(None, h), Path::new("/h/.railway/config.json"));
+        assert_eq!(
+            cli_config_path(Some("staging"), h),
+            Path::new("/h/.railway/config-staging.json")
+        );
+        assert_eq!(
+            cli_config_path(Some("dev"), h),
+            Path::new("/h/.railway/config-dev.json")
+        );
+        assert_eq!(
+            cli_config_path(Some("develop"), h),
+            Path::new("/h/.railway/config-dev.json")
+        );
+        assert_eq!(
+            cli_config_path(Some("production"), h),
+            Path::new("/h/.railway/config.json")
+        );
+        assert_eq!(
+            cli_config_path(None, h),
+            Path::new("/h/.railway/config.json")
+        );
     }
 }
