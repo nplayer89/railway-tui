@@ -22,6 +22,8 @@ const HISTORY_LIMIT: i64 = 500;
 const HEALTHY_AFTER: Duration = Duration::from_secs(30);
 /// Shown where a reconnect backfill may have been cut short.
 pub const GAP_MARKER: &str = "[railway-tui] some log lines may be missing here";
+/// Attribute that identifies the gap marker line, so filters never hide it.
+pub const GAP_ATTR: (&str, &str) = ("railway-tui", "gap");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamState {
@@ -194,7 +196,7 @@ async fn connection<S: LogSource>(
                 LogLine {
                     timestamp: gap_start,
                     message: GAP_MARKER.to_string(),
-                    attributes: Vec::new(),
+                    attributes: vec![(GAP_ATTR.0.to_string(), GAP_ATTR.1.to_string())],
                 },
             );
         }
@@ -658,7 +660,7 @@ mod tests {
             LogLine {
                 timestamp: line(1, "a").timestamp,
                 message: GAP_MARKER.to_string(),
-                attributes: Vec::new(),
+                attributes: vec![(GAP_ATTR.0.to_string(), GAP_ATTR.1.to_string())],
             }
         );
         assert_eq!(backfill[1], line(1000, "l0"));
