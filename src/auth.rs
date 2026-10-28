@@ -149,7 +149,14 @@ impl<R: CliRunner> CliTokenSource<R> {
     /// Caller must hold `refresh_lock`.
     fn whoami_and_reread(&self) -> Result<String, AuthError> {
         self.runner.run_whoami()?;
-        let creds = self.read_creds()?;
+        // The CLI may have been mid-write; retry a failed read once.
+        let creds = match self.read_creds() {
+            Err(AuthError::Io(_)) => {
+                std::thread::sleep(Duration::from_millis(100));
+                self.read_creds()?
+            }
+            other => other?,
+        };
         if self.is_expired(&creds) {
             return Err(AuthError::RefreshFailed("token still expired after `railway whoami`".into()));
         }
@@ -173,8 +180,21 @@ impl<R: CliRunner> TokenSource for CliTokenSource<R> {
     }
 
     fn refresh_after_rejection(&self) -> Result<String, AuthError> {
+        // The token the caller just had rejected.
+        let rejected = self.read_creds().ok().map(|c| c.token);
         let _guard = self.lock();
-        self.whoami_and_reread()
+        // Another caller may have refreshed while we waited for the lock.
+        if let Ok(creds) = self.read_creds() {
+            if Some(&creds.token) != rejected.as_ref() && !self.is_expired(&creds) {
+                return Ok(creds.token);
+            }
+        }
+        let token = self.whoami_and_reread()?;
+        if Some(&token) == rejected.as_ref() {
+            // The CLI only refreshes expired tokens, so this one was revoked server-side.
+            return Err(AuthError::Rejected);
+        }
+        Ok(token)
     }
 }
 
@@ -220,6 +240,7 @@ mod tests {
         path: PathBuf,
         rewrite: Option<String>,
         cli_missing: bool,
+        delay_ms: u64,
     }
 
     impl CliRunner for FakeRunner {
@@ -228,6 +249,7 @@ mod tests {
             if self.cli_missing {
                 return Err(AuthError::CliMissing);
             }
+            std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
             if let Some(content) = &self.rewrite {
                 std::fs::write(&self.path, content).unwrap();
             }
@@ -255,13 +277,22 @@ mod tests {
         rewrite: Option<String>,
         cli_missing: bool,
     ) -> (tempfile::TempDir, CliTokenSource<FakeRunner>, Arc<AtomicUsize>) {
+        source_delayed(content, rewrite, cli_missing, 0)
+    }
+
+    fn source_delayed(
+        content: Option<&str>,
+        rewrite: Option<String>,
+        cli_missing: bool,
+        delay_ms: u64,
+    ) -> (tempfile::TempDir, CliTokenSource<FakeRunner>, Arc<AtomicUsize>) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         if let Some(c) = content {
             std::fs::write(&path, c).unwrap();
         }
         let calls = Arc::new(AtomicUsize::new(0));
-        let runner = FakeRunner { calls: calls.clone(), path: path.clone(), rewrite, cli_missing };
+        let runner = FakeRunner { calls: calls.clone(), path: path.clone(), rewrite, cli_missing, delay_ms };
         let src = CliTokenSource::new(path, runner, Box::new(|| NOW));
         (dir, src, calls)
     }
@@ -343,6 +374,51 @@ mod tests {
         let (_d, s, calls) =
             source(Some(&cfg(Some("old"), Some(NOW + 3600), None)), Some(new), false);
         assert_eq!(s.refresh_after_rejection().unwrap(), "new");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn concurrent_rejections_run_whoami_once() {
+        let new = cfg(Some("new"), Some(NOW + 3600), None);
+        let (_d, s, calls) =
+            source_delayed(Some(&cfg(Some("old"), Some(NOW + 3600), None)), Some(new), false, 300);
+        let s = Arc::new(s);
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let s = s.clone();
+                std::thread::spawn(move || s.refresh_after_rejection())
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap().unwrap(), "new");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn concurrent_expired_tokens_run_whoami_once() {
+        let new = cfg(Some("new"), Some(NOW + 3600), None);
+        let (_d, s, calls) =
+            source_delayed(Some(&cfg(Some("old"), Some(NOW - 10), None)), Some(new), false, 300);
+        let s = Arc::new(s);
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let s = s.clone();
+                std::thread::spawn(move || s.token())
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap().unwrap(), "new");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn unchanged_token_after_rejection_is_rejected() {
+        let (_d, s, calls) = source(Some(&cfg(Some("acc"), Some(NOW + 3600), None)), None, false);
+        let err = s.refresh_after_rejection().unwrap_err();
+        assert!(matches!(err, AuthError::Rejected));
+        assert!(err.to_string().contains("railway login"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
