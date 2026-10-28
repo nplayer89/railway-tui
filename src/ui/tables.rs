@@ -7,18 +7,21 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
 
+use super::theme;
 use super::{box_style, clean};
 use crate::app::App;
 use crate::model::{DeploymentStatus, DeploymentSummary, InstanceStatus};
 use crate::status::{box_colour, derive_row, Health, RowTag};
 
-const HEADER: Style = Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD);
+const HEADER: Style = Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD);
+const TEXT: Style = Style::new().fg(theme::TEXT);
+const MUTED: Style = Style::new().fg(theme::MUTED);
 
 /// Selection is painted into the row style rather than as a table highlight, because a
 /// highlight overrides the explicit background of the `▚▚` marker.
 fn row_style(fg: Style, selected: bool) -> Style {
     if selected {
-        fg.bg(super::SELECT_BG).add_modifier(Modifier::BOLD)
+        fg.bg(theme::SELECT_BG).add_modifier(Modifier::BOLD)
     } else {
         fg
     }
@@ -26,25 +29,25 @@ fn row_style(fg: Style, selected: bool) -> Style {
 
 fn health_colour(h: Health) -> Color {
     match h {
-        Health::Healthy => Color::Green,
-        Health::Degraded | Health::Failing | Health::FailedButServing => Color::Red,
-        Health::Progressing => Color::Yellow,
-        Health::Inactive => Color::Gray,
+        Health::Healthy => theme::OK,
+        Health::Degraded | Health::Failing | Health::FailedButServing => theme::BAD,
+        Health::Progressing => theme::BUSY,
+        Health::Inactive => theme::IDLE,
     }
 }
 
 fn deployment_colour(s: &DeploymentStatus) -> Color {
     use DeploymentStatus as D;
     match s {
-        D::Success => Color::Green,
-        D::Failed | D::Crashed => Color::Red,
+        D::Success => theme::OK,
+        D::Failed | D::Crashed => theme::BAD,
         D::Building
         | D::Deploying
         | D::Queued
         | D::Waiting
         | D::Initializing
-        | D::NeedsApproval => Color::Yellow,
-        _ => Color::Gray,
+        | D::NeedsApproval => theme::BUSY,
+        _ => theme::IDLE,
     }
 }
 
@@ -89,13 +92,7 @@ fn render_table(
     empty: &str,
 ) {
     if rows.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                empty.to_string(),
-                Style::new().fg(Color::DarkGray),
-            )),
-            area,
-        );
+        frame.render_widget(Paragraph::new(Span::styled(empty.to_string(), MUTED)), area);
         return;
     }
     let mut state = TableState::default().with_selected(selected);
@@ -119,7 +116,7 @@ pub fn projects(frame: &mut Frame, area: Rect, app: &App) {
         }
         rows.push(
             Row::new([Cell::from(format!("  {}", clean(&project.name)))])
-                .style(row_style(Style::new(), selected_project == Some(i))),
+                .style(row_style(TEXT, selected_project == Some(i))),
         );
     }
     let empty = if app.workspaces.loading {
@@ -174,23 +171,23 @@ pub fn services(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
         if row.health == Health::FailedButServing {
             status.push(Span::styled(
                 "▚▚",
-                Style::new().fg(Color::Red).bg(Color::Green),
+                Style::new().fg(theme::BAD).bg(theme::OK),
             ));
             status.push(Span::raw(" "));
         }
-        status.push(Span::raw(clean(&row.label)));
+        status.push(Span::styled(clean(&row.label), Style::new().fg(colour)));
         let latest = svc.latest.as_ref();
         rows.push(
             Row::new([
                 Cell::from(clean(&svc.service_name)),
                 Cell::from(Line::from(boxes)),
-                Cell::from(format!("{}/{}", row.ready, row.desired)),
+                Cell::from(format!("{}/{}", row.ready, row.desired)).style(MUTED),
                 Cell::from(Line::from(status)),
-                Cell::from(latest.map_or("-".into(), |d| relative(d.created_at, now))),
-                Cell::from(latest.map_or("-".into(), short_sha)),
+                Cell::from(latest.map_or("-".into(), |d| relative(d.created_at, now))).style(MUTED),
+                Cell::from(latest.map_or("-".into(), short_sha)).style(MUTED),
                 Cell::from(latest.map_or("-".into(), message)),
             ])
-            .style(row_style(Style::new().fg(colour), selected == Some(i))),
+            .style(row_style(TEXT, selected == Some(i))),
         );
     }
     let empty = service_empty_text(app, "no services");
@@ -235,16 +232,14 @@ pub fn deployments(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>)
                 None => "",
             };
             Row::new([
-                Cell::from(tag),
-                Cell::from(clean(&d.status.label())),
-                Cell::from(relative(d.created_at, now)),
-                Cell::from(short_sha(d)),
+                Cell::from(tag).style(Style::new().fg(theme::HINT)),
+                Cell::from(clean(&d.status.label()))
+                    .style(Style::new().fg(deployment_colour(&d.status))),
+                Cell::from(relative(d.created_at, now)).style(MUTED),
+                Cell::from(short_sha(d)).style(MUTED),
                 Cell::from(message(d)),
             ])
-            .style(row_style(
-                Style::new().fg(deployment_colour(&d.status)),
-                selected == Some(i),
-            ))
+            .style(row_style(TEXT, selected == Some(i)))
         })
         .collect();
     let empty = if app.deployments.loading {
@@ -282,13 +277,10 @@ pub fn instances(frame: &mut Frame, area: Rect, app: &App) {
             };
             Row::new([
                 Cell::from(clean(&i.id)),
-                Cell::from(status),
-                Cell::from(clean(&d.id)),
+                Cell::from(status).style(box_style(&box_colour(&i.status))),
+                Cell::from(clean(&d.id)).style(MUTED),
             ])
-            .style(row_style(
-                box_style(&box_colour(&i.status)),
-                selected == Some(n),
-            ))
+            .style(row_style(TEXT, selected == Some(n)))
         })
         .collect();
     let empty = service_empty_text(app, "no instances");

@@ -1,12 +1,12 @@
 //! The log view: title, stream/follow badges and the visible window of lines.
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use super::clean;
+use super::{clean, theme};
 use crate::app::LogsView;
 use crate::logs::follow::StreamState;
 use crate::model::LogKind;
@@ -38,24 +38,24 @@ pub fn draw(frame: &mut Frame, area: Rect, logs: &LogsView) {
     frame.render_widget(
         Paragraph::new(Span::styled(
             text,
-            Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
         )),
         title,
     );
 
     let (stream, line_style) = match &logs.state {
-        StreamState::Live => ("● LIVE".to_string(), Style::new().fg(Color::Green)),
-        StreamState::Connecting => ("CONNECTING…".to_string(), Style::new().fg(Color::Yellow)),
+        StreamState::Live => ("● LIVE".to_string(), Style::new().fg(theme::OK)),
+        StreamState::Connecting => ("CONNECTING…".to_string(), Style::new().fg(theme::BUSY)),
         StreamState::Reconnecting { attempt, retry_in } => (
             format!(
                 "RECONNECTING (attempt {attempt}, retry in {}s)",
                 retry_in.as_secs()
             ),
-            Style::new().fg(Color::Black).bg(Color::Yellow),
+            Style::new().fg(theme::ON_BADGE).bg(theme::BUSY),
         ),
         StreamState::Failed(msg) => (
             format!("DISCONNECTED: {}", clean(msg)),
-            Style::new().fg(Color::White).bg(Color::Red),
+            Style::new().fg(theme::ON_BADGE).bg(theme::BAD),
         ),
     };
     let follow = if logs.follow { "FOLLOW" } else { "PAUSED" };
@@ -78,9 +78,9 @@ pub fn draw(frame: &mut Frame, area: Rect, logs: &LogsView) {
             Line::from(vec![
                 Span::styled(
                     l.timestamp.format("%H:%M:%S ").to_string(),
-                    Style::new().fg(Color::DarkGray),
+                    Style::new().fg(theme::MUTED),
                 ),
-                Span::raw(clean(&l.message)),
+                Span::styled(clean(&l.message), Style::new().fg(theme::TEXT)),
             ])
         })
         .collect();
