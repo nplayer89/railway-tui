@@ -569,5 +569,5 @@ fn server_labels_are_cleaned() {
     });
     let buf = render(&app, Instant::now());
     assert!(buf.content().iter().all(|c| !c.symbol().contains('\u{1b}')));
-    assert!(text(&buf).contains("BAD"));
+    assert!(text(&buf).contains("UNKNOWN(BAD)"), "{}", text(&buf));
 }

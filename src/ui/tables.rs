@@ -264,7 +264,7 @@ pub fn instances(frame: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .map(|(n, (d, i))| {
             let status = match &i.status {
-                InstanceStatus::Unknown(raw) => clean(raw),
+                InstanceStatus::Unknown(raw) => format!("UNKNOWN({})", clean(raw)),
                 other => format!("{other:?}").to_uppercase(),
             };
             Row::new([
