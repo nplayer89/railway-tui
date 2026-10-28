@@ -7,47 +7,51 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
 
-use super::theme;
 use super::{box_style, clean};
 use crate::app::App;
 use crate::model::{DeploymentStatus, DeploymentSummary, InstanceStatus};
 use crate::status::{box_colour, derive_row, Health, RowTag};
+use crate::theme::Theme;
 
-const HEADER: Style = Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD);
-const TEXT: Style = Style::new().fg(theme::TEXT);
-const MUTED: Style = Style::new().fg(theme::MUTED);
+fn heading(t: &Theme) -> Style {
+    Style::new().fg(t.accent).add_modifier(Modifier::BOLD)
+}
+
+fn fg(c: Color) -> Style {
+    Style::new().fg(c)
+}
 
 /// Selection is painted into the row style rather than as a table highlight, because a
 /// highlight overrides the explicit background of the `▚▚` marker.
-fn row_style(fg: Style, selected: bool) -> Style {
+fn row_style(t: &Theme, fg: Style, selected: bool) -> Style {
     if selected {
-        fg.bg(theme::SELECT_BG).add_modifier(Modifier::BOLD)
+        fg.bg(t.select_bg).add_modifier(Modifier::BOLD)
     } else {
         fg
     }
 }
 
-fn health_colour(h: Health) -> Color {
+fn health_colour(t: &Theme, h: Health) -> Color {
     match h {
-        Health::Healthy => theme::OK,
-        Health::Degraded | Health::Failing | Health::FailedButServing => theme::BAD,
-        Health::Progressing => theme::BUSY,
-        Health::Inactive => theme::IDLE,
+        Health::Healthy => t.ok,
+        Health::Degraded | Health::Failing | Health::FailedButServing => t.bad,
+        Health::Progressing => t.busy,
+        Health::Inactive => t.idle,
     }
 }
 
-fn deployment_colour(s: &DeploymentStatus) -> Color {
+fn deployment_colour(t: &Theme, s: &DeploymentStatus) -> Color {
     use DeploymentStatus as D;
     match s {
-        D::Success => theme::OK,
-        D::Failed | D::Crashed => theme::BAD,
+        D::Success => t.ok,
+        D::Failed | D::Crashed => t.bad,
         D::Building
         | D::Deploying
         | D::Queued
         | D::Waiting
         | D::Initializing
-        | D::NeedsApproval => theme::BUSY,
-        _ => theme::IDLE,
+        | D::NeedsApproval => t.busy,
+        _ => t.idle,
     }
 }
 
@@ -78,8 +82,8 @@ fn message(d: &DeploymentSummary) -> String {
     )
 }
 
-fn header(cols: &[&'static str]) -> Row<'static> {
-    Row::new(cols.iter().map(|c| Cell::from(*c))).style(HEADER)
+fn header(t: &Theme, cols: &[&'static str]) -> Row<'static> {
+    Row::new(cols.iter().map(|c| Cell::from(*c))).style(heading(t))
 }
 
 fn render_table(
@@ -89,10 +93,10 @@ fn render_table(
     rows: Vec<Row<'static>>,
     widths: Vec<Constraint>,
     selected: Option<usize>,
-    empty: &str,
+    empty: Span<'static>,
 ) {
     if rows.is_empty() {
-        frame.render_widget(Paragraph::new(Span::styled(empty.to_string(), MUTED)), area);
+        frame.render_widget(Paragraph::new(empty), area);
         return;
     }
     let mut state = TableState::default().with_selected(selected);
@@ -101,6 +105,7 @@ fn render_table(
 }
 
 pub fn projects(frame: &mut Frame, area: Rect, app: &App) {
+    let t = app.theme();
     let project_rows = app.project_rows();
     let selected_project = app.selected_index();
     let mut rows: Vec<Row> = Vec::new();
@@ -109,14 +114,17 @@ pub fn projects(frame: &mut Frame, area: Rect, app: &App) {
     for (i, (workspace, project)) in project_rows.iter().enumerate() {
         if current != Some(workspace.id.as_str()) {
             current = Some(workspace.id.as_str());
-            rows.push(Row::new([Cell::from(clean(&workspace.name))]).style(HEADER));
+            rows.push(Row::new([Cell::from(clean(&workspace.name))]).style(heading(t)));
         }
         if selected_project == Some(i) {
             selected = Some(rows.len());
         }
         rows.push(
-            Row::new([Cell::from(format!("  {}", clean(&project.name)))])
-                .style(row_style(TEXT, selected_project == Some(i))),
+            Row::new([Cell::from(format!("  {}", clean(&project.name)))]).style(row_style(
+                t,
+                fg(t.text),
+                selected_project == Some(i),
+            )),
         );
     }
     let empty = if app.workspaces.loading {
@@ -127,11 +135,11 @@ pub fn projects(frame: &mut Frame, area: Rect, app: &App) {
     render_table(
         frame,
         area,
-        header(&["PROJECT"]),
+        header(t, &["PROJECT"]),
         rows,
         vec![Constraint::Fill(1)],
         selected,
-        empty,
+        Span::styled(empty, fg(t.muted)),
     );
 }
 
@@ -153,26 +161,24 @@ fn service_empty_text(app: &App, none: &'static str) -> &'static str {
 }
 
 pub fn services(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
+    let t = app.theme();
     let mut rows = Vec::new();
     let mut box_width = "INSTANCES".len() as u16;
     let selected = app.selected_index();
     for (i, svc) in app.service_rows().into_iter().enumerate() {
         let row = derive_row(svc);
-        let colour = health_colour(row.health);
+        let colour = health_colour(t, row.health);
         let mut boxes: Vec<Span> = Vec::new();
         for (i, b) in row.boxes.iter().enumerate() {
             if i > 0 {
                 boxes.push(Span::raw(" "));
             }
-            boxes.push(Span::styled("■", box_style(&box_colour(b))));
+            boxes.push(Span::styled("■", box_style(t, &box_colour(b))));
         }
         box_width = box_width.max((row.boxes.len() * 2).saturating_sub(1) as u16);
         let mut status: Vec<Span> = Vec::new();
         if row.health == Health::FailedButServing {
-            status.push(Span::styled(
-                "▚▚",
-                Style::new().fg(theme::BAD).bg(theme::OK),
-            ));
+            status.push(Span::styled("▚▚", Style::new().fg(t.bad).bg(t.ok)));
             status.push(Span::raw(" "));
         }
         status.push(Span::styled(clean(&row.label), Style::new().fg(colour)));
@@ -181,28 +187,32 @@ pub fn services(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
             Row::new([
                 Cell::from(clean(&svc.service_name)),
                 Cell::from(Line::from(boxes)),
-                Cell::from(format!("{}/{}", row.ready, row.desired)).style(MUTED),
+                Cell::from(format!("{}/{}", row.ready, row.desired)).style(fg(t.muted)),
                 Cell::from(Line::from(status)),
-                Cell::from(latest.map_or("-".into(), |d| relative(d.created_at, now))).style(MUTED),
-                Cell::from(latest.map_or("-".into(), short_sha)).style(MUTED),
+                Cell::from(latest.map_or("-".into(), |d| relative(d.created_at, now)))
+                    .style(fg(t.muted)),
+                Cell::from(latest.map_or("-".into(), short_sha)).style(fg(t.muted)),
                 Cell::from(latest.map_or("-".into(), message)),
             ])
-            .style(row_style(TEXT, selected == Some(i))),
+            .style(row_style(t, fg(t.text), selected == Some(i))),
         );
     }
     let empty = service_empty_text(app, "no services");
     render_table(
         frame,
         area,
-        header(&[
-            "SERVICE",
-            "INSTANCES",
-            "READY",
-            "STATUS",
-            "DEPLOYED",
-            "COMMIT",
-            "MESSAGE",
-        ]),
+        header(
+            t,
+            &[
+                "SERVICE",
+                "INSTANCES",
+                "READY",
+                "STATUS",
+                "DEPLOYED",
+                "COMMIT",
+                "MESSAGE",
+            ],
+        ),
         rows,
         vec![
             Constraint::Length(20),
@@ -214,11 +224,12 @@ pub fn services(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
             Constraint::Fill(1),
         ],
         selected,
-        empty,
+        Span::styled(empty, fg(t.muted)),
     );
 }
 
 pub fn deployments(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
+    let t = app.theme();
     let selected = app.selected_index();
     let rows: Vec<Row> = app
         .deployment_table()
@@ -232,14 +243,14 @@ pub fn deployments(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>)
                 None => "",
             };
             Row::new([
-                Cell::from(tag).style(Style::new().fg(theme::HINT)),
+                Cell::from(tag).style(Style::new().fg(t.hint)),
                 Cell::from(clean(&d.status.label()))
-                    .style(Style::new().fg(deployment_colour(&d.status))),
-                Cell::from(relative(d.created_at, now)).style(MUTED),
-                Cell::from(short_sha(d)).style(MUTED),
+                    .style(Style::new().fg(deployment_colour(t, &d.status))),
+                Cell::from(relative(d.created_at, now)).style(fg(t.muted)),
+                Cell::from(short_sha(d)).style(fg(t.muted)),
                 Cell::from(message(d)),
             ])
-            .style(row_style(TEXT, selected == Some(i)))
+            .style(row_style(t, fg(t.text), selected == Some(i)))
         })
         .collect();
     let empty = if app.deployments.loading {
@@ -250,7 +261,7 @@ pub fn deployments(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>)
     render_table(
         frame,
         area,
-        header(&["TAG", "STATUS", "DEPLOYED", "COMMIT", "MESSAGE"]),
+        header(t, &["TAG", "STATUS", "DEPLOYED", "COMMIT", "MESSAGE"]),
         rows,
         vec![
             Constraint::Length(8),
@@ -260,11 +271,12 @@ pub fn deployments(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>)
             Constraint::Fill(1),
         ],
         selected,
-        empty,
+        Span::styled(empty, fg(t.muted)),
     );
 }
 
 pub fn instances(frame: &mut Frame, area: Rect, app: &App) {
+    let t = app.theme();
     let selected = app.selected_index();
     let rows: Vec<Row> = app
         .instance_rows()
@@ -277,17 +289,17 @@ pub fn instances(frame: &mut Frame, area: Rect, app: &App) {
             };
             Row::new([
                 Cell::from(clean(&i.id)),
-                Cell::from(status).style(box_style(&box_colour(&i.status))),
-                Cell::from(clean(&d.id)).style(MUTED),
+                Cell::from(status).style(box_style(t, &box_colour(&i.status))),
+                Cell::from(clean(&d.id)).style(fg(t.muted)),
             ])
-            .style(row_style(TEXT, selected == Some(n)))
+            .style(row_style(t, fg(t.text), selected == Some(n)))
         })
         .collect();
     let empty = service_empty_text(app, "no instances");
     render_table(
         frame,
         area,
-        header(&["ID", "STATUS", "DEPLOYMENT"]),
+        header(t, &["ID", "STATUS", "DEPLOYMENT"]),
         rows,
         vec![
             Constraint::Length(40),
@@ -295,6 +307,6 @@ pub fn instances(frame: &mut Frame, area: Rect, app: &App) {
             Constraint::Fill(1),
         ],
         selected,
-        empty,
+        Span::styled(empty, fg(t.muted)),
     );
 }

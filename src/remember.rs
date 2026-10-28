@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 pub struct Remembered {
     pub last_project_id: Option<String>,
     pub last_environment_id: Option<String>,
+    /// Theme id chosen in the picker.
+    pub theme: Option<String>,
 }
 
 /// `<xdg or home/.local/state>/railway-tui/state.toml`. An empty XDG value counts as unset.
@@ -50,6 +52,7 @@ mod tests {
         let r = Remembered {
             last_project_id: Some("p1".into()),
             last_environment_id: Some("e1".into()),
+            theme: Some("nord".into()),
         };
         save_remembered(&p, &r).unwrap();
         assert_eq!(load_remembered(&p), r);

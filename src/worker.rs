@@ -676,6 +676,7 @@ mod tests {
         let r = Remembered {
             last_project_id: Some("p1".into()),
             last_environment_id: Some("e1".into()),
+            theme: None,
         };
         h.send(Command::SaveRemembered(r.clone())).await;
         let deadline = Instant::now() + Duration::from_secs(5);

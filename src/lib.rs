@@ -9,5 +9,6 @@ pub mod logs;
 pub mod model;
 pub mod remember;
 pub mod status;
+pub mod theme;
 pub mod ui;
 pub mod worker;

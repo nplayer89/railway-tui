@@ -4,7 +4,6 @@ mod logs;
 mod tables;
 #[cfg(test)]
 mod tests;
-mod theme;
 
 use std::time::Instant;
 
@@ -17,13 +16,14 @@ use ratatui::Frame;
 
 use crate::app::{App, Loaded, View};
 use crate::status::BoxColour;
+use crate::theme::{Theme, THEMES};
 
-fn box_style(c: &BoxColour) -> Style {
+fn box_style(t: &Theme, c: &BoxColour) -> Style {
     Style::new().fg(match c {
-        BoxColour::Green => theme::OK,
-        BoxColour::Red => theme::BAD,
-        BoxColour::Yellow => theme::BUSY,
-        BoxColour::Grey => theme::IDLE,
+        BoxColour::Green => t.ok,
+        BoxColour::Red => t.bad,
+        BoxColour::Yellow => t.busy,
+        BoxColour::Grey => t.idle,
     })
 }
 
@@ -39,6 +39,8 @@ fn clean(s: &str) -> String {
 }
 
 pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
+    let t = app.theme();
+    frame.render_widget(Block::new().style(base(t)), frame.area());
     let [head, body, foot] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(0),
@@ -52,16 +54,19 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
         Some(View::Services) => tables::services(frame, body, app, wall),
         Some(View::Deployments { .. }) => tables::deployments(frame, body, app, wall),
         Some(View::Instances { .. }) => tables::instances(frame, body, app),
-        Some(View::Logs(l)) => logs::draw(frame, body, l),
+        Some(View::Logs(l)) => logs::draw(frame, body, l, t),
         Some(View::Projects) | None => tables::projects(frame, body, app),
     }
     draw_footer(frame, foot, app);
 
     if app.help {
-        draw_help(frame, body);
+        draw_help(frame, body, t);
     }
     if let Some(index) = app.env_picker {
         draw_env_picker(frame, body, app, index);
+    }
+    if app.theme_picker.is_some() {
+        draw_theme_picker(frame, body, app);
     }
 }
 
@@ -74,7 +79,7 @@ fn hints(app: &App) -> &'static str {
             "<enter> logs  </> filter  <esc> back  <?> help"
         }
         Some(View::Logs(_)) => "<b> build/runtime  <f> follow  </> filter  <esc> back  <?> help",
-        _ => "<enter> open  </> filter  <:> command  <?> help",
+        _ => "<enter> open  </> filter  <:> command  <t> theme  <?> help",
     }
 }
 
@@ -98,6 +103,7 @@ fn freshness_source(app: &App) -> Option<Freshness<'_>> {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
+    let t = app.theme();
     let workspace = app
         .workspace_id
         .as_deref()
@@ -112,8 +118,8 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
         .unwrap_or("-");
     let project = app.project.as_ref().map_or("-", |p| p.name.as_str());
     let env = app.environment.as_ref().map_or("-", |e| e.name.as_str());
-    let dim = Style::new().fg(theme::MUTED);
-    let text = Style::new().fg(theme::TEXT);
+    let dim = Style::new().fg(t.muted);
+    let text = Style::new().fg(t.text);
     let line1 = Line::from(vec![
         Span::styled("Workspace: ", dim),
         Span::styled(clean(workspace), text),
@@ -122,13 +128,13 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
         Span::styled("  Env: ", dim),
         Span::styled(clean(env), text),
         Span::raw("    "),
-        Span::styled(hints(app), Style::new().fg(theme::HINT)),
+        Span::styled(hints(app), Style::new().fg(t.hint)),
     ]);
 
     let mut spans: Vec<Span> = Vec::new();
     if let Some((loading, fetched_at, error)) = freshness_source(app) {
         let age = fetched_at.map(|at| now.saturating_duration_since(at).as_secs());
-        let red = Style::new().fg(theme::BAD);
+        let red = Style::new().fg(t.bad);
         match (error, age, loading) {
             (Some(err), Some(a), _) => spans.push(Span::styled(
                 format!("STALE: {} (last ok {a}s ago)", clean(err)),
@@ -144,22 +150,20 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
         }
     }
     if !app.live_updates {
-        spans.push(Span::styled(
-            "  live updates off",
-            Style::new().fg(theme::BUSY),
-        ));
+        spans.push(Span::styled("  live updates off", Style::new().fg(t.busy)));
     }
     if let Some(until) = app.blocked_until.filter(|u| *u > now) {
         let secs = until.saturating_duration_since(now).as_secs();
         spans.push(Span::styled(
             format!("  rate limited, retrying in {secs}s"),
-            Style::new().fg(theme::BUSY),
+            Style::new().fg(t.busy),
         ));
     }
     frame.render_widget(Paragraph::new(vec![line1, Line::from(spans)]), area);
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let t = app.theme();
     if let Some(text) = &app.command_line {
         frame.render_widget(Paragraph::new(format!(":{}▏", clean(text))), area);
         return;
@@ -183,21 +187,61 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     }
     let mut spans = vec![Span::styled(
         format!(" {} ", crumbs.join(" > ")),
-        Style::new().fg(theme::ON_BADGE).bg(theme::ACCENT),
+        Style::new().fg(t.bg).bg(t.accent),
     )];
     if let Some(filter) = &app.table_filter {
         spans.push(Span::styled(
             format!(" filter: {}", clean(filter)),
-            Style::new().fg(theme::HINT),
+            Style::new().fg(t.hint),
         ));
     }
     if let Some(msg) = &app.message {
         spans.push(Span::styled(
             format!("  {}", clean(msg)),
-            Style::new().fg(theme::BUSY),
+            Style::new().fg(t.busy),
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Default text on the theme background.
+fn base(t: &Theme) -> Style {
+    Style::new().fg(t.text).bg(t.bg)
+}
+
+/// A bordered overlay in the theme's colours.
+fn popup<'a>(t: &Theme, title: &'a str) -> Block<'a> {
+    Block::bordered()
+        .title(Span::styled(title, Style::new().fg(t.accent)))
+        .border_style(Style::new().fg(t.muted))
+        .style(base(t))
+}
+
+/// Lists every theme with a swatch of its status colours; the highlighted one is live.
+fn draw_theme_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let t = app.theme();
+    let rect = centered(area, 40, (THEMES.len() as u16).saturating_add(2));
+    frame.render_widget(Clear, rect);
+    let lines: Vec<Line> = THEMES
+        .iter()
+        .enumerate()
+        .map(|(i, theme)| {
+            let row = if i == app.theme {
+                Style::new()
+                    .fg(t.text)
+                    .bg(t.select_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(t.text)
+            };
+            let mut spans = vec![Span::styled(format!(" {:<24}", theme.name), row)];
+            for c in [theme.ok, theme.busy, theme.bad, theme.accent, theme.hint] {
+                spans.push(Span::styled("■ ", row.fg(c)));
+            }
+            Line::from(spans).style(row)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines).block(popup(t, " Theme ")), rect);
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -211,7 +255,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
+fn draw_help(frame: &mut Frame, area: Rect, t: &Theme) {
     let text = [
         "j/k, arrows  move / scroll",
         "enter        open",
@@ -223,19 +267,18 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         "b            build/runtime logs",
         "f, G         follow logs",
         "ctrl-r       reload (in logs: reconnect)",
+        "t            theme picker (:theme)",
         "?            toggle help",
         "q            quit",
     ];
     let rect = centered(area, 64, text.len() as u16 + 2);
     frame.render_widget(Clear, rect);
     let lines: Vec<Line> = text.iter().map(|t| Line::from(*t)).collect();
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(" Help ")),
-        rect,
-    );
+    frame.render_widget(Paragraph::new(lines).block(popup(t, " Help ")), rect);
 }
 
 fn draw_env_picker(frame: &mut Frame, area: Rect, app: &App, index: usize) {
+    let t = app.theme();
     let envs = app.environments.value.as_deref().unwrap_or_default();
     let rect = centered(area, 40, (envs.len() as u16).saturating_add(2));
     frame.render_widget(Clear, rect);
@@ -244,17 +287,12 @@ fn draw_env_picker(frame: &mut Frame, area: Rect, app: &App, index: usize) {
         .enumerate()
         .map(|(i, e)| {
             let style = if i == index {
-                Style::new()
-                    .bg(theme::SELECT_BG)
-                    .add_modifier(Modifier::BOLD)
+                Style::new().bg(t.select_bg).add_modifier(Modifier::BOLD)
             } else {
                 Style::new()
             };
             Line::styled(format!(" {}", clean(&e.name)), style)
         })
         .collect();
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(" Environment ")),
-        rect,
-    );
+    frame.render_widget(Paragraph::new(lines).block(popup(t, " Environment ")), rect);
 }

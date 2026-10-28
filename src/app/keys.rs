@@ -8,6 +8,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use super::{App, Command, Kind, LogsView, View};
 use crate::model::LogKind;
 use crate::status::default_log_kind;
+use crate::theme::THEMES;
 
 /// Lines moved by PgUp/PgDn in the log view.
 const PAGE: usize = 20;
@@ -27,6 +28,8 @@ impl App {
             self.filter_key(key);
         } else if self.env_picker.is_some() {
             self.picker_key(key.code, now, out);
+        } else if self.theme_picker.is_some() {
+            self.theme_key(key.code, out);
         } else if ctrl {
             if key.code == KeyCode::Char('r') {
                 self.reload_current(now, out);
@@ -43,6 +46,7 @@ impl App {
                     self.filter_input = Some(current.unwrap_or_default());
                 }
                 KeyCode::Char('?') => self.help = !self.help,
+                KeyCode::Char('t') => self.theme_picker = Some(self.theme),
                 KeyCode::Esc if self.help => self.help = false,
                 code => self.view_key(code, now, out),
             }
@@ -84,6 +88,7 @@ impl App {
                     self.open_latest_logs(out);
                 }
             }
+            "theme" => self.theme_picker = Some(self.theme),
             "" => {}
             other => self.message = Some(format!("unknown command: {other}")),
         }
@@ -129,6 +134,32 @@ impl App {
                         }
                         self.set_environment(env, now, out);
                     }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Moving previews a theme; Enter keeps and saves it, Esc restores the previous one.
+    fn theme_key(&mut self, code: KeyCode, out: &mut Vec<Command>) {
+        let Some(original) = self.theme_picker else {
+            return;
+        };
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.theme = (self.theme + 1).min(THEMES.len() - 1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => self.theme = self.theme.saturating_sub(1),
+            KeyCode::Esc => {
+                self.theme = original;
+                self.theme_picker = None;
+            }
+            KeyCode::Enter => {
+                self.theme_picker = None;
+                let id = self.theme().id.to_string();
+                if self.prefs.remembered.theme.as_deref() != Some(id.as_str()) {
+                    self.prefs.remembered.theme = Some(id);
+                    out.push(Command::SaveRemembered(self.prefs.remembered.clone()));
                 }
             }
             _ => {}
