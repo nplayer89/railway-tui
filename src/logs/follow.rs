@@ -18,6 +18,10 @@ use crate::model::{LogKind, LogLine};
 
 /// How many lines of history to load on each (re)connect (the CLI's value).
 const HISTORY_LIMIT: i64 = 500;
+/// A stream that stays up this long counts as healthy even if it was quiet.
+const HEALTHY_AFTER: Duration = Duration::from_secs(30);
+/// Shown where a reconnect backfill may have been cut short.
+pub const GAP_MARKER: &str = "[railway-tui] some log lines may be missing here";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamState {
@@ -104,8 +108,9 @@ impl LogSource for RailwayLogSource {
 
 /// How one connection ended.
 enum Outcome {
-    /// Dropped, ended or failed to start: reconnect.
-    Dropped,
+    /// Dropped, ended or failed to start: reconnect, waiting at least
+    /// `retry_after` if the API asked for that.
+    Dropped { retry_after: Option<Duration> },
     /// Retrying cannot help.
     Fatal(String),
     /// The receiver is gone.
@@ -121,16 +126,16 @@ pub async fn follow_logs<S: LogSource>(source: S, out: mpsc::Sender<FollowEvent>
             _ = out.closed() => Outcome::Closed,
             outcome = connection(&source, &out, &mut last_seen, &mut attempt) => outcome,
         };
-        match outcome {
+        let retry_after = match outcome {
             Outcome::Closed => return,
             Outcome::Fatal(msg) => {
                 let _ = out.send(FollowEvent::State(StreamState::Failed(msg))).await;
                 return;
             }
-            Outcome::Dropped => {}
-        }
+            Outcome::Dropped { retry_after } => retry_after,
+        };
         attempt = attempt.saturating_add(1);
-        let retry_in = backoff(attempt);
+        let retry_in = backoff(attempt).max(retry_after.unwrap_or_default());
         let state = StreamState::Reconnecting { attempt, retry_in };
         if out.send(FollowEvent::State(state)).await.is_err() {
             return;
@@ -143,7 +148,9 @@ pub async fn follow_logs<S: LogSource>(source: S, out: mpsc::Sender<FollowEvent>
 }
 
 /// One connection: backfill history since `last_seen`, then forward the live
-/// stream until it drops. A successful subscribe resets `attempt`.
+/// stream until it drops. `attempt` resets only once the stream proves
+/// healthy (a non-empty batch, or `HEALTHY_AFTER` of uptime), so a
+/// subscription the server ends at once still backs off.
 async fn connection<S: LogSource>(
     source: &S,
     out: &mpsc::Sender<FollowEvent>,
@@ -157,10 +164,25 @@ async fn connection<S: LogSource>(
     {
         return Outcome::Closed;
     }
-    let history = match source.history(*last_seen).await {
+    let gap_start = *last_seen;
+    let mut history = match source.history(gap_start).await {
         Ok(lines) => lines,
         Err(e) => return failure(e),
     };
+    // Both sources return the newest `HISTORY_LIMIT` lines, so a full page
+    // after a drop means the oldest part of the gap was cut off.
+    if let Some(gap_start) = gap_start {
+        if history.len() >= HISTORY_LIMIT as usize {
+            history.insert(
+                0,
+                LogLine {
+                    timestamp: gap_start,
+                    message: GAP_MARKER.to_string(),
+                    attributes: Vec::new(),
+                },
+            );
+        }
+    }
     if let Err(outcome) = forward(out, last_seen, history).await {
         return outcome;
     }
@@ -175,24 +197,34 @@ async fn connection<S: LogSource>(
     {
         return Outcome::Closed;
     }
-    *attempt = 0;
-    while let Some(batch) = stream.next().await {
-        match batch {
-            Ok(lines) => {
+    let live_since = tokio::time::Instant::now();
+    let outcome = loop {
+        match stream.next().await {
+            Some(Ok(lines)) => {
+                if !lines.is_empty() {
+                    *attempt = 0;
+                }
                 if let Err(outcome) = forward(out, last_seen, lines).await {
-                    return outcome;
+                    break outcome;
                 }
             }
-            Err(e) => return failure(e),
+            Some(Err(e)) => break failure(e),
+            None => break Outcome::Dropped { retry_after: None },
         }
+    };
+    if live_since.elapsed() >= HEALTHY_AFTER {
+        *attempt = 0;
     }
-    Outcome::Dropped
+    outcome
 }
 
 fn failure(e: ApiError) -> Outcome {
     match e {
         ApiError::Auth(_) => Outcome::Fatal(e.to_string()),
-        _ => Outcome::Dropped,
+        ApiError::RateLimited { retry_after } => Outcome::Dropped {
+            retry_after: Some(retry_after),
+        },
+        _ => Outcome::Dropped { retry_after: None },
     }
 }
 
@@ -239,6 +271,8 @@ mod tests {
     enum End {
         Close,
         Hang,
+        /// Stays open, silent, for this long and then ends.
+        After(Duration),
     }
 
     /// Plays back scripted results; once a script runs out, history is empty
@@ -296,6 +330,11 @@ mod tests {
                     Some(Sub::Items(items, End::Hang)) => Ok(futures::stream::iter(items)
                         .chain(futures::stream::pending())
                         .boxed()),
+                    Some(Sub::Items(items, End::After(d))) => {
+                        let wait = futures::stream::once(tokio::time::sleep(d))
+                            .filter_map(|()| async { None });
+                        Ok(futures::stream::iter(items).chain(wait).boxed())
+                    }
                 }
             }
         }
@@ -412,19 +451,21 @@ mod tests {
         assert_eq!(fake.since_calls()[1], Some(line(1, "a").timestamp));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn failed_attempts_back_off_until_live_resets() {
-        let fake = Fake::default()
-            .history(Err(ApiError::Network("down".into())))
-            .sub(Sub::Fail(ApiError::Http(502)))
-            .sub(Sub::Items(Vec::new(), End::Close));
-        let (mut rx, _h) = start(&fake);
-
-        let events = collect_states(&mut rx, 9).await;
-        let reconnecting = |attempt, secs| StreamState::Reconnecting {
+    fn reconnecting(attempt: u32, secs: u64) -> StreamState {
+        StreamState::Reconnecting {
             attempt,
             retry_in: Duration::from_secs(secs),
-        };
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_attempts_back_off() {
+        let fake = Fake::default()
+            .history(Err(ApiError::Network("down".into())))
+            .sub(Sub::Fail(ApiError::Http(502)));
+        let (mut rx, _h) = start(&fake);
+
+        let events = collect_states(&mut rx, 5).await;
         assert_eq!(
             states(&events),
             vec![
@@ -433,12 +474,161 @@ mod tests {
                 StreamState::Connecting,
                 reconnecting(2, 2),
                 StreamState::Connecting,
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_ending_at_once_keeps_backing_off() {
+        let fake = Fake::default()
+            .sub(Sub::Items(Vec::new(), End::Close))
+            .sub(Sub::Items(vec![Ok(Vec::new())], End::Close))
+            .sub(Sub::Items(Vec::new(), End::Close));
+        let (mut rx, _h) = start(&fake);
+
+        let events = collect_states(&mut rx, 9).await;
+        assert_eq!(
+            states(&events),
+            vec![
+                StreamState::Connecting,
                 StreamState::Live,
                 reconnecting(1, 1),
                 StreamState::Connecting,
                 StreamState::Live,
+                reconnecting(2, 2),
+                StreamState::Connecting,
+                StreamState::Live,
+                reconnecting(3, 4),
             ]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lines_reset_backoff() {
+        let fake = Fake::default()
+            .sub(Sub::Fail(ApiError::Http(502)))
+            .sub(Sub::Items(vec![Ok(vec![line(1, "a")])], End::Close));
+        let (mut rx, _h) = start(&fake);
+
+        let events = collect_states(&mut rx, 6).await;
+        assert_eq!(
+            states(&events),
+            vec![
+                StreamState::Connecting,
+                reconnecting(1, 1),
+                StreamState::Connecting,
+                StreamState::Live,
+                reconnecting(1, 1),
+                StreamState::Connecting,
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiet_stream_up_for_30s_resets_backoff() {
+        let fake = Fake::default()
+            .sub(Sub::Fail(ApiError::Http(502)))
+            .sub(Sub::Items(Vec::new(), End::After(Duration::from_secs(29))))
+            .sub(Sub::Items(Vec::new(), End::After(Duration::from_secs(30))));
+        let (mut rx, _h) = start(&fake);
+
+        let events = collect_states(&mut rx, 8).await;
+        assert_eq!(
+            states(&events),
+            vec![
+                StreamState::Connecting,
+                reconnecting(1, 1),
+                StreamState::Connecting,
+                StreamState::Live,
+                reconnecting(2, 2),
+                StreamState::Connecting,
+                StreamState::Live,
+                reconnecting(1, 1),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limit_waits_for_retry_after() {
+        let fake = Fake::default()
+            .history(Err(ApiError::RateLimited {
+                retry_after: Duration::from_secs(60),
+            }))
+            .history(Err(ApiError::RateLimited {
+                retry_after: Duration::from_millis(500),
+            }));
+        let (mut rx, _h) = start(&fake);
+
+        let started = tokio::time::Instant::now();
+        let events = collect_states(&mut rx, 5).await;
+        assert_eq!(
+            states(&events),
+            vec![
+                StreamState::Connecting,
+                reconnecting(1, 60),
+                StreamState::Connecting,
+                // backoff(2) is longer than the 0.5s asked for, so it wins.
+                reconnecting(2, 2),
+                StreamState::Connecting,
+            ]
+        );
+        assert!(started.elapsed() >= Duration::from_secs(62));
+    }
+
+    fn full_page(from_secs: i64) -> Vec<LogLine> {
+        (0..HISTORY_LIMIT)
+            .map(|i| line(from_secs + i, &format!("l{i}")))
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_backfill_page_marks_a_possible_gap() {
+        let fake = Fake::default()
+            .history(Ok(Vec::new()))
+            .sub(Sub::Items(
+                vec![Ok(vec![line(1, "a")]), Err(ApiError::Network("x".into()))],
+                End::Hang,
+            ))
+            .history(Ok(full_page(1000)));
+        let (mut rx, _h) = start(&fake);
+
+        let events = collect_states(&mut rx, 5).await;
+        let backfill = events
+            .iter()
+            .filter_map(|e| match e {
+                FollowEvent::Lines(lines) if lines.len() > 1 => Some(lines),
+                _ => None,
+            })
+            .next()
+            .expect("backfill batch");
+        assert_eq!(backfill.len(), HISTORY_LIMIT as usize + 1);
+        assert_eq!(
+            backfill[0],
+            LogLine {
+                timestamp: line(1, "a").timestamp,
+                message: GAP_MARKER.to_string(),
+                attributes: Vec::new(),
+            }
+        );
+        assert_eq!(backfill[1], line(1000, "l0"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_first_page_and_short_backfill_have_no_marker() {
+        let fake = Fake::default()
+            .history(Ok(full_page(0)))
+            .sub(Sub::Items(
+                vec![Err(ApiError::Network("x".into()))],
+                End::Hang,
+            ))
+            .history(Ok(vec![line(600, "b")]));
+        let (mut rx, _h) = start(&fake);
+
+        let events = collect_states(&mut rx, 5).await;
+        let marked = events.iter().any(|e| {
+            matches!(e, FollowEvent::Lines(lines) if lines.iter().any(|l| l.message == GAP_MARKER))
+        });
+        assert!(!marked);
     }
 
     #[tokio::test(start_paused = true)]
