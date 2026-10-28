@@ -1,0 +1,1682 @@
+//! App state machine: `update(event, now) -> commands`. No IO, no rendering.
+
+mod keys;
+
+use std::time::{Duration, Instant};
+
+use ratatui::crossterm::event::KeyEvent;
+
+use crate::budget::{backstop_interval, DEFAULT_HOURLY_LIMIT};
+use crate::logs::buffer::{LogBuffer, LOG_CAP};
+use crate::logs::follow::{FollowEvent, StreamState};
+use crate::model::{
+    DeploymentStatus, DeploymentSummary, Environment, Instance, LogKind, ProjectRef,
+    ServiceInstance, Workspace,
+};
+use crate::remember::Remembered;
+use crate::status::{default_log_kind, deployment_rows, DeploymentRow};
+
+/// A fetched value with its freshness. A failed reload keeps the old value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Loaded<T> {
+    pub value: Option<T>,
+    pub fetched_at: Option<Instant>,
+    pub error: Option<String>,
+    pub loading: bool,
+}
+
+impl<T> Default for Loaded<T> {
+    fn default() -> Self {
+        Self {
+            value: None,
+            fetched_at: None,
+            error: None,
+            loading: false,
+        }
+    }
+}
+
+/// The stack holds a handful of views, so the large `Logs` variant is not worth boxing.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum View {
+    Projects,
+    Services,
+    Deployments { service_id: String },
+    Instances { service_id: String },
+    Logs(LogsView),
+}
+
+#[derive(Debug)]
+pub struct LogsView {
+    pub session: u64,
+    pub deployment_id: String,
+    pub service_name: String,
+    pub kind: LogKind,
+    pub replica: Option<String>,
+    pub buffer: LogBuffer,
+    pub follow: bool,
+    /// Lines scrolled up from the bottom; 0 while following.
+    pub scroll: usize,
+    pub filter: Option<String>,
+    pub state: StreamState,
+}
+
+#[derive(Debug)]
+pub enum AppEvent {
+    Key(KeyEvent),
+    Tick(Instant),
+    Data(DataEvent),
+}
+
+#[derive(Debug)]
+pub enum DataEvent {
+    Workspaces(Result<Vec<Workspace>, String>),
+    Environments {
+        project_id: String,
+        result: Result<Vec<Environment>, String>,
+    },
+    Services {
+        project_id: String,
+        env_id: String,
+        result: Result<Vec<ServiceInstance>, String>,
+    },
+    Deployments {
+        service_id: String,
+        env_id: String,
+        result: Result<Vec<DeploymentSummary>, String>,
+    },
+    StatusChanged {
+        deployment_id: String,
+        status: DeploymentStatus,
+    },
+    Log {
+        session: u64,
+        event: FollowEvent,
+    },
+    Budget {
+        interval: Duration,
+        blocked_until: Option<Instant>,
+    },
+    LiveUpdates {
+        ok: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    LoadWorkspaces,
+    LoadEnvironments {
+        project_id: String,
+    },
+    LoadServices {
+        project_id: String,
+        env_id: String,
+    },
+    LoadDeployments {
+        project_id: String,
+        env_id: String,
+        service_id: String,
+    },
+    /// Replaces the previous watch set; empty means stop.
+    WatchDeployments {
+        ids: Vec<String>,
+    },
+    OpenLogs {
+        session: u64,
+        env_id: String,
+        deployment_id: String,
+        kind: LogKind,
+    },
+    CloseLogs {
+        session: u64,
+    },
+    SaveRemembered(Remembered),
+    Quit,
+}
+
+/// Start-up preferences: config defaults (id or case-insensitive name) and remembered ids.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StartPrefs {
+    pub workspace: Option<String>,
+    pub project: Option<String>,
+    pub environment: Option<String>,
+    pub remembered: Remembered,
+}
+
+/// Selected row per table view, by id, so it survives reloads and filtering.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Selection {
+    pub project: Option<String>,
+    pub service: Option<String>,
+    pub deployment: Option<String>,
+    pub instance: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct App {
+    pub prefs: StartPrefs,
+    /// Never empty; the root is always `View::Projects`.
+    pub stack: Vec<View>,
+    pub workspace_id: Option<String>,
+    pub project: Option<ProjectRef>,
+    pub environment: Option<Environment>,
+    pub workspaces: Loaded<Vec<Workspace>>,
+    pub environments: Loaded<Vec<Environment>>,
+    pub services: Loaded<Vec<ServiceInstance>>,
+    /// History for the service of the `Deployments` view in the stack.
+    pub deployments: Loaded<Vec<DeploymentSummary>>,
+    pub selection: Selection,
+    /// Applied name filter for the current table view (cleared on view change).
+    pub table_filter: Option<String>,
+    /// Filter text being typed after `/` (table or logs, by the top view).
+    pub filter_input: Option<String>,
+    /// Command text being typed after `:`.
+    pub command_line: Option<String>,
+    /// Highlighted index into `environments` while the picker is open.
+    pub env_picker: Option<usize>,
+    pub help: bool,
+    /// One-shot notice (unknown command, nothing to open); cleared on the next key.
+    pub message: Option<String>,
+    pub backstop: Duration,
+    pub blocked_until: Option<Instant>,
+    pub live_updates: bool,
+    next_session: u64,
+    started: bool,
+    requested: Requested,
+}
+
+/// When each load was last requested, so a failed first load is still retried on the backstop.
+#[derive(Debug, Default)]
+struct Requested {
+    workspaces: Option<Instant>,
+    environments: Option<Instant>,
+    services: Option<Instant>,
+    deployments: Option<Instant>,
+}
+
+impl App {
+    pub fn new(prefs: StartPrefs) -> (App, Vec<Command>) {
+        let mut app = App {
+            prefs,
+            stack: vec![View::Projects],
+            workspace_id: None,
+            project: None,
+            environment: None,
+            workspaces: Loaded::default(),
+            environments: Loaded::default(),
+            services: Loaded::default(),
+            deployments: Loaded::default(),
+            selection: Selection::default(),
+            table_filter: None,
+            filter_input: None,
+            command_line: None,
+            env_picker: None,
+            help: false,
+            message: None,
+            backstop: backstop_interval(DEFAULT_HOURLY_LIMIT, None),
+            blocked_until: None,
+            live_updates: true,
+            next_session: 0,
+            started: false,
+            requested: Requested::default(),
+        };
+        app.workspaces.loading = true;
+        (app, vec![Command::LoadWorkspaces])
+    }
+
+    pub fn update(&mut self, ev: AppEvent, now: Instant) -> Vec<Command> {
+        let mut out = Vec::new();
+        match ev {
+            AppEvent::Key(key) => self.on_key(key, now, &mut out),
+            AppEvent::Tick(_) => self.on_tick(now, &mut out),
+            AppEvent::Data(data) => self.on_data(data, now, &mut out),
+        }
+        out
+    }
+
+    // ---- rows for the table views (filtered by `table_filter`) ----
+
+    /// Projects grouped by workspace, the preferred workspace first.
+    pub fn project_rows(&self) -> Vec<(&Workspace, &ProjectRef)> {
+        self.ordered_workspaces()
+            .into_iter()
+            .flat_map(|w| w.projects.iter().map(move |p| (w, p)))
+            .filter(|(_, p)| self.passes_filter(&[&p.name]))
+            .collect()
+    }
+
+    pub fn service_rows(&self) -> Vec<&ServiceInstance> {
+        self.services
+            .value
+            .iter()
+            .flatten()
+            .filter(|s| self.passes_filter(&[&s.service_name]))
+            .collect()
+    }
+
+    /// The Deployments view: failed latest, then active, then history (see `deployment_rows`).
+    pub fn deployment_table(&self) -> Vec<DeploymentRow> {
+        let Some(service_id) = self.view_service_id(Kind::Deployments) else {
+            return Vec::new();
+        };
+        let history = self.deployments.value.as_deref().unwrap_or_default();
+        let rows = match self.service(service_id) {
+            Some(svc) => deployment_rows(svc, history),
+            None => history
+                .iter()
+                .map(|d| DeploymentRow {
+                    deployment: d.clone(),
+                    tag: None,
+                })
+                .collect(),
+        };
+        rows.into_iter()
+            .filter(|r| {
+                let d = &r.deployment;
+                let msg = d.commit_message.as_deref().or(d.image.as_deref());
+                let sha = d.commit_sha.as_deref();
+                self.passes_filter(&[&d.id, msg.unwrap_or(""), sha.unwrap_or("")])
+            })
+            .collect()
+    }
+
+    /// Replicas of the Instances view's service: its active deployments, or the latest if none.
+    pub fn instance_rows(&self) -> Vec<(&DeploymentSummary, &Instance)> {
+        let Some(svc) = self
+            .view_service_id(Kind::Instances)
+            .and_then(|id| self.service(id))
+        else {
+            return Vec::new();
+        };
+        let source: Vec<&DeploymentSummary> = if svc.active.is_empty() {
+            svc.latest.iter().collect()
+        } else {
+            svc.active.iter().collect()
+        };
+        source
+            .into_iter()
+            .flat_map(|d| d.instances.iter().map(move |i| (d, i)))
+            .filter(|(_, i)| self.passes_filter(&[&i.id]))
+            .collect()
+    }
+
+    /// Highlighted row of the top table view, or None for an empty table or the log view.
+    pub fn selected_index(&self) -> Option<usize> {
+        let ids = self.row_ids();
+        if ids.is_empty() {
+            return None;
+        }
+        let selected = self.selection_slot(self.kind())?;
+        Some(position(&ids, selected.as_deref()))
+    }
+
+    // ---- data events ----
+
+    fn on_data(&mut self, data: DataEvent, now: Instant, out: &mut Vec<Command>) {
+        match data {
+            DataEvent::Workspaces(result) => {
+                // The initial load is requested by `new`, which has no clock.
+                self.requested.workspaces.get_or_insert(now);
+                self.workspaces.finish(result, now);
+                if !self.started && self.workspaces.value.is_some() {
+                    self.started = true;
+                    self.resolve_start_project(now, out);
+                }
+            }
+            DataEvent::Environments { project_id, result } => {
+                if self.project_id() != Some(project_id.as_str()) {
+                    return;
+                }
+                self.environments.finish(result, now);
+                self.ensure_environment(now, out);
+            }
+            DataEvent::Services {
+                project_id,
+                env_id,
+                result,
+            } => {
+                if self.project_id() != Some(project_id.as_str())
+                    || self.env_id() != Some(env_id.as_str())
+                {
+                    return;
+                }
+                let ok = result.is_ok();
+                self.services.finish(result, now);
+                if ok && self.kind() == Kind::Services {
+                    out.push(self.watch_command());
+                }
+            }
+            DataEvent::Deployments {
+                service_id,
+                env_id,
+                result,
+            } => {
+                if self.env_id() != Some(env_id.as_str())
+                    || self.view_service_id(Kind::Deployments) != Some(service_id.as_str())
+                {
+                    return;
+                }
+                self.deployments.finish(result, now);
+            }
+            DataEvent::StatusChanged {
+                deployment_id,
+                status,
+            } => self.on_status_changed(&deployment_id, status, now, out),
+            DataEvent::Log { session, event } => self.on_log(session, event),
+            DataEvent::Budget {
+                interval,
+                blocked_until,
+            } => {
+                self.backstop = interval;
+                self.blocked_until = blocked_until;
+            }
+            DataEvent::LiveUpdates { ok } => self.live_updates = ok,
+        }
+    }
+
+    fn resolve_start_project(&mut self, now: Instant, out: &mut Vec<Command>) {
+        let configured = self.prefs.project.clone();
+        let by_pref = configured
+            .as_deref()
+            .and_then(|want| self.find_project(|p| p.id == want || same_name(&p.name, want)));
+        if by_pref.is_none() {
+            if let Some(want) = &configured {
+                self.message = Some(format!("project {want:?} not found"));
+            }
+        }
+        let remembered = self.prefs.remembered.last_project_id.clone();
+        let found = by_pref.or_else(|| {
+            remembered
+                .as_deref()
+                .and_then(|id| self.find_project(|p| p.id == id))
+        });
+        if let Some((workspace_id, project)) = found {
+            self.open_project(workspace_id, project, now, out);
+        }
+    }
+
+    fn find_project(&self, pred: impl Fn(&ProjectRef) -> bool) -> Option<(String, ProjectRef)> {
+        self.ordered_workspaces().into_iter().find_map(|w| {
+            w.projects
+                .iter()
+                .find(|p| pred(p))
+                .map(|p| (w.id.clone(), p.clone()))
+        })
+    }
+
+    /// Picks an environment once they arrive, unless the current one is still listed.
+    fn ensure_environment(&mut self, now: Instant, out: &mut Vec<Command>) {
+        let Some(envs) = self.environments.value.as_deref() else {
+            return;
+        };
+        if let Some(current) = &self.environment {
+            if envs.iter().any(|e| e.id == current.id) {
+                return;
+            }
+        }
+        if let Some(env) = self.pick_environment(envs).cloned() {
+            self.set_environment(env, now, out);
+        }
+    }
+
+    /// Configured (id or name), then remembered id, then `production`, then the first.
+    fn pick_environment<'a>(&self, envs: &'a [Environment]) -> Option<&'a Environment> {
+        let configured = self.prefs.environment.as_deref();
+        let remembered = self.prefs.remembered.last_environment_id.as_deref();
+        configured
+            .and_then(|want| {
+                envs.iter()
+                    .find(|e| e.id == want || same_name(&e.name, want))
+            })
+            .or_else(|| remembered.and_then(|id| envs.iter().find(|e| e.id == id)))
+            .or_else(|| envs.iter().find(|e| same_name(&e.name, "production")))
+            .or_else(|| envs.first())
+    }
+
+    fn set_environment(&mut self, env: Environment, now: Instant, out: &mut Vec<Command>) {
+        let remembered = Remembered {
+            last_project_id: self.project_id().map(String::from),
+            last_environment_id: Some(env.id.clone()),
+        };
+        self.environment = Some(env);
+        self.services = Loaded::default();
+        self.selection.service = None;
+        self.load_services(now, out);
+        self.prefs.remembered = remembered.clone();
+        out.push(Command::SaveRemembered(remembered));
+    }
+
+    fn on_status_changed(
+        &mut self,
+        deployment_id: &str,
+        status: DeploymentStatus,
+        now: Instant,
+        out: &mut Vec<Command>,
+    ) {
+        let mut matched = false;
+        let latest = self
+            .services
+            .value
+            .iter_mut()
+            .flatten()
+            .filter_map(|s| s.latest.as_mut());
+        for d in latest.filter(|d| d.id == deployment_id) {
+            d.status = status.clone();
+            matched = true;
+        }
+        let history = self.deployments.value.iter_mut().flatten();
+        for d in history.filter(|d| d.id == deployment_id) {
+            d.status = status.clone();
+        }
+        let terminal = matches!(
+            status,
+            DeploymentStatus::Success
+                | DeploymentStatus::Failed
+                | DeploymentStatus::Crashed
+                | DeploymentStatus::Removed
+        );
+        if matched && terminal {
+            self.load_services(now, out);
+        }
+    }
+
+    fn on_log(&mut self, session: u64, event: FollowEvent) {
+        let Some(View::Logs(logs)) = self.stack.last_mut() else {
+            return;
+        };
+        if logs.session != session {
+            return;
+        }
+        match event {
+            FollowEvent::Lines(lines) => {
+                if logs.follow {
+                    logs.buffer.extend(lines);
+                } else {
+                    // Keep a paused view anchored: new lines land below it (approximately;
+                    // backfilled older lines would shift it slightly).
+                    let before = logs.visible_len();
+                    logs.buffer.extend(lines);
+                    logs.scroll += logs.visible_len().saturating_sub(before);
+                }
+            }
+            FollowEvent::State(state) => logs.state = state,
+        }
+    }
+
+    // ---- backstop and loads ----
+
+    fn on_tick(&mut self, now: Instant, out: &mut Vec<Command>) {
+        if self.blocked_until.is_some_and(|until| until > now) {
+            return;
+        }
+        let (fetched_at, requested, loading) = match self.kind() {
+            Kind::Projects => (
+                self.workspaces.fetched_at,
+                self.requested.workspaces,
+                self.workspaces.loading,
+            ),
+            Kind::Services | Kind::Instances if self.environment.is_none() => (
+                self.environments.fetched_at,
+                self.requested.environments,
+                self.environments.loading,
+            ),
+            Kind::Services | Kind::Instances => (
+                self.services.fetched_at,
+                self.requested.services,
+                self.services.loading,
+            ),
+            Kind::Deployments => (
+                self.deployments.fetched_at,
+                self.requested.deployments,
+                self.deployments.loading,
+            ),
+            Kind::Logs => return,
+        };
+        let last = fetched_at.max(requested);
+        if !loading && last.is_some_and(|t| t + self.backstop <= now) {
+            self.reload_current(now, out);
+        }
+    }
+
+    /// The top view's load command (backstop and Ctrl-R). The log view streams instead.
+    fn reload_current(&mut self, now: Instant, out: &mut Vec<Command>) {
+        match self.kind() {
+            Kind::Projects => self.load_workspaces(now, out),
+            Kind::Services | Kind::Instances if self.environment.is_none() => {
+                self.load_environments(now, out)
+            }
+            Kind::Services | Kind::Instances => self.load_services(now, out),
+            Kind::Deployments => {
+                if let Some(id) = self.view_service_id(Kind::Deployments).map(String::from) {
+                    self.load_deployments(id, now, out);
+                }
+            }
+            Kind::Logs => {}
+        }
+    }
+
+    fn load_workspaces(&mut self, now: Instant, out: &mut Vec<Command>) {
+        self.workspaces.loading = true;
+        self.requested.workspaces = Some(now);
+        out.push(Command::LoadWorkspaces);
+    }
+
+    fn load_environments(&mut self, now: Instant, out: &mut Vec<Command>) {
+        let Some(project_id) = self.project_id().map(String::from) else {
+            return;
+        };
+        self.environments.loading = true;
+        self.requested.environments = Some(now);
+        out.push(Command::LoadEnvironments { project_id });
+    }
+
+    fn load_services(&mut self, now: Instant, out: &mut Vec<Command>) {
+        let (Some(project_id), Some(env_id)) = (self.project_id(), self.env_id()) else {
+            return;
+        };
+        out.push(Command::LoadServices {
+            project_id: project_id.to_string(),
+            env_id: env_id.to_string(),
+        });
+        self.services.loading = true;
+        self.requested.services = Some(now);
+    }
+
+    fn load_deployments(&mut self, service_id: String, now: Instant, out: &mut Vec<Command>) {
+        let (Some(project_id), Some(env_id)) = (self.project_id(), self.env_id()) else {
+            return;
+        };
+        out.push(Command::LoadDeployments {
+            project_id: project_id.to_string(),
+            env_id: env_id.to_string(),
+            service_id,
+        });
+        self.deployments.loading = true;
+        self.requested.deployments = Some(now);
+    }
+
+    // ---- navigation ----
+
+    fn open_project(
+        &mut self,
+        workspace_id: String,
+        project: ProjectRef,
+        now: Instant,
+        out: &mut Vec<Command>,
+    ) {
+        self.workspace_id = Some(workspace_id);
+        self.selection.project = Some(project.id.clone());
+        let reopening = self.project_id() == Some(project.id.as_str());
+        if reopening && self.environment.is_some() {
+            self.push(View::Services, out);
+            self.load_services(now, out);
+            return;
+        }
+        self.project = Some(project);
+        self.environment = None;
+        self.environments = Loaded::default();
+        self.services = Loaded::default();
+        self.selection.service = None;
+        self.push(View::Services, out);
+        self.load_environments(now, out);
+    }
+
+    fn open_deployments(&mut self, service_id: String, now: Instant, out: &mut Vec<Command>) {
+        self.deployments = Loaded::default();
+        self.selection.deployment = None;
+        self.push(
+            View::Deployments {
+                service_id: service_id.clone(),
+            },
+            out,
+        );
+        self.load_deployments(service_id, now, out);
+    }
+
+    /// Logs of the selected service's latest deployment (the failed one, if it failed).
+    fn open_latest_logs(&mut self, out: &mut Vec<Command>) {
+        let Some(svc) = self.selected_service() else {
+            self.message = Some("no service selected".into());
+            return;
+        };
+        let Some(latest) = &svc.latest else {
+            self.message = Some(format!("{} has no deployments", svc.service_name));
+            return;
+        };
+        let (id, name, kind) = (
+            latest.id.clone(),
+            svc.service_name.clone(),
+            default_log_kind(latest),
+        );
+        self.open_logs(id, name, kind, None, out);
+    }
+
+    fn open_logs(
+        &mut self,
+        deployment_id: String,
+        service_name: String,
+        kind: LogKind,
+        replica: Option<String>,
+        out: &mut Vec<Command>,
+    ) {
+        let Some(env_id) = self.env_id().map(String::from) else {
+            return;
+        };
+        self.next_session += 1;
+        let session = self.next_session;
+        self.push(
+            View::Logs(LogsView {
+                session,
+                deployment_id: deployment_id.clone(),
+                service_name,
+                kind,
+                replica,
+                buffer: LogBuffer::new(LOG_CAP),
+                follow: true,
+                scroll: 0,
+                filter: None,
+                state: StreamState::Connecting,
+            }),
+            out,
+        );
+        out.push(Command::OpenLogs {
+            session,
+            env_id,
+            deployment_id,
+            kind,
+        });
+    }
+
+    /// `b` in the log view: close the session and reopen with the other log kind.
+    fn toggle_log_kind(&mut self, out: &mut Vec<Command>) {
+        let Some(env_id) = self.env_id().map(String::from) else {
+            return;
+        };
+        let session = self.next_session + 1;
+        let Some(View::Logs(logs)) = self.stack.last_mut() else {
+            return;
+        };
+        self.next_session = session;
+        out.push(Command::CloseLogs {
+            session: logs.session,
+        });
+        logs.session = session;
+        logs.kind = match logs.kind {
+            LogKind::Build => LogKind::Runtime,
+            LogKind::Runtime => LogKind::Build,
+        };
+        logs.buffer = LogBuffer::new(LOG_CAP);
+        logs.follow = true;
+        logs.scroll = 0;
+        logs.state = StreamState::Connecting;
+        out.push(Command::OpenLogs {
+            session,
+            env_id,
+            deployment_id: logs.deployment_id.clone(),
+            kind: logs.kind,
+        });
+    }
+
+    /// Makes Services the top view (truncating or pushing). False when no project is open.
+    fn goto_services(&mut self, out: &mut Vec<Command>) -> bool {
+        if self.project.is_none() {
+            self.message = Some("no project selected".into());
+            return false;
+        }
+        match self.stack.iter().position(|v| matches!(v, View::Services)) {
+            Some(i) => self.truncate(i + 1, out),
+            None => {
+                self.truncate(1, out);
+                self.push(View::Services, out);
+            }
+        }
+        true
+    }
+
+    fn push(&mut self, view: View, out: &mut Vec<Command>) {
+        self.leave_top(out);
+        self.stack.push(view);
+        self.enter_top(out);
+    }
+
+    fn pop(&mut self, out: &mut Vec<Command>) {
+        let len = self.stack.len();
+        if len > 1 {
+            self.truncate(len - 1, out);
+        }
+    }
+
+    fn truncate(&mut self, len: usize, out: &mut Vec<Command>) {
+        if self.stack.len() <= len.max(1) {
+            return;
+        }
+        self.leave_top(out);
+        self.stack.truncate(len.max(1));
+        self.enter_top(out);
+    }
+
+    /// Only the top view subscribes: leaving Services stops its watch, leaving Logs closes the stream.
+    fn leave_top(&mut self, out: &mut Vec<Command>) {
+        self.table_filter = None;
+        match self.stack.last() {
+            Some(View::Services) => out.push(Command::WatchDeployments { ids: Vec::new() }),
+            Some(View::Logs(logs)) => out.push(Command::CloseLogs {
+                session: logs.session,
+            }),
+            _ => {}
+        }
+    }
+
+    fn enter_top(&mut self, out: &mut Vec<Command>) {
+        if self.kind() == Kind::Services && self.services.value.is_some() {
+            out.push(self.watch_command());
+        }
+    }
+
+    fn watch_command(&self) -> Command {
+        let ids = self
+            .services
+            .value
+            .iter()
+            .flatten()
+            .filter_map(|s| s.latest.as_ref().map(|d| d.id.clone()))
+            .collect();
+        Command::WatchDeployments { ids }
+    }
+
+    // ---- selection ----
+
+    fn move_selection(&mut self, delta: isize) {
+        let ids = self.row_ids();
+        let Some(current) = self.selected_index() else {
+            return;
+        };
+        let next = current.saturating_add_signed(delta).min(ids.len() - 1);
+        let kind = self.kind();
+        if let Some(slot) = self.selection_slot_mut(kind) {
+            *slot = Some(ids[next].clone());
+        }
+    }
+
+    fn row_ids(&self) -> Vec<String> {
+        match self.kind() {
+            Kind::Projects => self
+                .project_rows()
+                .iter()
+                .map(|(_, p)| p.id.clone())
+                .collect(),
+            Kind::Services => self
+                .service_rows()
+                .iter()
+                .map(|s| s.service_id.clone())
+                .collect(),
+            Kind::Deployments => self
+                .deployment_table()
+                .into_iter()
+                .map(|r| r.deployment.id)
+                .collect(),
+            Kind::Instances => self
+                .instance_rows()
+                .iter()
+                .map(|(_, i)| i.id.clone())
+                .collect(),
+            Kind::Logs => Vec::new(),
+        }
+    }
+
+    fn selection_slot(&self, kind: Kind) -> Option<&Option<String>> {
+        match kind {
+            Kind::Projects => Some(&self.selection.project),
+            Kind::Services => Some(&self.selection.service),
+            Kind::Deployments => Some(&self.selection.deployment),
+            Kind::Instances => Some(&self.selection.instance),
+            Kind::Logs => None,
+        }
+    }
+
+    fn selection_slot_mut(&mut self, kind: Kind) -> Option<&mut Option<String>> {
+        match kind {
+            Kind::Projects => Some(&mut self.selection.project),
+            Kind::Services => Some(&mut self.selection.service),
+            Kind::Deployments => Some(&mut self.selection.deployment),
+            Kind::Instances => Some(&mut self.selection.instance),
+            Kind::Logs => None,
+        }
+    }
+
+    fn selected_project(&self) -> Option<(String, ProjectRef)> {
+        let rows = self.project_rows();
+        let ids: Vec<String> = rows.iter().map(|(_, p)| p.id.clone()).collect();
+        let (w, p) = rows.get(position(&ids, self.selection.project.as_deref()))?;
+        Some((w.id.clone(), (*p).clone()))
+    }
+
+    /// The selected service, whatever the top view (used by `l` and `:deploys`/`:logs`).
+    fn selected_service(&self) -> Option<&ServiceInstance> {
+        let rows = self.service_rows();
+        let ids: Vec<String> = rows.iter().map(|s| s.service_id.clone()).collect();
+        rows.get(position(&ids, self.selection.service.as_deref()))
+            .copied()
+    }
+
+    fn selected_deployment(&self) -> Option<DeploymentSummary> {
+        let rows = self.deployment_table();
+        let ids: Vec<String> = rows.iter().map(|r| r.deployment.id.clone()).collect();
+        let index = position(&ids, self.selection.deployment.as_deref());
+        rows.into_iter().nth(index).map(|r| r.deployment)
+    }
+
+    fn selected_instance(&self) -> Option<(String, String)> {
+        let rows = self.instance_rows();
+        let ids: Vec<String> = rows.iter().map(|(_, i)| i.id.clone()).collect();
+        let (d, i) = rows.get(position(&ids, self.selection.instance.as_deref()))?;
+        Some((d.id.clone(), i.id.clone()))
+    }
+
+    // ---- small helpers ----
+
+    fn kind(&self) -> Kind {
+        match self.stack.last() {
+            Some(View::Projects) | None => Kind::Projects,
+            Some(View::Services) => Kind::Services,
+            Some(View::Deployments { .. }) => Kind::Deployments,
+            Some(View::Instances { .. }) => Kind::Instances,
+            Some(View::Logs(_)) => Kind::Logs,
+        }
+    }
+
+    fn logs_mut(&mut self) -> Option<&mut LogsView> {
+        match self.stack.last_mut() {
+            Some(View::Logs(logs)) => Some(logs),
+            _ => None,
+        }
+    }
+
+    /// The service id of the nearest Deployments or Instances view in the stack.
+    fn view_service_id(&self, kind: Kind) -> Option<&str> {
+        self.stack.iter().rev().find_map(|v| match (v, kind) {
+            (View::Deployments { service_id }, Kind::Deployments)
+            | (View::Instances { service_id }, Kind::Instances) => Some(service_id.as_str()),
+            _ => None,
+        })
+    }
+
+    fn service(&self, id: &str) -> Option<&ServiceInstance> {
+        self.services
+            .value
+            .iter()
+            .flatten()
+            .find(|s| s.service_id == id)
+    }
+
+    fn project_id(&self) -> Option<&str> {
+        self.project.as_ref().map(|p| p.id.as_str())
+    }
+
+    fn env_id(&self) -> Option<&str> {
+        self.environment.as_ref().map(|e| e.id.as_str())
+    }
+
+    fn ordered_workspaces(&self) -> Vec<&Workspace> {
+        let all = self.workspaces.value.iter().flatten();
+        let preferred = |w: &Workspace| {
+            self.prefs
+                .workspace
+                .as_deref()
+                .is_some_and(|want| w.id == want || same_name(&w.name, want))
+        };
+        let (mut first, rest): (Vec<&Workspace>, Vec<&Workspace>) = all.partition(|w| preferred(w));
+        first.extend(rest);
+        first
+    }
+
+    fn passes_filter(&self, fields: &[&str]) -> bool {
+        let Some(filter) = self.table_filter.as_deref() else {
+            return true;
+        };
+        let needle = filter.to_lowercase();
+        fields.iter().any(|f| f.to_lowercase().contains(&needle))
+    }
+}
+
+impl<T> Loaded<T> {
+    fn finish(&mut self, result: Result<T, String>, now: Instant) {
+        self.loading = false;
+        match result {
+            Ok(value) => {
+                self.value = Some(value);
+                self.fetched_at = Some(now);
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+}
+
+impl LogsView {
+    fn visible_len(&self) -> usize {
+        self.buffer
+            .visible(self.filter.as_deref(), self.replica.as_deref())
+            .len()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Projects,
+    Services,
+    Deployments,
+    Instances,
+    Logs,
+}
+
+/// Index of `selected` in `ids`, or 0 when it is unset or filtered out.
+fn position(ids: &[String], selected: Option<&str>) -> usize {
+    selected
+        .and_then(|s| ids.iter().position(|id| id == s))
+        .unwrap_or(0)
+}
+
+fn same_name(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{InstanceStatus, LogLine};
+    use chrono::{TimeZone, Utc};
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+
+    fn key(c: char) -> AppEvent {
+        AppEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+
+    fn code(c: KeyCode) -> AppEvent {
+        AppEvent::Key(KeyEvent::new(c, KeyModifiers::NONE))
+    }
+
+    fn ctrl(c: char) -> AppEvent {
+        AppEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+    }
+
+    fn typed(app: &mut App, text: &str, now: Instant) {
+        for c in text.chars() {
+            app.update(key(c), now);
+        }
+    }
+
+    fn deploy(id: &str, status: DeploymentStatus) -> DeploymentSummary {
+        DeploymentSummary {
+            id: id.into(),
+            status,
+            created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            commit_sha: None,
+            commit_message: None,
+            image: None,
+            instances: vec![Instance {
+                id: format!("{id}-i0"),
+                status: InstanceStatus::Running,
+            }],
+        }
+    }
+
+    fn service(
+        id: &str,
+        latest: DeploymentSummary,
+        active: Vec<DeploymentSummary>,
+    ) -> ServiceInstance {
+        ServiceInstance {
+            service_id: id.into(),
+            service_name: format!("{id}-name"),
+            num_replicas: 1,
+            latest: Some(latest),
+            active,
+        }
+    }
+
+    /// svc-a: latest d2 FAILED while d1 still runs. svc-b: latest d3 SUCCESS.
+    fn services() -> Vec<ServiceInstance> {
+        let failed = DeploymentSummary {
+            instances: vec![],
+            ..deploy("d2", DeploymentStatus::Failed)
+        };
+        vec![
+            service(
+                "svc-a",
+                failed,
+                vec![deploy("d1", DeploymentStatus::Success)],
+            ),
+            service("svc-b", deploy("d3", DeploymentStatus::Success), vec![]),
+        ]
+    }
+
+    fn workspaces() -> Vec<Workspace> {
+        let ws = |id: &str, name: &str, pid: &str, pname: &str| Workspace {
+            id: id.into(),
+            name: name.into(),
+            projects: vec![ProjectRef {
+                id: pid.into(),
+                name: pname.into(),
+            }],
+        };
+        vec![
+            ws("w1", "Personal", "p1", "Alpha"),
+            ws("w2", "Team", "p2", "Beta"),
+        ]
+    }
+
+    fn envs() -> Vec<Environment> {
+        let env = |id: &str, name: &str| Environment {
+            id: id.into(),
+            name: name.into(),
+        };
+        vec![env("e-stg", "staging"), env("e-prod", "production")]
+    }
+
+    fn line(sec: u32, msg: &str) -> LogLine {
+        LogLine {
+            timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, sec).unwrap(),
+            message: msg.into(),
+            attributes: vec![],
+        }
+    }
+
+    fn data(app: &mut App, d: DataEvent, now: Instant) -> Vec<Command> {
+        app.update(AppEvent::Data(d), now)
+    }
+
+    fn envs_event(project_id: &str) -> DataEvent {
+        DataEvent::Environments {
+            project_id: project_id.into(),
+            result: Ok(envs()),
+        }
+    }
+
+    fn services_event(env_id: &str, result: Result<Vec<ServiceInstance>, String>) -> DataEvent {
+        DataEvent::Services {
+            project_id: "p2".into(),
+            env_id: env_id.into(),
+            result,
+        }
+    }
+
+    fn log_event(session: u64, event: FollowEvent) -> DataEvent {
+        DataEvent::Log { session, event }
+    }
+
+    fn load_services(env_id: &str) -> Command {
+        Command::LoadServices {
+            project_id: "p2".into(),
+            env_id: env_id.into(),
+        }
+    }
+
+    fn prefs_for(project: &str) -> StartPrefs {
+        StartPrefs {
+            project: Some(project.into()),
+            ..StartPrefs::default()
+        }
+    }
+
+    /// Project p2 / production, services loaded, Services view on top.
+    fn app_in_services(now: Instant) -> App {
+        let (mut app, _) = App::new(prefs_for("beta"));
+        data(&mut app, DataEvent::Workspaces(Ok(workspaces())), now);
+        data(&mut app, envs_event("p2"), now);
+        data(&mut app, services_event("e-prod", Ok(services())), now);
+        app
+    }
+
+    fn logs_view(app: &App) -> &LogsView {
+        match app.stack.last() {
+            Some(View::Logs(l)) => l,
+            other => panic!("expected logs view, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_loads_workspaces_with_default_backstop() {
+        let (app, cmds) = App::new(StartPrefs::default());
+        assert_eq!(cmds, vec![Command::LoadWorkspaces]);
+        assert_eq!(app.backstop, Duration::from_secs(360));
+        assert!(matches!(app.stack.as_slice(), [View::Projects]));
+    }
+
+    #[test]
+    fn failed_first_workspace_load_is_retried_on_the_backstop() {
+        let t0 = Instant::now();
+        let (mut app, _) = App::new(StartPrefs::default());
+        assert!(app.workspaces.loading);
+        data(&mut app, DataEvent::Workspaces(Err("offline".into())), t0);
+        assert_eq!(app.workspaces.error.as_deref(), Some("offline"));
+        let early = t0 + Duration::from_secs(359);
+        assert!(app.update(AppEvent::Tick(early), early).is_empty());
+        let due = t0 + Duration::from_secs(360);
+        assert_eq!(
+            app.update(AppEvent::Tick(due), due),
+            vec![Command::LoadWorkspaces]
+        );
+    }
+
+    #[test]
+    fn start_resolves_configured_project_by_name_and_loads_envs() {
+        let now = Instant::now();
+        let mut prefs = prefs_for("BETA");
+        prefs.remembered.last_project_id = Some("p1".into());
+        let (mut app, _) = App::new(prefs);
+        let cmds = data(&mut app, DataEvent::Workspaces(Ok(workspaces())), now);
+        assert_eq!(
+            cmds,
+            vec![Command::LoadEnvironments {
+                project_id: "p2".into()
+            }]
+        );
+        assert_eq!(app.project.as_ref().map(|p| p.id.as_str()), Some("p2"));
+        assert_eq!(app.workspace_id.as_deref(), Some("w2"));
+        assert!(matches!(
+            app.stack.as_slice(),
+            [View::Projects, View::Services]
+        ));
+    }
+
+    #[test]
+    fn start_falls_back_to_remembered_project() {
+        let now = Instant::now();
+        let mut prefs = prefs_for("no-such-project");
+        prefs.remembered.last_project_id = Some("p1".into());
+        let (mut app, _) = App::new(prefs);
+        let cmds = data(&mut app, DataEvent::Workspaces(Ok(workspaces())), now);
+        assert_eq!(
+            cmds,
+            vec![Command::LoadEnvironments {
+                project_id: "p1".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn start_without_prefs_shows_projects() {
+        let now = Instant::now();
+        let prefs = StartPrefs {
+            workspace: Some("team".into()),
+            ..StartPrefs::default()
+        };
+        let (mut app, _) = App::new(prefs);
+        let cmds = data(&mut app, DataEvent::Workspaces(Ok(workspaces())), now);
+        assert!(cmds.is_empty());
+        assert!(matches!(app.stack.as_slice(), [View::Projects]));
+        let ids: Vec<_> = app
+            .project_rows()
+            .iter()
+            .map(|(_, p)| p.id.clone())
+            .collect();
+        assert_eq!(ids, ["p2", "p1"], "preferred workspace is listed first");
+        assert_eq!(app.selected_index(), Some(0));
+
+        let cmds = app.update(code(KeyCode::Enter), now);
+        assert_eq!(
+            cmds,
+            vec![Command::LoadEnvironments {
+                project_id: "p2".into()
+            }]
+        );
+        assert!(matches!(
+            app.stack.as_slice(),
+            [View::Projects, View::Services]
+        ));
+    }
+
+    #[test]
+    fn env_resolution_prefers_production() {
+        let now = Instant::now();
+        let (mut app, _) = App::new(prefs_for("p2"));
+        data(&mut app, DataEvent::Workspaces(Ok(workspaces())), now);
+        let cmds = data(&mut app, envs_event("p2"), now);
+        assert_eq!(
+            cmds,
+            vec![
+                load_services("e-prod"),
+                Command::SaveRemembered(Remembered {
+                    last_project_id: Some("p2".into()),
+                    last_environment_id: Some("e-prod".into()),
+                }),
+            ]
+        );
+        assert_eq!(
+            app.environment.as_ref().map(|e| e.id.as_str()),
+            Some("e-prod")
+        );
+    }
+
+    #[test]
+    fn env_resolution_prefers_configured_then_remembered() {
+        let now = Instant::now();
+        let resolve = |prefs: StartPrefs| {
+            let (mut app, _) = App::new(prefs);
+            data(&mut app, DataEvent::Workspaces(Ok(workspaces())), now);
+            data(&mut app, envs_event("p2"), now);
+            app.environment.unwrap().id
+        };
+        let mut prefs = prefs_for("p2");
+        prefs.environment = Some("STAGING".into());
+        prefs.remembered.last_environment_id = Some("e-prod".into());
+        assert_eq!(resolve(prefs.clone()), "e-stg");
+        prefs.environment = None;
+        prefs.remembered.last_environment_id = Some("e-stg".into());
+        assert_eq!(resolve(prefs), "e-stg");
+    }
+
+    #[test]
+    fn services_arrival_watches_latest_and_leaving_stops() {
+        let now = Instant::now();
+        let (mut app, _) = App::new(prefs_for("p2"));
+        data(&mut app, DataEvent::Workspaces(Ok(workspaces())), now);
+        data(&mut app, envs_event("p2"), now);
+        let watch = Command::WatchDeployments {
+            ids: vec!["d2".into(), "d3".into()],
+        };
+        let cmds = data(&mut app, services_event("e-prod", Ok(services())), now);
+        assert_eq!(cmds, vec![watch.clone()]);
+        let cmds = app.update(code(KeyCode::Enter), now);
+        assert_eq!(
+            cmds,
+            vec![
+                Command::WatchDeployments { ids: vec![] },
+                Command::LoadDeployments {
+                    project_id: "p2".into(),
+                    env_id: "e-prod".into(),
+                    service_id: "svc-a".into()
+                },
+            ]
+        );
+        assert_eq!(app.update(code(KeyCode::Esc), now), vec![watch]);
+    }
+
+    #[test]
+    fn l_on_failed_service_opens_build_logs_of_latest() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        let cmds = app.update(key('l'), now);
+        assert!(cmds.contains(&Command::OpenLogs {
+            session: 1,
+            env_id: "e-prod".into(),
+            deployment_id: "d2".into(),
+            kind: LogKind::Build,
+        }));
+        let l = logs_view(&app);
+        assert_eq!(l.deployment_id, "d2");
+        assert_eq!(l.service_name, "svc-a-name");
+        assert!(l.follow);
+        assert_eq!(l.state, StreamState::Connecting);
+    }
+
+    #[test]
+    fn deployments_view_shows_failed_latest_then_active_and_enter_opens_row() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        app.update(code(KeyCode::Enter), now);
+        let history = vec![deploy("d0", DeploymentStatus::Removed)];
+        data(
+            &mut app,
+            DataEvent::Deployments {
+                service_id: "svc-a".into(),
+                env_id: "e-prod".into(),
+                result: Ok(history),
+            },
+            now,
+        );
+        let ids: Vec<_> = app
+            .deployment_table()
+            .iter()
+            .map(|r| r.deployment.id.clone())
+            .collect();
+        assert_eq!(ids, ["d2", "d1", "d0"]);
+        app.update(key('j'), now);
+        let cmds = app.update(code(KeyCode::Enter), now);
+        assert_eq!(
+            cmds,
+            vec![Command::OpenLogs {
+                session: 1,
+                env_id: "e-prod".into(),
+                deployment_id: "d1".into(),
+                kind: LogKind::Runtime,
+            }]
+        );
+    }
+
+    #[test]
+    fn instances_enter_opens_runtime_logs_for_replica() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        app.update(key('i'), now);
+        assert!(matches!(app.stack.last(), Some(View::Instances { .. })));
+        let cmds = app.update(code(KeyCode::Enter), now);
+        assert!(cmds.contains(&Command::OpenLogs {
+            session: 1,
+            env_id: "e-prod".into(),
+            deployment_id: "d1".into(),
+            kind: LogKind::Runtime,
+        }));
+        assert_eq!(logs_view(&app).replica.as_deref(), Some("d1-i0"));
+    }
+
+    #[test]
+    fn esc_from_logs_closes_session() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        app.update(key('l'), now);
+        let cmds = app.update(code(KeyCode::Esc), now);
+        assert_eq!(cmds[0], Command::CloseLogs { session: 1 });
+        assert!(matches!(app.stack.last(), Some(View::Services)));
+    }
+
+    #[test]
+    fn b_toggles_kind_with_a_new_session() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        app.update(key('l'), now);
+        let cmds = app.update(key('b'), now);
+        assert_eq!(
+            cmds,
+            vec![
+                Command::CloseLogs { session: 1 },
+                Command::OpenLogs {
+                    session: 2,
+                    env_id: "e-prod".into(),
+                    deployment_id: "d2".into(),
+                    kind: LogKind::Runtime,
+                },
+            ]
+        );
+        assert_eq!(logs_view(&app).kind, LogKind::Runtime);
+    }
+
+    #[test]
+    fn late_services_for_old_env_ignored() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        app.update(key('e'), now);
+        assert_eq!(app.env_picker, Some(1), "picker starts on the current env");
+        // Modal: k moves the picker, it is not a table move.
+        app.update(key('k'), now);
+        let cmds = app.update(code(KeyCode::Enter), now);
+        assert!(cmds.contains(&load_services("e-stg")));
+        assert!(cmds.contains(&Command::SaveRemembered(Remembered {
+            last_project_id: Some("p2".into()),
+            last_environment_id: Some("e-stg".into()),
+        })));
+        assert_eq!(app.env_picker, None);
+        assert!(app.services.value.is_none());
+        assert!(app.services.loading);
+
+        let cmds = data(&mut app, services_event("e-prod", Ok(services())), now);
+        assert!(cmds.is_empty());
+        assert!(app.services.value.is_none());
+        assert!(app.services.loading);
+        assert!(app.services.fetched_at.is_none());
+    }
+
+    #[test]
+    fn late_deployments_and_environments_for_old_context_ignored() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        app.update(code(KeyCode::Enter), now); // Deployments for svc-a
+        let other = vec![deploy("x", DeploymentStatus::Success)];
+        let cmds = data(
+            &mut app,
+            DataEvent::Deployments {
+                service_id: "svc-b".into(),
+                env_id: "e-prod".into(),
+                result: Ok(other),
+            },
+            now,
+        );
+        assert!(cmds.is_empty());
+        assert!(app.deployments.value.is_none());
+        let cmds = data(
+            &mut app,
+            DataEvent::Environments {
+                project_id: "p1".into(),
+                result: Ok(vec![]),
+            },
+            now,
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(app.environments.value.as_ref().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn log_events_for_closed_session_ignored() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        app.update(key('l'), now);
+        app.update(key('b'), now); // closes session 1, opens session 2
+        assert_eq!(logs_view(&app).session, 2);
+        data(
+            &mut app,
+            log_event(1, FollowEvent::Lines(vec![line(1, "old")])),
+            now,
+        );
+        data(
+            &mut app,
+            log_event(1, FollowEvent::State(StreamState::Live)),
+            now,
+        );
+        assert!(logs_view(&app).buffer.is_empty());
+        assert_eq!(logs_view(&app).state, StreamState::Connecting);
+
+        data(
+            &mut app,
+            log_event(2, FollowEvent::Lines(vec![line(1, "new")])),
+            now,
+        );
+        data(
+            &mut app,
+            log_event(2, FollowEvent::State(StreamState::Live)),
+            now,
+        );
+        assert_eq!(logs_view(&app).buffer.len(), 1);
+        assert_eq!(logs_view(&app).state, StreamState::Live);
+
+        // Once the view is gone, its session's events are dropped too.
+        app.update(code(KeyCode::Esc), now);
+        data(
+            &mut app,
+            log_event(2, FollowEvent::Lines(vec![line(2, "x")])),
+            now,
+        );
+        assert!(matches!(app.stack.last(), Some(View::Services)));
+    }
+
+    #[test]
+    fn scroll_up_pauses_follow_and_shift_g_resumes() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        app.update(key('l'), now);
+        let lines = (0..10).map(|i| line(i, &format!("l{i}"))).collect();
+        data(&mut app, log_event(1, FollowEvent::Lines(lines)), now);
+        app.update(key('k'), now);
+        assert!(!logs_view(&app).follow);
+        assert_eq!(logs_view(&app).scroll, 1);
+        app.update(code(KeyCode::Up), now);
+        assert_eq!(logs_view(&app).scroll, 2);
+        // Lines arriving while paused keep the view anchored.
+        let late = vec![line(30, "late")];
+        data(&mut app, log_event(1, FollowEvent::Lines(late)), now);
+        assert_eq!(logs_view(&app).scroll, 3);
+
+        let shift_g = KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT);
+        app.update(AppEvent::Key(shift_g), now);
+        assert!(logs_view(&app).follow);
+        assert_eq!(logs_view(&app).scroll, 0);
+
+        app.update(code(KeyCode::PageUp), now);
+        assert!(!logs_view(&app).follow);
+        assert_eq!(logs_view(&app).scroll, 10, "page up clamps to the top line");
+        app.update(key('f'), now);
+        assert!(logs_view(&app).follow);
+    }
+
+    #[test]
+    fn logs_filter_is_modal_and_esc_clears_then_goes_back() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        app.update(key('l'), now);
+        app.update(key('/'), now);
+        assert!(
+            app.update(key('q'), now).is_empty(),
+            "q is filter text, not quit"
+        );
+        app.update(code(KeyCode::Enter), now);
+        assert_eq!(app.filter_input, None);
+        assert_eq!(logs_view(&app).filter.as_deref(), Some("q"));
+        assert!(app.update(code(KeyCode::Esc), now).is_empty());
+        assert_eq!(logs_view(&app).filter, None);
+        let cmds = app.update(code(KeyCode::Esc), now);
+        assert_eq!(cmds[0], Command::CloseLogs { session: 1 });
+    }
+
+    #[test]
+    fn table_filter_narrows_rows_and_esc_clears_it_first() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        typed(&mut app, "/SVC-B", now);
+        app.update(code(KeyCode::Enter), now);
+        let ids: Vec<_> = app
+            .service_rows()
+            .iter()
+            .map(|s| s.service_id.clone())
+            .collect();
+        assert_eq!(ids, ["svc-b"]);
+        assert_eq!(app.selected_index(), Some(0));
+        app.update(code(KeyCode::Esc), now);
+        assert_eq!(app.table_filter, None);
+        assert!(matches!(app.stack.last(), Some(View::Services)));
+    }
+
+    #[test]
+    fn backstop_tick_emits_reload_after_interval_only() {
+        let t0 = Instant::now();
+        let secs = Duration::from_secs;
+        let mut app = app_in_services(t0);
+        let budget = |blocked_until| DataEvent::Budget {
+            interval: secs(60),
+            blocked_until,
+        };
+        data(&mut app, budget(None), t0);
+        assert_eq!(app.backstop, secs(60));
+
+        let early = t0 + secs(59);
+        assert!(app.update(AppEvent::Tick(early), early).is_empty());
+        let t1 = t0 + secs(60);
+        assert_eq!(
+            app.update(AppEvent::Tick(t1), t1),
+            vec![load_services("e-prod")]
+        );
+        assert!(
+            app.update(AppEvent::Tick(t1), t1).is_empty(),
+            "no duplicate while loading"
+        );
+
+        // While rate limited nothing goes out; afterwards the reload does.
+        data(&mut app, services_event("e-prod", Ok(services())), t1);
+        let t2 = t1 + secs(60);
+        data(&mut app, budget(Some(t2 + secs(10))), t1);
+        assert_eq!(app.blocked_until, Some(t2 + secs(10)));
+        assert!(app.update(AppEvent::Tick(t2), t2).is_empty());
+        let t3 = t2 + secs(10);
+        assert_eq!(
+            app.update(AppEvent::Tick(t3), t3),
+            vec![load_services("e-prod")]
+        );
+    }
+
+    #[test]
+    fn load_error_keeps_old_value_and_sets_error() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        let later = now + Duration::from_secs(5);
+        assert_eq!(app.update(ctrl('r'), later), vec![load_services("e-prod")]);
+        assert!(app.services.loading);
+        data(
+            &mut app,
+            services_event("e-prod", Err("boom".into())),
+            later,
+        );
+        assert_eq!(app.services.value.as_ref().map(Vec::len), Some(2));
+        assert_eq!(app.services.error.as_deref(), Some("boom"));
+        assert_eq!(app.services.fetched_at, Some(now));
+        assert!(!app.services.loading);
+    }
+
+    #[test]
+    fn terminal_status_event_triggers_service_reload() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        let status_of = |app: &App| {
+            let svc = &app.services.value.as_ref().unwrap()[1];
+            svc.latest.as_ref().unwrap().status.clone()
+        };
+        let changed = |status| DataEvent::StatusChanged {
+            deployment_id: "d3".into(),
+            status,
+        };
+        assert!(data(&mut app, changed(DeploymentStatus::Deploying), now).is_empty());
+        assert_eq!(status_of(&app), DeploymentStatus::Deploying);
+        let cmds = data(&mut app, changed(DeploymentStatus::Crashed), now);
+        assert_eq!(cmds, vec![load_services("e-prod")]);
+        assert_eq!(status_of(&app), DeploymentStatus::Crashed);
+    }
+
+    #[test]
+    fn colon_q_quits() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        app.update(key(':'), now);
+        assert!(
+            app.update(key('q'), now).is_empty(),
+            "q is command text, not quit"
+        );
+        assert_eq!(app.update(code(KeyCode::Enter), now), vec![Command::Quit]);
+        assert_eq!(app.update(key('q'), now), vec![Command::Quit]);
+    }
+
+    #[test]
+    fn command_line_jumps_between_views() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        typed(&mut app, ":logs", now);
+        app.update(code(KeyCode::Enter), now);
+        assert_eq!(logs_view(&app).session, 1);
+
+        typed(&mut app, ":projects", now);
+        let cmds = app.update(code(KeyCode::Enter), now);
+        assert_eq!(cmds, vec![Command::CloseLogs { session: 1 }]);
+        assert!(matches!(app.stack.as_slice(), [View::Projects]));
+
+        typed(&mut app, ":deploys", now);
+        app.update(code(KeyCode::Enter), now);
+        assert!(matches!(
+            app.stack.as_slice(),
+            [View::Projects, View::Services, View::Deployments { .. }]
+        ));
+
+        typed(&mut app, ":nope", now);
+        assert!(app.update(code(KeyCode::Enter), now).is_empty());
+        assert!(app.message.is_some());
+    }
+
+    #[test]
+    fn help_toggles_and_ctrl_c_always_quits() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        app.update(key('?'), now);
+        assert!(app.help);
+        app.update(key('?'), now);
+        assert!(!app.help);
+        app.update(key('/'), now);
+        assert_eq!(app.update(ctrl('c'), now), vec![Command::Quit]);
+    }
+}
