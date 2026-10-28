@@ -7,6 +7,7 @@ pub mod budget;
 pub mod config;
 pub mod logs;
 pub mod model;
+pub mod pending;
 pub mod remember;
 pub mod status;
 pub mod theme;
