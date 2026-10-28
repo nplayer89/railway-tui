@@ -10,3 +10,4 @@ pub mod model;
 pub mod remember;
 pub mod status;
 pub mod ui;
+pub mod worker;
