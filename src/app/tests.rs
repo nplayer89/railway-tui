@@ -95,6 +95,7 @@ fn service(id: &str, latest: DeploymentSummary, active: Vec<DeploymentSummary>) 
 fn services() -> Vec<ServiceInstance> {
     let failed = DeploymentSummary {
         instances: vec![],
+        branch: Some("main".into()),
         ..deploy("d2", DeploymentStatus::Failed)
     };
     vec![
@@ -103,7 +104,14 @@ fn services() -> Vec<ServiceInstance> {
             failed,
             vec![deploy("d1", DeploymentStatus::Success)],
         ),
-        service("svc-b", deploy("d3", DeploymentStatus::Success), vec![]),
+        service(
+            "svc-b",
+            DeploymentSummary {
+                branch: Some("feat/x".into()),
+                ..deploy("d3", DeploymentStatus::Success)
+            },
+            vec![],
+        ),
     ]
 }
 
@@ -3199,10 +3207,103 @@ fn position_is_one_based_and_absent_on_empty_or_logs() {
 }
 
 #[test]
-fn status_label_names_the_context_and_view() {
+fn status_label_starts_with_the_project() {
     let now = Instant::now();
     let mut app = app_in_services(now);
     assert_eq!(app.status_label(), "Beta › services");
     app.update(key('v'), now);
-    assert_eq!(app.status_label(), "svc-a-name › variables");
+    assert_eq!(app.status_label(), "Beta › svc-a-name › variables");
+}
+
+#[test]
+fn cursor_branch_follows_the_selected_deployment() {
+    let now = Instant::now();
+    let mut app = app_in_services(now);
+    assert_eq!(app.cursor_branch(), Some("main"));
+    app.update(key('j'), now);
+    assert_eq!(app.cursor_branch(), Some("feat/x"));
+    let (app, _) = App::new(StartPrefs::default());
+    assert_eq!(app.cursor_branch(), None);
+}
+
+#[test]
+fn cursor_branch_follows_real_navigation_on_every_screen() {
+    let now = Instant::now();
+    let mut app = app_in_services(now);
+    {
+        let svcs = app.services.value.as_mut().unwrap();
+        svcs[0].active[0].branch = Some("rel".into());
+    }
+    // Services: the latest deployment of the selected service.
+    assert_eq!(app.cursor_branch(), Some("main"));
+
+    // Deployments: before the history loads, after it, and after `j`.
+    app.update(code(KeyCode::Enter), now);
+    assert!(matches!(app.stack.last(), Some(View::Deployments { .. })));
+    assert_eq!(app.cursor_branch(), Some("main"));
+    let history = DeploymentSummary {
+        branch: Some("old".into()),
+        ..deploy("d0", DeploymentStatus::Removed)
+    };
+    data(
+        &mut app,
+        DataEvent::Deployments {
+            service_id: "svc-a".into(),
+            env_id: "e-prod".into(),
+            result: Ok(vec![history]),
+        },
+        now,
+    );
+    assert_eq!(app.cursor_branch(), Some("main"));
+    app.update(key('j'), now);
+    assert_eq!(app.cursor_branch(), Some("rel"));
+    app.update(key('j'), now);
+    assert_eq!(app.cursor_branch(), Some("old"));
+    app.update(code(KeyCode::Esc), now);
+
+    // Instances, and Logs opened from the selected instance.
+    app.update(key('i'), now);
+    assert!(matches!(app.stack.last(), Some(View::Instances { .. })));
+    assert_eq!(app.cursor_branch(), Some("rel"));
+    app.update(code(KeyCode::Enter), now);
+    assert!(matches!(app.stack.last(), Some(View::Logs(_))));
+    assert_eq!(app.cursor_branch(), Some("rel"));
+    app.update(code(KeyCode::Esc), now);
+    app.update(code(KeyCode::Esc), now);
+
+    // Variables: the service's latest deployment.
+    app.update(key('v'), now);
+    assert!(matches!(app.stack.last(), Some(View::Variables(_))));
+    assert_eq!(app.cursor_branch(), Some("main"));
+}
+
+#[test]
+fn cursor_branch_is_none_for_image_deploys_and_unknown_logs() {
+    let now = Instant::now();
+    let mut app = app_in_services(now);
+    app.services.value.as_mut().unwrap()[0]
+        .latest
+        .as_mut()
+        .unwrap()
+        .branch = None;
+    assert_eq!(app.cursor_branch(), None);
+    app.stack.push(View::Logs(LogsView {
+        session: 0,
+        deployment_id: "nope".into(),
+        service_name: "x".into(),
+        kind: LogKind::Runtime,
+        replica: None,
+        buffer: crate::logs::buffer::LogBuffer::new(10),
+        follow: true,
+        scroll: 0,
+        filter: None,
+        state: StreamState::Connecting,
+    }));
+    assert_eq!(app.cursor_branch(), None);
+}
+
+#[test]
+fn workspace_name_resolves_the_current_workspace() {
+    let app = app_in_services(Instant::now());
+    assert_eq!(app.workspace_name(), Some("Team"));
 }

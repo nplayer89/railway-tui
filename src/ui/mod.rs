@@ -10,7 +10,7 @@ mod vars;
 
 use std::time::Instant;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -47,10 +47,15 @@ pub fn is_production(env_name: &str) -> bool {
 }
 
 pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
+    draw_at(frame, app, now, Utc::now());
+}
+
+/// `draw` with the wall clock supplied, so the scrolling workspace name can be tested.
+fn draw_at(frame: &mut Frame, app: &App, now: Instant, wall: DateTime<Utc>) {
     let t = app.theme();
     frame.render_widget(Block::new().style(base(t)), frame.area());
     let [head, body, status, cmd] = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(1),
         Constraint::Min(0),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -58,7 +63,6 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
     .areas(frame.area());
 
     draw_header(frame, head, app, now);
-    let wall = Utc::now();
     match app.stack.last() {
         Some(View::Services) => tables::services(frame, body, app, wall, now),
         Some(View::Deployments { .. }) => tables::deployments(frame, body, app, wall),
@@ -73,7 +77,12 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
         Some(View::Variables(v)) => vars::draw(frame, body, app, v),
         Some(View::Projects) | None => tables::projects(frame, body, app),
     }
-    statusline::draw_statusline(frame, status, app);
+    statusline::draw_statusline(
+        frame,
+        status,
+        app,
+        wall.timestamp_millis().max(0) as u64 / 250,
+    );
     statusline::draw_cmdline(frame, cmd, app);
 
     if app.help {
@@ -119,6 +128,26 @@ fn hints(app: &App) -> &'static str {
     }
 }
 
+/// The hint groups (split on double spaces) that fit in `room` cells: leading groups are
+/// kept and whole groups dropped from the right, but the trailing `<?> help` group always
+/// stays last when it alone fits. Empty when not even that fits.
+fn fit_hints(hints: &str, room: usize) -> String {
+    const HELP: &str = "<?> help";
+    let mut groups: Vec<&str> = hints.split("  ").collect();
+    if groups.last() == Some(&HELP) {
+        groups.pop();
+    }
+    for keep in (0..=groups.len()).rev() {
+        let mut shown = groups[..keep].to_vec();
+        shown.push(HELP);
+        let joined = shown.join("  ");
+        if joined.chars().count() <= room {
+            return joined;
+        }
+    }
+    String::new()
+}
+
 /// What the freshness indicator shows of a load.
 struct Freshness<'a> {
     loading: bool,
@@ -150,32 +179,7 @@ fn freshness_source(app: &App) -> Option<Freshness<'_>> {
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
     let t = app.theme();
-    let workspace = app
-        .workspace_id
-        .as_deref()
-        .and_then(|id| {
-            app.workspaces
-                .value
-                .iter()
-                .flatten()
-                .find(|w| w.id == id)
-                .map(|w| w.name.as_str())
-        })
-        .unwrap_or("-");
-    let project = app.project.as_ref().map_or("-", |p| p.name.as_str());
-    let env = app.environment.as_ref().map_or("-", |e| e.name.as_str());
     let dim = Style::new().fg(t.muted);
-    let text = Style::new().fg(t.text);
-    let line1 = Line::from(vec![
-        Span::styled("Workspace: ", dim),
-        Span::styled(clean(workspace), text),
-        Span::styled("  Project: ", dim),
-        Span::styled(clean(project), text),
-        Span::styled("  Env: ", dim),
-        Span::styled(clean(env), text),
-        Span::raw("    "),
-        Span::styled(hints(app), Style::new().fg(t.hint)),
-    ]);
 
     let mut spans: Vec<Span> = Vec::new();
     if let Some(Freshness {
@@ -220,7 +224,18 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
             Style::new().fg(t.busy),
         ));
     }
-    frame.render_widget(Paragraph::new(vec![line1, Line::from(spans)]), area);
+    // Hints sit right-aligned, after the status. Whole groups are dropped from the right
+    // until the rest fits; `<?> help` is the last one standing.
+    let left = Line::from(spans.clone()).width();
+    let room = (area.width as usize).saturating_sub(left + 2);
+    let hints = fit_hints(hints(app), room);
+    let hint_width = hints.chars().count();
+    if hint_width > 0 {
+        let gap = area.width as usize - left - hint_width;
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.push(Span::styled(hints, Style::new().fg(t.hint)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Default text on the theme background.

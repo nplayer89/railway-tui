@@ -6,7 +6,8 @@ use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 use ratatui::Terminal;
 
-use super::draw;
+use super::statusline::marquee;
+use super::{draw, draw_at};
 use crate::theme::{Theme, THEMES};
 
 /// The default theme, which the fixtures render with.
@@ -25,6 +26,16 @@ use crate::model::{
 fn render_sized(app: &App, now: Instant, w: u16, h: u16) -> Buffer {
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
     terminal.draw(|f| draw(f, app, now)).unwrap();
+    terminal.backend().buffer().clone()
+}
+
+/// Renders at a fixed wall-clock time, which sets the workspace marquee's step (`ms / 250`).
+fn render_at_step(app: &App, w: u16, step: u64) -> Buffer {
+    let wall = Utc.timestamp_millis_opt((step * 250) as i64).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(w, 20)).unwrap();
+    terminal
+        .draw(|f| draw_at(f, app, Instant::now(), wall))
+        .unwrap();
     terminal.backend().buffer().clone()
 }
 
@@ -203,7 +214,7 @@ fn row_colours_follow_health() {
         let y = (0..30)
             .find(|y| row_text(&buf, *y).trim_start().starts_with(name))
             .unwrap();
-        let status_x = row_text(&buf, 2).find("STATUS").unwrap() as u16;
+        let status_x = row_text(&buf, 1).find("STATUS").unwrap() as u16;
         (buf[(0, y)].fg, buf[(status_x, y)].fg)
     };
     assert_eq!(fg_of("healthy"), (T.text, T.ok));
@@ -929,10 +940,10 @@ fn header_shows_pending_count() {
     add_pending(&mut app, "A", Change::Delete, Some("1"));
     add_pending(&mut app, "B", Change::Set { value: "2".into() }, None);
     let buf = render(&app, Instant::now());
-    let line = row_text(&buf, 1);
+    let line = row_text(&buf, 0);
     assert!(line.contains("2 pending"), "{line}");
     let x = line.find("2 pending").unwrap() as u16;
-    assert_eq!(buf[(x, 1)].fg, T.busy);
+    assert_eq!(buf[(x, 0)].fg, T.busy);
 }
 
 #[test]
@@ -1566,42 +1577,211 @@ fn message_wins_over_filter_on_the_last_line() {
     assert!(last.contains("filter: A"), "{last}");
 }
 
+/// A variables view with a workspace named `name` and the latest branch `feat/x`.
+fn workspace_app(env: &str, name: &str) -> App {
+    let mut app = vars_app(env, &[("A", "1"), ("B", "2")]);
+    app.services.value.as_mut().unwrap()[0]
+        .latest
+        .as_mut()
+        .unwrap()
+        .branch = Some("feat/x".into());
+    app.workspace_id = Some("w1".into());
+    app.workspaces.value = Some(vec![crate::model::Workspace {
+        id: "w1".into(),
+        name: name.into(),
+        projects: vec![],
+    }]);
+    app
+}
+
 #[test]
-fn narrow_statusline_drops_pieces_and_keeps_the_mode() {
-    let app = vars_app("staging", &[("A", "1")]);
-    let row = status_row(&render_sized(&app, Instant::now(), 40, 20));
-    assert!(row.contains("NORMAL") && !row.contains("proj"), "{row}");
-    let row = status_row(&render_sized(&app, Instant::now(), 24, 20));
-    assert!(row.contains("NORMAL") && row.contains('…'), "{row}");
+fn marquee_pads_short_text_and_scrolls_long_text() {
+    assert_eq!(marquee("shop", 6, 99), "shop  ");
+    assert_eq!(
+        marquee("abcdefghijklmnopqrst", 20, 5),
+        "abcdefghijklmnopqrst"
+    );
+    assert_eq!(marquee("abcdef", 4, 0), "abcd");
+    assert_eq!(marquee("abcdef", 4, 3), "def ");
+    assert_eq!(marquee("abcdef", 4, 7), "  ab");
+    assert_eq!(marquee("abcdef", 4, 9), "abcd");
+    // A wide char counts as two cells: the field is 3 cells, so "😀a" fits and "b" does not.
+    assert_eq!(marquee("éé😀abc", 3, 2), "😀a");
+}
+
+#[test]
+fn marquee_is_exactly_the_width_in_cells_with_wide_characters() {
+    use unicode_width::UnicodeWidthStr;
+    for name in [
+        "東京のチーム ワークスペース名",
+        "team 🚀 launch 🚀 pad crew",
+        "日本語",
+    ] {
+        for step in 0..40 {
+            let m = marquee(name, 20, step);
+            assert_eq!(
+                UnicodeWidthStr::width(m.as_str()),
+                20,
+                "{name:?} step {step}: {m:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn header_is_one_line_with_status_left_and_hints_right() {
+    let app = services_app(vec![]);
+    let buf = render_sized(&app, Instant::now(), 140, 20);
+    let row = row_text(&buf, 0);
+    assert!(row.contains("updated") && row.contains("<?> help"), "{row}");
+    assert!(row.find("updated").unwrap() < row.find("<?> help").unwrap());
+    assert!(row.trim_end().ends_with("<?> help"), "{row}");
+    let all = text(&buf);
+    assert!(!all.contains("Workspace:") && !all.contains("Project:") && !all.contains("Env:"));
+}
+
+#[test]
+fn header_at_80_columns_keeps_help_and_the_first_hint_group() {
+    let app = services_app(vec![]);
+    for w in [80, 100] {
+        let row = row_text(&render_sized(&app, Instant::now(), w, 20), 0);
+        assert!(row.contains("updated"), "{row}");
+        assert!(
+            row.contains("<e> env") && row.trim_end().ends_with("<?> help"),
+            "{row}"
+        );
+    }
+}
+
+#[test]
+fn header_shows_help_alone_when_only_it_fits() {
+    let app = services_app(vec![]);
+    let row = row_text(&render_sized(&app, Instant::now(), 26, 20), 0);
+    assert!(
+        row.contains("updated") && row.trim_end().ends_with("<?> help"),
+        "{row}"
+    );
+    assert!(!row.contains("<e> env"), "{row}");
+}
+
+#[test]
+fn header_shows_no_hint_when_not_even_help_fits() {
+    let app = services_app(vec![]);
+    let row = row_text(&render_sized(&app, Instant::now(), 22, 20), 0);
+    assert!(row.contains("updated") && !row.contains("<?>"), "{row}");
+}
+
+#[test]
+fn narrow_header_keeps_status_and_drops_hints() {
+    let app = services_app(vec![]);
+    let row = row_text(&render_sized(&app, Instant::now(), 20, 20), 0);
+    assert!(
+        row.contains("updated") && !row.contains("<?> help"),
+        "{row}"
+    );
     for w in 0..12 {
         render_sized(&app, Instant::now(), w, 20);
     }
 }
 
 #[test]
-fn statusline_drops_count_then_project_then_env_then_position() {
-    let mut app = vars_app("staging", &[("A", "1"), ("B", "2")]);
+fn statusline_shows_env_branch_and_scrolling_workspace() {
+    let app = workspace_app("production", "Neil's Deployment Workspace");
+    let row = |step| status_row(&render_at_step(&app, 140, step));
+    let (r0, r1) = (row(0), row(1));
+    assert!(r0.contains("production") && r0.contains("feat/x"), "{r0}");
+    assert!(r0.contains('\u{f0ac}') && r0.contains('\u{e725}'), "{r0}");
+    let field = |r: &str| {
+        let i = r.find('\u{f07b}').unwrap();
+        r[i..].chars().skip(2).take(20).collect::<String>()
+    };
+    assert_eq!(field(&r0), "Neil's Deployment Wo");
+    assert_eq!(field(&r1), "eil's Deployment Wor");
+    let buf = render_at_step(&app, 140, 0);
+    let y = buf.area.height - 2;
+    let x = r0.find("production").unwrap();
+    let x = r0[..x].chars().count() as u16;
+    let cell = &buf[(x, y)];
+    assert_eq!(cell.fg, T.bad);
+    assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
+    let x = r0.find('\u{f07b}').unwrap();
+    let x = r0[..x].chars().count() as u16 + 2;
+    assert_eq!(buf[(x, y)].bg, T.select_bg);
+}
+
+#[test]
+fn short_workspace_name_is_padded_not_scrolled() {
+    let app = workspace_app("staging", "shop");
+    let row = |step| status_row(&render_at_step(&app, 140, step));
+    assert_eq!(row(0), row(7));
+    assert!(row(0).contains("shop "), "{}", row(0));
+}
+
+#[test]
+fn non_production_env_is_plain_text() {
+    let app = workspace_app("staging", "shop");
+    let buf = render_at_step(&app, 140, 0);
+    let y = buf.area.height - 2;
+    let r = row_text(&buf, y);
+    let x = r.find("staging").unwrap();
+    let cell = &buf[(r[..x].chars().count() as u16, y)];
+    assert_eq!(cell.fg, T.text);
+    assert!(!cell.modifier.contains(ratatui::style::Modifier::BOLD));
+}
+
+#[test]
+fn no_branch_or_workspace_omits_those_segments() {
+    let app = vars_app("staging", &[("A", "1")]);
+    let row = status_row(&render_sized(&app, Instant::now(), 140, 20));
+    assert!(!row.contains('\u{f07b}'), "{row}");
+    let (mut app, _) = App::new(StartPrefs::default());
+    app.stack = vec![View::Projects];
+    let row = status_row(&render_sized(&app, Instant::now(), 140, 20));
+    assert!(
+        !row.contains('\u{e725}') && !row.contains('\u{f0ac}'),
+        "{row}"
+    );
+}
+
+#[test]
+fn narrow_statusline_drops_pieces_and_keeps_the_mode() {
+    let app = workspace_app("staging", "shop");
+    let row = status_row(&render_sized(&app, Instant::now(), 40, 20));
+    assert!(row.contains("NORMAL") && !row.contains('\u{f07b}'), "{row}");
+    assert!(row.contains("staging"), "{row}");
+    let row = status_row(&render_sized(&app, Instant::now(), 30, 20));
+    assert!(row.contains("NORMAL") && row.contains("staging"), "{row}");
+    for w in 0..12 {
+        render_sized(&app, Instant::now(), w, 20);
+    }
+}
+
+#[test]
+fn statusline_drop_order_keeps_env_and_mode() {
+    let mut app = workspace_app("staging", "shop");
     press(&mut app, 'v');
     press(&mut app, 'j');
     let row = |w| status_row(&render_sized(&app, Instant::now(), w, 20));
-    let full = row(120);
-    assert!(
-        full.contains("2 selected") && full.contains("proj"),
-        "{full}"
+    let full = row(140);
+    for want in ["2 selected", "\u{f07b}", "feat/x", "2/2"] {
+        assert!(full.contains(want), "missing {want:?} in {full}");
+    }
+    // The widest width at which each piece has gone.
+    let gone = |piece: &str| (1..140).rev().find(|&w| !row(w).contains(piece)).unwrap();
+    let (count, ws, branch, pos) = (
+        gone("selected"),
+        gone("\u{f07b}"),
+        gone("feat/x"),
+        gone("2/2"),
     );
-    // Find the widest width at which each piece is still absent or present.
-    let w_no_count = (1..120)
-        .rev()
-        .find(|&w| !row(w).contains("selected"))
-        .unwrap();
-    let r = row(w_no_count);
-    assert!(r.contains("proj") && r.contains("staging"), "{r}");
-    let w_no_env = (1..120)
-        .rev()
-        .find(|&w| !row(w).contains("staging"))
-        .unwrap();
-    let r = row(w_no_env);
-    assert!(!r.contains("proj") && r.contains("2/2"), "{r}");
+    assert!(
+        count > ws && ws > branch && branch > pos,
+        "{count} {ws} {branch} {pos}"
+    );
+    for w in 30..140 {
+        let r = row(w);
+        assert!(r.contains("VISUAL") && r.contains("staging"), "{w}: {r}");
+    }
 }
 
 #[test]

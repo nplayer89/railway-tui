@@ -896,9 +896,9 @@ impl App {
             .map(|(i, (len, _))| (i + 1, len))
     }
 
-    /// `<context> › <view>` for the statusline, uncleaned.
+    /// `<project> › <service> › <view>` for the statusline, uncleaned; names not loaded show as `-`.
     pub fn status_label(&self) -> String {
-        let project = || self.project.as_ref().map_or("-", |p| p.name.as_str());
+        let project = self.project.as_ref().map_or("-", |p| p.name.as_str());
         let service = |kind| {
             self.view_service_id(kind)
                 .and_then(|id| self.service(id))
@@ -906,16 +906,52 @@ impl App {
         };
         match self.kind() {
             Kind::Projects => "projects".to_string(),
-            Kind::Services => format!("{} › services", project()),
-            Kind::Deployments => format!("{} › deployments", service(Kind::Deployments)),
-            Kind::Instances => format!("{} › instances", service(Kind::Instances)),
-            Kind::Variables => format!("{} › variables", service(Kind::Variables)),
-            Kind::Pending => format!("{} › pending", project()),
+            Kind::Services => format!("{project} › services"),
+            Kind::Pending => format!("{project} › pending"),
+            Kind::Deployments => {
+                format!("{project} › {} › deployments", service(Kind::Deployments))
+            }
+            Kind::Instances => format!("{project} › {} › instances", service(Kind::Instances)),
+            Kind::Variables => format!("{project} › {} › variables", service(Kind::Variables)),
             Kind::Logs => match self.stack.last() {
-                Some(View::Logs(l)) => format!("{} › logs", l.service_name),
+                Some(View::Logs(l)) => format!("{project} › {} › logs", l.service_name),
                 _ => unreachable!("kind() is Logs only for a Logs view"),
             },
         }
+    }
+
+    /// The branch of the deployment under the cursor; None where there is no deployment
+    /// (Projects, Pending), it is not loaded, or it was not built from a branch.
+    pub fn cursor_branch(&self) -> Option<&str> {
+        let deployment = match self.kind() {
+            Kind::Projects | Kind::Pending => None,
+            Kind::Services => self.selected_service()?.latest.as_ref(),
+            Kind::Deployments => self.selected_deployment(),
+            Kind::Instances => {
+                let (deployment_id, _) = self.selected_instance()?;
+                self.find_deployment(&deployment_id)
+            }
+            Kind::Variables => self
+                .service(self.view_service_id(Kind::Variables)?)?
+                .latest
+                .as_ref(),
+            Kind::Logs => match self.stack.last() {
+                Some(View::Logs(l)) => self.find_deployment(&l.deployment_id),
+                _ => None,
+            },
+        };
+        deployment?.branch.as_deref()
+    }
+
+    /// The name of the current workspace, once the workspace list has loaded.
+    pub fn workspace_name(&self) -> Option<&str> {
+        let id = self.workspace_id.as_deref()?;
+        self.workspaces
+            .value
+            .iter()
+            .flatten()
+            .find(|w| w.id == id)
+            .map(|w| w.name.as_str())
     }
 
     // ---- data events ----
