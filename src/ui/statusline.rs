@@ -14,7 +14,7 @@ use crate::theme::Theme;
 // Nerd Font v3 glyphs; there is no plain-text fallback.
 const SEPARATOR: &str = "\u{e0bc}";
 const ICON_VIM: &str = "\u{e62b}";
-const ICON_FILE: &str = "\u{f15b}";
+const ICON_GLOBE: &str = "\u{f059f}";
 const ICON_BRANCH: &str = "\u{e725}";
 const ICON_SITEMAP: &str = "\u{f0631}";
 const ICON_LIST: &str = "\u{f03a}";
@@ -94,7 +94,7 @@ pub(super) fn draw_statusline(frame: &mut Frame, area: Rect, app: &App, step: u6
     let view_block = |label: &str| {
         vec![
             Span::styled(
-                format!(" {ICON_FILE} {label} "),
+                format!(" {ICON_GLOBE} {label} "),
                 Style::new().fg(t.text).bg(t.select_bg),
             ),
             Span::styled(SEPARATOR, Style::new().fg(t.select_bg).bg(t.bg)),
