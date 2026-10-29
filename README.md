@@ -4,9 +4,11 @@ A k9s-style terminal UI for looking at [Railway](https://railway.com) from the k
 service's deployment health at a glance, and get from a failed or crashed deployment to the log
 line that explains it in a couple of keystrokes.
 
-Everything is read-only except environment variables: you can edit, add and delete a service's
-variables and deploy those changes (see [Variables](#variables)). It never restarts, scales or
-otherwise changes anything else. It uses only Railway's public GraphQL API.
+Everything is read-only except two things: you can edit, add and delete a service's variables and
+deploy those changes (see [Variables](#variables)), and you can deploy the latest commit of a
+service's connected branch (`D`), or switch the service to another branch and deploy that (`d`),
+both on Services or Deployments and confirmed with `y`. It never restarts, scales or otherwise
+changes anything else. It uses only Railway's public GraphQL API.
 
 Views: Projects, Services (one row per service with a coloured box per replica), Deployments
 (history of one service), Instances (the replicas of a deployment) and Logs (live build or
@@ -59,6 +61,8 @@ On launch it reopens the last-used project and environment.
 | `i` | instances of the service's deployment (Services) |
 | `v` | variables of the selected service (Services; also `:vars`) |
 | `p` | review pending variable changes (Services and Variables; also `:pending`) |
+| `D` | deploy the latest commit of the service's branch (Services and Deployments): a confirmation shows the environment, service, repo, branch and the commit running now; `y` deploys, any other key cancels. Variable changes already written to Railway ship with it. Refused for a service that runs an image |
+| `d` | pick a branch to deploy (Services and Deployments): type to filter the repo's branches, arrows to move, `enter` to pick, `esc` to close. Picking a branch other than the connected one switches the service's deploy trigger to it before deploying, and the service **stays on that branch** (pushes to it deploy if auto-deploy is on); pick the old branch again to go back. The confirm shows `old → new`. Needs your Railway login to have GitHub access to the repo |
 | `b` | switch between build and runtime logs (Logs) |
 | `f`, `G` | resume following the log (Logs) |
 | `PageUp` / `PageDown` | scroll the log by a page (Logs) |

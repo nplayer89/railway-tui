@@ -1,5 +1,5 @@
 //! Railway's public GraphQL API over HTTP. Reads live here; the only writes
-//! (three allowlisted mutations) live in [`write`].
+//! (five allowlisted mutations) live in [`write`].
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -14,7 +14,7 @@ use crate::auth::{AuthError, TokenSource};
 use crate::budget::{parse_retry_after, RateBudget};
 use crate::model::{
     DeploymentStatus, DeploymentSummary, Environment, Instance, InstanceStatus, LogLine,
-    ProjectRef, ServiceInstance, Variables, Workspace,
+    ProjectRef, ServiceInstance, Trigger, Variables, Workspace,
 };
 
 pub mod subscribe;
@@ -95,6 +95,22 @@ mod ops {
         response_derives = "Debug"
     )]
     pub struct EnvironmentLogs;
+
+    #[derive(GraphQLQuery)]
+    #[graphql(
+        schema_path = "graphql/schema.json",
+        query_path = "graphql/GitHubRepoBranches.graphql",
+        response_derives = "Debug"
+    )]
+    pub struct GitHubRepoBranches;
+
+    #[derive(GraphQLQuery)]
+    #[graphql(
+        schema_path = "graphql/schema.json",
+        query_path = "graphql/DeploymentTriggers.graphql",
+        response_derives = "Debug"
+    )]
+    pub struct DeploymentTriggers;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -246,6 +262,50 @@ impl Api {
             })
             .await?;
         Ok(data.variables)
+    }
+
+    /// Branch names of a GitHub repo (`owner/name`), as Railway's GitHub app sees them.
+    pub async fn branches(&self, repo: &str) -> Result<Vec<String>, ApiError> {
+        let Some((owner, name)) = repo.split_once('/') else {
+            return Err(ApiError::Decode(format!("not an owner/name repo: {repo}")));
+        };
+        let data = self
+            .query::<ops::GitHubRepoBranches>(ops::git_hub_repo_branches::Variables {
+                owner: owner.to_string(),
+                repo: name.to_string(),
+            })
+            .await?;
+        Ok(data
+            .github_repo_branches
+            .into_iter()
+            .map(|b| b.name)
+            .collect())
+    }
+
+    /// The service's GitHub deploy triggers in one environment.
+    pub async fn triggers(
+        &self,
+        project_id: &str,
+        env_id: &str,
+        service_id: &str,
+    ) -> Result<Vec<Trigger>, ApiError> {
+        let data = self
+            .query::<ops::DeploymentTriggers>(ops::deployment_triggers::Variables {
+                project_id: project_id.to_string(),
+                environment_id: env_id.to_string(),
+                service_id: service_id.to_string(),
+            })
+            .await?;
+        Ok(data
+            .deployment_triggers
+            .edges
+            .into_iter()
+            .map(|e| Trigger {
+                id: e.node.id,
+                branch: e.node.branch,
+                repository: e.node.repository,
+            })
+            .collect())
     }
 
     pub async fn service_instances(
@@ -572,6 +632,8 @@ fn summarize<S: Serialize>(
         created_at,
         commit_sha: meta_str("commitHash"),
         commit_message: meta_str("commitMessage"),
+        repo: meta_str("repo"),
+        branch: meta_str("branch"),
         image: meta_str("image"),
         instances: instances
             .map(|(id, status)| Instance {

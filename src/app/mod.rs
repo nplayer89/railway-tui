@@ -14,7 +14,7 @@ use crate::logs::buffer::{LogBuffer, LOG_CAP};
 use crate::logs::follow::{FollowEvent, StreamState};
 use crate::model::{
     DeploymentStatus, DeploymentSummary, Environment, Instance, LogKind, ProjectRef,
-    ServiceInstance, Variables, Workspace,
+    ServiceInstance, Trigger, Variables, Workspace,
 };
 use crate::pending::{Pending, PendingVar};
 use crate::remember::Remembered;
@@ -99,6 +99,7 @@ impl PendingGroup {
 pub enum Confirm {
     Discard { env_id: String, service_id: String },
     Deploy(DeployConfirm),
+    DeployLatest(Box<LatestConfirm>),
 }
 
 /// Deploying one pending group. The ids come from the group, never from the
@@ -109,6 +110,90 @@ pub struct DeployConfirm {
     pub service_id: String,
     /// Names changed on Railway since they were edited.
     pub drift: Vec<String>,
+}
+
+/// Deploying the latest commit of a service's branch, with what is deployed
+/// now and where it goes, as known when `D` was pressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatestConfirm {
+    pub project_id: String,
+    pub env_id: String,
+    pub env_name: String,
+    pub service_id: String,
+    pub service_name: String,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    /// The deployment running now, else the latest one.
+    pub current: Option<DeploymentSummary>,
+    /// Variables written to Railway but not deployed: they ship with this deploy.
+    pub written: usize,
+    /// Set when a branch other than the connected one was picked with `d`.
+    pub switch: Option<BranchSwitch>,
+}
+
+/// Points the service's deploy trigger at another branch before deploying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchSwitch {
+    pub trigger_id: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// The branch picker (`d` on Services or Deployments): type to filter,
+/// arrows to move, Enter to pick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchPicker {
+    /// The deploy as it would go to the connected branch.
+    pub target: LatestConfirm,
+    /// `None` while loading.
+    pub choices: Option<Result<BranchChoices, String>>,
+    pub query: String,
+    /// Index into `filtered()`.
+    pub index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchChoices {
+    pub trigger_id: String,
+    /// The branch the service deploys from now.
+    pub connected: String,
+    pub names: Vec<String>,
+}
+
+impl BranchPicker {
+    /// Branch names containing the query (any case), the connected one first.
+    pub fn filtered(&self) -> Vec<&str> {
+        let Some(Ok(c)) = &self.choices else {
+            return Vec::new();
+        };
+        let query = self.query.to_lowercase();
+        let mut names: Vec<&str> = c
+            .names
+            .iter()
+            .map(String::as_str)
+            .filter(|n| n.to_lowercase().contains(&query))
+            .collect();
+        if let Some(i) = names.iter().position(|n| *n == c.connected) {
+            let connected = names.remove(i);
+            names.insert(0, connected);
+        }
+        names
+    }
+}
+
+/// What Railway said to a deploy of the latest commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LatestOutcome {
+    Started,
+    Refused(String),
+    /// Sent, but Railway may or may not have started it.
+    Unknown(String),
+    /// The branch switch did not go through, so nothing was deployed.
+    SwitchFailed {
+        error: String,
+        /// Sent, but Railway may or may not have switched.
+        unknown: bool,
+    },
 }
 
 /// Why variables were loaded: for the Variables view, to check a deploy
@@ -201,6 +286,17 @@ pub enum DataEvent {
         service_id: String,
         step: DeployStep,
     },
+    DeployedLatest {
+        env_id: String,
+        service_id: String,
+        outcome: LatestOutcome,
+    },
+    /// The service's deploy triggers and its repo's branches, for the picker.
+    Branches {
+        env_id: String,
+        service_id: String,
+        result: Result<(Vec<Trigger>, Vec<String>), String>,
+    },
     /// Saving the pending file failed; the text never holds a value.
     SaveFailed(String),
     /// The external editor finished: the new value, or why it could not run.
@@ -257,6 +353,20 @@ pub enum Command {
         upserts: Variables,
         deletes: Vec<String>,
         redeploy_only: bool,
+    },
+    /// Deploys the latest commit of the service's connected branch, after
+    /// switching that branch when `switch` is set (stopping if it fails).
+    DeployLatest {
+        env_id: String,
+        service_id: String,
+        switch: Option<BranchSwitch>,
+    },
+    /// The service's deploy triggers and the branches of `repo` (`owner/name`).
+    LoadBranches {
+        project_id: String,
+        env_id: String,
+        service_id: String,
+        repo: String,
     },
     /// Handled by the main loop, not the worker: edit `initial` in `$VISUAL`/`$EDITOR`.
     EditExternal {
@@ -339,6 +449,8 @@ pub struct App {
     pub confirm: Option<Confirm>,
     /// Deploys sent to the worker and not finished, by (env id, service id).
     deploys: BTreeMap<(String, String), deploy::Sent>,
+    /// Latest-commit deploys sent to the worker and not answered, by (env id, service id).
+    latest_deploys: BTreeMap<(String, String), deploy::LatestSent>,
     /// Ctrl-C was pressed once while deploys are in flight; a second one quits.
     /// Cleared once no deploy is in flight.
     force_quit_armed: bool,
@@ -350,6 +462,7 @@ pub struct App {
     pub command_line: Option<String>,
     /// Highlighted index into `environments` while the picker is open.
     pub env_picker: Option<usize>,
+    pub branch_picker: Option<BranchPicker>,
     /// Index into `THEMES` of the active (or previewed) theme.
     pub theme: usize,
     /// While the theme picker is open: the theme to restore on Esc.
@@ -397,11 +510,13 @@ impl App {
             var_input: None,
             confirm: None,
             deploys: BTreeMap::new(),
+            latest_deploys: BTreeMap::new(),
             force_quit_armed: false,
             table_filter: None,
             filter_input: None,
             command_line: None,
             env_picker: None,
+            branch_picker: None,
             theme,
             theme_picker: None,
             help: false,
@@ -424,7 +539,7 @@ impl App {
             AppEvent::Tick(_) => self.on_tick(now, &mut out),
             AppEvent::Data(data) => self.on_data(data, now, &mut out),
         }
-        if self.deploys.is_empty() {
+        if !self.deploy_in_flight() {
             self.force_quit_armed = false;
         }
         self.track_service_focus(now);
@@ -698,6 +813,16 @@ impl App {
                 service_id,
                 step,
             } => self.on_deploy_step(env_id, service_id, step, now, out),
+            DataEvent::DeployedLatest {
+                env_id,
+                service_id,
+                outcome,
+            } => self.on_deploy_latest(env_id, service_id, outcome, now, out),
+            DataEvent::Branches {
+                env_id,
+                service_id,
+                result,
+            } => self.on_branches(&env_id, &service_id, result),
             DataEvent::SaveFailed(message) => self.message = Some(message),
             DataEvent::Edited { name, result } => match result {
                 Ok(value) => self.set_variable(&name, value, out),
@@ -1462,6 +1587,26 @@ impl fmt::Debug for DataEvent {
                 .field("service_id", service_id)
                 .field("step", step)
                 .finish(),
+            DataEvent::DeployedLatest {
+                env_id,
+                service_id,
+                outcome,
+            } => f
+                .debug_struct("DeployedLatest")
+                .field("env_id", env_id)
+                .field("service_id", service_id)
+                .field("outcome", outcome)
+                .finish(),
+            DataEvent::Branches {
+                env_id,
+                service_id,
+                result,
+            } => f
+                .debug_struct("Branches")
+                .field("env_id", env_id)
+                .field("service_id", service_id)
+                .field("result", result)
+                .finish(),
             DataEvent::SaveFailed(m) => f.debug_tuple("SaveFailed").field(m).finish(),
             DataEvent::Edited { name, result } => f
                 .debug_struct("Edited")
@@ -1556,6 +1701,28 @@ impl fmt::Debug for Command {
                 .field("deletes", deletes)
                 .field("redeploy_only", redeploy_only)
                 .finish(),
+            Command::DeployLatest {
+                env_id,
+                service_id,
+                switch,
+            } => f
+                .debug_struct("DeployLatest")
+                .field("env_id", env_id)
+                .field("service_id", service_id)
+                .field("switch", switch)
+                .finish(),
+            Command::LoadBranches {
+                project_id,
+                env_id,
+                service_id,
+                repo,
+            } => f
+                .debug_struct("LoadBranches")
+                .field("project_id", project_id)
+                .field("env_id", env_id)
+                .field("service_id", service_id)
+                .field("repo", repo)
+                .finish(),
             Command::EditExternal { name, .. } => f
                 .debug_struct("EditExternal")
                 .field("name", name)
@@ -1645,6 +1812,8 @@ mod tests {
             created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
             commit_sha: None,
             commit_message: None,
+            repo: None,
+            branch: None,
             image: None,
             instances: vec![Instance {
                 id: format!("{id}-i0"),
@@ -3693,5 +3862,397 @@ mod tests {
             app.message.as_deref(),
             Some("deploying api to production: OLD deleted…")
         );
+    }
+
+    // ---- deploy latest commit ----
+
+    fn git_deploy(id: &str, sha: &str, msg: &str) -> DeploymentSummary {
+        DeploymentSummary {
+            commit_sha: Some(sha.into()),
+            commit_message: Some(msg.into()),
+            repo: Some("acme/api".into()),
+            branch: Some("main".into()),
+            ..deploy(id, DeploymentStatus::Success)
+        }
+    }
+
+    /// Services open on production with svc-a built from acme/api@main.
+    fn app_with_git_service(now: Instant) -> App {
+        let mut app = app_in_services(now);
+        let svc = service(
+            "svc-a",
+            git_deploy("d2", "bbbbbbb2", "newer"),
+            vec![git_deploy("d1", "aaaaaaa1", "running")],
+        );
+        data(&mut app, services_event("e-prod", Ok(vec![svc])), now);
+        app
+    }
+
+    fn latest_outcome(outcome: LatestOutcome) -> DataEvent {
+        DataEvent::DeployedLatest {
+            env_id: "e-prod".into(),
+            service_id: "svc-a".into(),
+            outcome,
+        }
+    }
+
+    #[test]
+    fn shift_d_on_a_service_asks_with_what_will_be_deployed() {
+        let now = Instant::now();
+        let mut app = app_with_git_service(now);
+        assert_eq!(app.update(key('D'), now), vec![]);
+        let Some(Confirm::DeployLatest(c)) = &app.confirm else {
+            panic!("expected the latest-commit confirm, got {:?}", app.confirm);
+        };
+        assert_eq!(
+            (&c.env_id[..], &c.env_name[..], &c.service_name[..]),
+            ("e-prod", "production", "svc-a-name")
+        );
+        assert_eq!(c.repo.as_deref(), Some("acme/api"));
+        assert_eq!(c.branch.as_deref(), Some("main"));
+        // What is running, not the newest attempt.
+        assert_eq!(c.current.as_ref().map(|d| d.id.as_str()), Some("d1"));
+        assert_eq!(c.written, 0);
+    }
+
+    #[test]
+    fn y_sends_the_deploy_and_any_other_key_cancels() {
+        let now = Instant::now();
+        let mut app = app_with_git_service(now);
+        app.update(key('D'), now);
+        assert_eq!(app.update(key('n'), now), vec![]);
+        assert!(app.confirm.is_none());
+
+        app.update(key('D'), now);
+        assert_eq!(
+            app.update(key('y'), now),
+            vec![Command::DeployLatest {
+                env_id: "e-prod".into(),
+                service_id: "svc-a".into(),
+                switch: None,
+            }]
+        );
+        assert_eq!(
+            app.message.as_deref(),
+            Some("deploying the latest commit of svc-a-name to production…")
+        );
+        // A second D while it is in flight is refused, and so is quitting.
+        app.update(key('D'), now);
+        assert!(app.confirm.is_none());
+        assert_eq!(app.message.as_deref(), Some("already deploying svc-a-name"));
+        assert_eq!(app.update(key('q'), now), vec![]);
+    }
+
+    #[test]
+    fn shift_d_in_deployments_deploys_that_service() {
+        let now = Instant::now();
+        let mut app = app_with_git_service(now);
+        app.update(code(KeyCode::Enter), now);
+        assert_eq!(app.kind(), Kind::Deployments);
+        app.update(key('D'), now);
+        assert!(matches!(
+            &app.confirm,
+            Some(Confirm::DeployLatest(c)) if c.service_id == "svc-a"
+        ));
+        let cmds = app.update(key('y'), now);
+        assert!(matches!(cmds.as_slice(), [Command::DeployLatest { .. }]));
+        // Railway accepted it: the open deployments list reloads.
+        let cmds = data(&mut app, latest_outcome(LatestOutcome::Started), now);
+        assert!(cmds.iter().any(
+            |c| matches!(c, Command::LoadDeployments { service_id, .. } if service_id == "svc-a")
+        ));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Command::LoadServices { .. })));
+        assert_eq!(app.update(key('q'), now), vec![Command::Quit]);
+    }
+
+    #[test]
+    fn started_deploy_ships_written_variables_and_keeps_unwritten_ones() {
+        let now = Instant::now();
+        let mut app = app_with_git_service(now);
+        let t = crate::pending::Target {
+            project_id: "p2",
+            env_id: "e-prod",
+            env_name: "production",
+            service_id: "svc-a",
+            service_name: "svc-a-name",
+        };
+        app.pending.set(&t, "WRITTEN", "1".into(), None);
+        app.pending.set(&t, "LATER", "2".into(), None);
+        sp_mut(&mut app, "e-prod", "svc-a")
+            .vars
+            .get_mut("WRITTEN")
+            .unwrap()
+            .applied = true;
+        app.update(key('D'), now);
+        assert!(matches!(&app.confirm, Some(Confirm::DeployLatest(c)) if c.written == 1));
+        app.update(key('y'), now);
+        let cmds = data(&mut app, latest_outcome(LatestOutcome::Started), now);
+        assert!(cmds.iter().any(|c| matches!(c, Command::SavePending(_))));
+        let sp = app.pending.service("e-prod", "svc-a").unwrap();
+        assert_eq!(sp.vars.keys().collect::<Vec<_>>(), ["LATER"]);
+        assert!(!sp.written_not_deployed);
+    }
+
+    #[test]
+    fn refused_and_unknown_deploys_are_reported() {
+        let now = Instant::now();
+        let mut app = app_with_git_service(now);
+        app.update(key('D'), now);
+        app.update(key('y'), now);
+        data(
+            &mut app,
+            latest_outcome(LatestOutcome::Refused("Not Authorized".into())),
+            now,
+        );
+        assert_eq!(
+            app.message.as_deref(),
+            Some("deploy of svc-a-name failed: Not Authorized")
+        );
+        app.update(key('D'), now);
+        app.update(key('y'), now);
+        data(
+            &mut app,
+            latest_outcome(LatestOutcome::Unknown("timeout".into())),
+            now,
+        );
+        assert_eq!(
+            app.message.as_deref(),
+            Some("deploy of svc-a-name outcome unknown — check the deployments view")
+        );
+    }
+
+    #[test]
+    fn an_image_service_has_no_commit_to_deploy() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        let image = DeploymentSummary {
+            image: Some("postgres:16".into()),
+            ..deploy("d1", DeploymentStatus::Success)
+        };
+        data(
+            &mut app,
+            services_event("e-prod", Ok(vec![service("svc-a", image, vec![])])),
+            now,
+        );
+        app.update(key('D'), now);
+        assert!(app.confirm.is_none());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("cannot deploy svc-a-name: it runs an image, not a repo")
+        );
+    }
+
+    // ---- deploy a picked branch ----
+
+    fn branches_event(
+        service_id: &str,
+        result: Result<(Vec<Trigger>, Vec<String>), String>,
+    ) -> DataEvent {
+        DataEvent::Branches {
+            env_id: "e-prod".into(),
+            service_id: service_id.into(),
+            result,
+        }
+    }
+
+    fn trigger() -> Trigger {
+        Trigger {
+            id: "t1".into(),
+            branch: "main".into(),
+            repository: "acme/api".into(),
+        }
+    }
+
+    /// The picker open on svc-a with branches loaded (connected: main).
+    fn app_with_picker(now: Instant) -> App {
+        let mut app = app_with_git_service(now);
+        let cmds = app.update(key('d'), now);
+        assert_eq!(
+            cmds,
+            vec![Command::LoadBranches {
+                project_id: "p2".into(),
+                env_id: "e-prod".into(),
+                service_id: "svc-a".into(),
+                repo: "acme/api".into(),
+            }]
+        );
+        let names = ["release/2", "feat/Login", "main", "feat/logout"];
+        data(
+            &mut app,
+            branches_event(
+                "svc-a",
+                Ok((
+                    vec![trigger()],
+                    names.iter().map(|n| n.to_string()).collect(),
+                )),
+            ),
+            now,
+        );
+        app
+    }
+
+    fn picked(app: &App) -> Vec<&str> {
+        app.branch_picker.as_ref().unwrap().filtered()
+    }
+
+    #[test]
+    fn d_lists_branches_connected_first_and_typing_filters() {
+        let now = Instant::now();
+        let mut app = app_with_picker(now);
+        assert_eq!(
+            picked(&app),
+            ["main", "feat/Login", "feat/logout", "release/2"]
+        );
+        // Letters go to the query, including j and k.
+        typed(&mut app, "LOG", now);
+        assert_eq!(app.branch_picker.as_ref().unwrap().query, "LOG");
+        assert_eq!(picked(&app), ["feat/Login", "feat/logout"]);
+        app.update(code(KeyCode::Down), now);
+        app.update(code(KeyCode::Down), now);
+        assert_eq!(
+            app.branch_picker.as_ref().unwrap().index,
+            1,
+            "stops at the last"
+        );
+        app.update(code(KeyCode::Backspace), now);
+        assert_eq!(
+            app.branch_picker.as_ref().unwrap().index,
+            0,
+            "editing resets"
+        );
+        typed(&mut app, "zzz", now);
+        assert!(picked(&app).is_empty());
+        app.update(code(KeyCode::Enter), now);
+        assert!(app.confirm.is_none(), "nothing to pick");
+        app.update(code(KeyCode::Esc), now);
+        assert!(app.branch_picker.is_none());
+        assert_eq!(app.kind(), Kind::Services, "esc only closes the picker");
+    }
+
+    #[test]
+    fn picking_another_branch_confirms_the_switch_then_y_sends_it() {
+        let now = Instant::now();
+        let mut app = app_with_picker(now);
+        typed(&mut app, "logout", now);
+        app.update(code(KeyCode::Enter), now);
+        assert!(app.branch_picker.is_none());
+        let Some(Confirm::DeployLatest(c)) = &app.confirm else {
+            panic!("expected the confirm, got {:?}", app.confirm);
+        };
+        let switch = BranchSwitch {
+            trigger_id: "t1".into(),
+            from: "main".into(),
+            to: "feat/logout".into(),
+        };
+        assert_eq!(c.switch.as_ref(), Some(&switch));
+        assert_eq!(c.branch.as_deref(), Some("feat/logout"));
+        assert_eq!(
+            app.update(key('y'), now),
+            vec![Command::DeployLatest {
+                env_id: "e-prod".into(),
+                service_id: "svc-a".into(),
+                switch: Some(switch),
+            }]
+        );
+        assert_eq!(
+            app.message.as_deref(),
+            Some("switching svc-a-name to feat/logout and deploying to production…")
+        );
+        data(&mut app, latest_outcome(LatestOutcome::Started), now);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("switched svc-a-name to feat/logout; deploying the latest commit of svc-a-name to production: Railway accepted it")
+        );
+    }
+
+    #[test]
+    fn picking_the_connected_branch_deploys_without_switching() {
+        let now = Instant::now();
+        let mut app = app_with_picker(now);
+        app.update(code(KeyCode::Enter), now);
+        let Some(Confirm::DeployLatest(c)) = &app.confirm else {
+            panic!("expected the confirm");
+        };
+        assert_eq!(c.switch, None);
+        assert_eq!(c.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn a_failed_switch_says_nothing_was_deployed() {
+        let now = Instant::now();
+        let mut app = app_with_picker(now);
+        typed(&mut app, "release", now);
+        app.update(code(KeyCode::Enter), now);
+        app.update(key('y'), now);
+        let failed = LatestOutcome::SwitchFailed {
+            error: "Not Authorized".into(),
+            unknown: false,
+        };
+        data(&mut app, latest_outcome(failed), now);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("could not switch svc-a-name to release/2: Not Authorized; nothing was deployed")
+        );
+        app.update(key('d'), now);
+        data(
+            &mut app,
+            branches_event("svc-a", Ok((vec![trigger()], vec!["release/2".into()]))),
+            now,
+        );
+        app.update(code(KeyCode::Enter), now);
+        assert!(app.confirm.is_some());
+    }
+
+    #[test]
+    fn picker_errors_stale_replies_and_image_services() {
+        let now = Instant::now();
+        let mut app = app_with_git_service(now);
+        app.update(key('d'), now);
+        // A reply for another service is ignored.
+        data(
+            &mut app,
+            branches_event("svc-b", Ok((vec![trigger()], vec![]))),
+            now,
+        );
+        assert_eq!(app.branch_picker.as_ref().unwrap().choices, None);
+        data(
+            &mut app,
+            branches_event("svc-a", Ok((vec![], vec!["main".into()]))),
+            now,
+        );
+        assert_eq!(
+            app.branch_picker.as_ref().unwrap().choices,
+            Some(Err(
+                "the service has no GitHub deploy trigger in this environment".into()
+            ))
+        );
+        app.update(code(KeyCode::Esc), now);
+
+        let image = DeploymentSummary {
+            image: Some("postgres:16".into()),
+            ..deploy("d1", DeploymentStatus::Success)
+        };
+        data(
+            &mut app,
+            services_event("e-prod", Ok(vec![service("svc-a", image, vec![])])),
+            now,
+        );
+        assert_eq!(app.update(key('d'), now), vec![]);
+        assert!(app.branch_picker.is_none());
+    }
+
+    #[test]
+    fn d_in_deployments_opens_the_picker_for_that_service() {
+        let now = Instant::now();
+        let mut app = app_with_git_service(now);
+        app.update(code(KeyCode::Enter), now);
+        let cmds = app.update(key('d'), now);
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::LoadBranches { service_id, .. }] if service_id == "svc-a"
+        ));
+        assert!(app.branch_picker.is_some());
     }
 }

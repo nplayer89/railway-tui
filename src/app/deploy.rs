@@ -1,11 +1,18 @@
 //! Deploying one pending group: read Railway, confirm with `y`, then follow
 //! the worker's steps. Every id comes from the group, never from the open
 //! project or environment, and only what was actually sent is marked applied.
+//!
+//! Also deploying a service's latest commit (`D` on Services or Deployments),
+//! or a branch picked with `d` (switching the service's trigger to it first):
+//! confirmed with `y`.
 
 use std::time::Instant;
 
-use super::{App, Command, Confirm, DeployConfirm, DeployStep, Kind, Phase, VarsPurpose, View};
-use crate::model::Variables;
+use super::{
+    App, BranchChoices, BranchPicker, BranchSwitch, Command, Confirm, DeployConfirm, DeployStep,
+    Kind, LatestConfirm, LatestOutcome, Phase, VarsPurpose, View,
+};
+use crate::model::{Trigger, Variables};
 use crate::pending::Change;
 
 /// A deploy in flight: exactly what was sent, and the names to report it by.
@@ -18,7 +25,251 @@ pub(super) struct Sent {
     deletes: Vec<String>,
 }
 
+/// A latest-commit deploy in flight, with the names to report it by.
+#[derive(Clone)]
+pub(super) struct LatestSent {
+    project_id: String,
+    env_name: String,
+    service_name: String,
+    /// The branch the trigger was switched to, when one was picked with `d`.
+    switched_to: Option<String>,
+}
+
 impl App {
+    /// Whether any deploy (pending group or latest commit) is in flight.
+    pub(super) fn deploy_in_flight(&self) -> bool {
+        !self.deploys.is_empty() || !self.latest_deploys.is_empty()
+    }
+
+    /// `D` on a service or its deployments: ask before deploying its latest
+    /// commit, showing what is deployed now and where the new one goes.
+    pub(super) fn request_deploy_latest(&mut self, service_id: String) {
+        if let Some(target) = self.latest_target(&service_id) {
+            self.confirm = Some(Confirm::DeployLatest(Box::new(target)));
+        }
+    }
+
+    /// `d` on a service or its deployments: open the branch picker and load
+    /// the branches and the trigger that would be switched.
+    pub(super) fn open_branch_picker(&mut self, service_id: String, out: &mut Vec<Command>) {
+        let Some(target) = self.latest_target(&service_id) else {
+            return;
+        };
+        let Some(repo) = target.repo.clone() else {
+            self.message = Some(format!(
+                "cannot pick a branch: no GitHub repo is known for {}",
+                target.service_name
+            ));
+            return;
+        };
+        out.push(Command::LoadBranches {
+            project_id: target.project_id.clone(),
+            env_id: target.env_id.clone(),
+            service_id: target.service_id.clone(),
+            repo,
+        });
+        self.branch_picker = Some(BranchPicker {
+            target,
+            choices: None,
+            query: String::new(),
+            index: 0,
+        });
+    }
+
+    /// The service's triggers and branches arrived: fill the open picker.
+    pub(super) fn on_branches(
+        &mut self,
+        env_id: &str,
+        service_id: &str,
+        result: Result<(Vec<Trigger>, Vec<String>), String>,
+    ) {
+        let Some(picker) = self.branch_picker.as_mut() else {
+            return;
+        };
+        if picker.target.env_id != env_id || picker.target.service_id != service_id {
+            return;
+        }
+        let repo = picker.target.repo.as_deref().unwrap_or_default();
+        picker.choices = Some(result.and_then(|(triggers, mut names)| {
+            let trigger = triggers
+                .iter()
+                .find(|t| t.repository == repo)
+                .or(triggers.first())
+                .ok_or("the service has no GitHub deploy trigger in this environment")?;
+            names.sort();
+            Ok(BranchChoices {
+                trigger_id: trigger.id.clone(),
+                connected: trigger.branch.clone(),
+                names,
+            })
+        }));
+        picker.index = 0;
+    }
+
+    /// Enter in the picker: confirm deploying the highlighted branch.
+    pub(super) fn pick_branch(&mut self) {
+        let Some(picker) = self.branch_picker.as_ref() else {
+            return;
+        };
+        let Some(Ok(choices)) = &picker.choices else {
+            return;
+        };
+        let Some(name) = picker.filtered().get(picker.index).map(|n| n.to_string()) else {
+            return;
+        };
+        let switch = (name != choices.connected).then(|| BranchSwitch {
+            trigger_id: choices.trigger_id.clone(),
+            from: choices.connected.clone(),
+            to: name.clone(),
+        });
+        let service_id = picker.target.service_id.clone();
+        self.branch_picker = None;
+        // Checked again: a deploy may have started while the picker was open.
+        if let Some(target) = self.latest_target(&service_id) {
+            self.confirm = Some(Confirm::DeployLatest(Box::new(LatestConfirm {
+                branch: Some(name),
+                switch,
+                ..target
+            })));
+        }
+    }
+
+    /// The deploy of the service's connected branch as it stands, or `None`
+    /// (with a message) when it cannot be deployed now.
+    fn latest_target(&mut self, service_id: &str) -> Option<LatestConfirm> {
+        let (Some(project), Some(env)) = (self.project.clone(), self.environment.clone()) else {
+            self.message = Some("cannot deploy: no environment is open".into());
+            return None;
+        };
+        let Some(svc) = self.service(service_id) else {
+            self.message = Some("cannot deploy: the service is not loaded yet".into());
+            return None;
+        };
+        let key = (env.id.clone(), service_id.to_string());
+        if self.deploys.contains_key(&key) || self.latest_deploys.contains_key(&key) {
+            self.message = Some(format!("already deploying {}", svc.service_name));
+            return None;
+        }
+        let source = svc.latest.as_ref().or(svc.active.first());
+        let repo = source.and_then(|d| d.repo.clone());
+        if repo.is_none() && source.is_some_and(|d| d.image.is_some()) {
+            self.message = Some(format!(
+                "cannot deploy {}: it runs an image, not a repo",
+                svc.service_name
+            ));
+            return None;
+        }
+        let written = self
+            .pending
+            .service(&env.id, service_id)
+            .map_or(0, |sp| sp.vars.values().filter(|v| v.applied).count());
+        Some(LatestConfirm {
+            project_id: project.id,
+            env_id: env.id,
+            env_name: env.name,
+            service_id: service_id.to_string(),
+            service_name: svc.service_name.clone(),
+            repo,
+            branch: source.and_then(|d| d.branch.clone()),
+            current: svc.active.first().or(svc.latest.as_ref()).cloned(),
+            written,
+            switch: None,
+        })
+    }
+
+    /// `y` on the latest-commit confirm: send the deploy.
+    pub(super) fn start_deploy_latest(&mut self, c: LatestConfirm, out: &mut Vec<Command>) {
+        let key = (c.env_id, c.service_id);
+        if self.deploys.contains_key(&key) || self.latest_deploys.contains_key(&key) {
+            self.message = Some(format!("already deploying {}", c.service_name));
+            return;
+        }
+        self.message = Some(match &c.switch {
+            Some(sw) => format!(
+                "switching {} to {} and deploying to {}…",
+                c.service_name, sw.to, c.env_name
+            ),
+            None => format!(
+                "deploying the latest commit of {} to {}…",
+                c.service_name, c.env_name
+            ),
+        });
+        self.latest_deploys.insert(
+            key.clone(),
+            LatestSent {
+                project_id: c.project_id,
+                env_name: c.env_name,
+                service_name: c.service_name,
+                switched_to: c.switch.as_ref().map(|sw| sw.to.clone()),
+            },
+        );
+        out.push(Command::DeployLatest {
+            env_id: key.0,
+            service_id: key.1,
+            switch: c.switch,
+        });
+    }
+
+    pub(super) fn on_deploy_latest(
+        &mut self,
+        env_id: String,
+        service_id: String,
+        outcome: LatestOutcome,
+        now: Instant,
+        out: &mut Vec<Command>,
+    ) {
+        let key = (env_id, service_id);
+        let Some(sent) = self.latest_deploys.remove(&key) else {
+            return;
+        };
+        let name = &sent.service_name;
+        // Said first whenever the switch went through, so it is never missed.
+        let switched = sent
+            .switched_to
+            .as_ref()
+            .map_or(String::new(), |b| format!("switched {name} to {b}; "));
+        match outcome {
+            LatestOutcome::Started => {
+                // Written variables went out with this deploy.
+                if self.pending.service(&key.0, &key.1).is_some_and(|sp| {
+                    sp.vars.values().any(|v| v.applied) || sp.written_not_deployed
+                }) {
+                    self.finish_deploy(&key);
+                    out.push(Command::SavePending(self.pending.clone()));
+                }
+                self.message = Some(format!(
+                    "{switched}deploying the latest commit of {name} to {}: Railway accepted it",
+                    sent.env_name
+                ));
+                self.reload_after_deploy(&key, &sent.project_id, now, out);
+                if self.project_id() == Some(sent.project_id.as_str())
+                    && self.env_id() == Some(key.0.as_str())
+                    && self.view_service_id(Kind::Deployments) == Some(key.1.as_str())
+                {
+                    self.load_deployments(key.1.clone(), now, out);
+                }
+            }
+            LatestOutcome::Refused(error) => {
+                self.message = Some(format!("{switched}deploy of {name} failed: {error}"));
+            }
+            LatestOutcome::Unknown(_) => {
+                self.message = Some(format!(
+                    "{switched}deploy of {name} outcome unknown — check the deployments view"
+                ));
+            }
+            LatestOutcome::SwitchFailed { error, unknown } => {
+                let branch = sent.switched_to.as_deref().unwrap_or_default();
+                self.message = Some(if unknown {
+                    format!(
+                        "switching {name} to {branch}: outcome unknown — check its branch on Railway; nothing was deployed"
+                    )
+                } else {
+                    format!("could not switch {name} to {branch}: {error}; nothing was deployed")
+                });
+            }
+        }
+    }
+
     /// `D` on a group in the review: read the service's variables first, so
     /// the confirm can list what changed on Railway since the edits.
     pub(super) fn request_deploy(&mut self, env_id: String, service_id: String) -> Vec<Command> {
@@ -85,6 +336,7 @@ impl App {
             || self.filter_input.is_some()
             || self.command_line.is_some()
             || self.env_picker.is_some()
+            || self.branch_picker.is_some()
             || self.theme_picker.is_some()
             || self.help
             || self.kind() != Kind::Pending;
@@ -199,7 +451,7 @@ impl App {
                     "deployed {} to {}",
                     sent.service_name, sent.env_name
                 ));
-                self.reload_after_deploy(&key, &sent, now, out);
+                self.reload_after_deploy(&key, &sent.project_id, now, out);
             }
             DeployStep::Failed {
                 during: Phase::Redeploy,
@@ -323,13 +575,11 @@ impl App {
     fn reload_after_deploy(
         &mut self,
         key: &(String, String),
-        sent: &Sent,
+        project_id: &str,
         now: Instant,
         out: &mut Vec<Command>,
     ) {
-        if self.project_id() != Some(sent.project_id.as_str())
-            || self.env_id() != Some(key.0.as_str())
-        {
+        if self.project_id() != Some(project_id) || self.env_id() != Some(key.0.as_str()) {
             return;
         }
         if self.stack.iter().any(|v| matches!(v, View::Services)) {

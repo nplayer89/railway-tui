@@ -1,0 +1,19 @@
+query DeploymentTriggers(
+  $projectId: String!
+  $environmentId: String!
+  $serviceId: String!
+) {
+  deploymentTriggers(
+    projectId: $projectId
+    environmentId: $environmentId
+    serviceId: $serviceId
+  ) {
+    edges {
+      node {
+        id
+        branch
+        repository
+      }
+    }
+  }
+}

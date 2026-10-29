@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Confirm, Loaded, View};
+use crate::app::{App, BranchPicker, Confirm, LatestConfirm, Loaded, View};
 use crate::status::BoxColour;
 use crate::theme::{Theme, THEMES};
 
@@ -85,14 +85,23 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
     if let Some(Confirm::Deploy(d)) = &app.confirm {
         pending::draw_deploy_confirm(frame, body, app, d);
     }
+    if let Some(picker) = &app.branch_picker {
+        draw_branch_picker(frame, body, app, picker);
+    }
+    if let Some(Confirm::DeployLatest(c)) = &app.confirm {
+        draw_latest_confirm(frame, body, app, c);
+    }
 }
 
 fn hints(app: &App) -> &'static str {
     match app.stack.last() {
         Some(View::Services) => {
-            "<e> env  <l> logs  <i> inst  <v> vars  <p> pending  <r> reload  </> filter  <?> help"
+            "<e> env  <l> logs  <v> vars  <p> pending  <D> deploy  <d> branch  </> filter  <?> help"
         }
-        Some(View::Deployments { .. }) | Some(View::Instances { .. }) => {
+        Some(View::Deployments { .. }) => {
+            "<enter> logs  <D> deploy latest  <d> branch  <r> reload  <esc> back  <?> help"
+        }
+        Some(View::Instances { .. }) => {
             "<enter> logs  <r> reload  </> filter  <esc> back  <?> help"
         }
         Some(View::Variables(_)) => {
@@ -311,7 +320,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
-const HELP_LINES: [&str; 19] = [
+const HELP_LINES: [&str; 21] = [
     "j/k, arrows  move / scroll",
     "enter        open",
     "esc          back / clear filter",
@@ -320,6 +329,8 @@ const HELP_LINES: [&str; 19] = [
     "             also :vars :pending :theme :q",
     "e            environment picker (services)",
     "l            latest logs   i  instances",
+    "D            deploy latest commit (services, deploys)",
+    "d            pick a branch to deploy: type to filter, enter",
     "b            build/runtime logs",
     "f, G         follow logs",
     "r, ctrl-r    reload (in logs: reconnect)",
@@ -339,6 +350,153 @@ fn draw_help(frame: &mut Frame, area: Rect, t: &Theme) {
     frame.render_widget(Clear, rect);
     let lines: Vec<Line> = text.iter().map(|t| Line::from(*t)).collect();
     frame.render_widget(Paragraph::new(lines).block(popup(t, " Help ")), rect);
+}
+
+/// The latest-commit confirm: target, source, what is deployed now, and the prompt.
+fn draw_latest_confirm(frame: &mut Frame, area: Rect, app: &App, c: &LatestConfirm) {
+    let t = app.theme();
+    let bold = Modifier::BOLD;
+    let text = Style::new().fg(t.text);
+    let muted = Style::new().fg(t.muted);
+    let env_colour = if is_production(&c.env_name) {
+        t.bad
+    } else {
+        t.accent
+    };
+    let unknown = || "unknown".to_string();
+    let now = match &c.current {
+        Some(d) => {
+            let sha = d
+                .commit_sha
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map_or("-".into(), |s| s.chars().take(7).collect::<String>());
+            let msg = d.commit_message.as_deref().unwrap_or_default();
+            let msg = msg.lines().next().unwrap_or_default();
+            format!("{sha}  {}", clean(msg))
+        }
+        None => "nothing deployed yet".into(),
+    };
+    let next = match &c.branch {
+        Some(b) => format!("latest commit on {}", clean(b)),
+        None => "latest commit of the connected branch".into(),
+    };
+    let title = match &c.switch {
+        Some(sw) => format!(" Deploy branch {} to ", clean(&sw.to)),
+        None => " Deploy latest commit to ".into(),
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(title, text.add_modifier(bold)),
+            Span::styled(
+                clean(&c.env_name),
+                Style::new().fg(env_colour).add_modifier(bold),
+            ),
+        ]),
+        Line::styled(format!(" service: {}", clean(&c.service_name)), text),
+        Line::styled(
+            format!(
+                " repo:    {}",
+                c.repo.as_deref().map_or_else(unknown, clean)
+            ),
+            text,
+        ),
+    ];
+    match &c.switch {
+        Some(sw) => {
+            let warn = Style::new().fg(t.busy);
+            lines.push(Line::styled(
+                format!(" branch:  {} → {}", clean(&sw.from), clean(&sw.to)),
+                warn.add_modifier(bold),
+            ));
+            lines.push(Line::styled(
+                format!(
+                    "          the service stays on {} afterwards",
+                    clean(&sw.to)
+                ),
+                warn,
+            ));
+        }
+        None => lines.push(Line::styled(
+            format!(
+                " branch:  {}",
+                c.branch.as_deref().map_or_else(unknown, clean)
+            ),
+            text,
+        )),
+    }
+    lines.extend([
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(" now:     ", muted),
+            Span::styled(now, muted),
+        ]),
+        Line::from(vec![
+            Span::styled(" deploy:  ", text),
+            Span::styled(next, Style::new().fg(t.accent).add_modifier(bold)),
+        ]),
+    ]);
+    if c.written > 0 {
+        lines.push(Line::styled(
+            format!(
+                "   ! {} written variable change{} will ship with this deploy",
+                c.written,
+                if c.written == 1 { "" } else { "s" }
+            ),
+            Style::new().fg(t.busy),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        " Deploy? y to confirm, any other key cancels",
+        Style::new().fg(t.busy).add_modifier(bold),
+    ));
+    let height = lines.len() as u16 + 2;
+    let rect = centered(area, area.width.saturating_sub(4).min(80), height);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).block(popup(t, " Deploy ")), rect);
+}
+
+/// The branch picker: the query, then the matching branches (connected one
+/// first and marked), scrolled to keep the highlighted one in view.
+fn draw_branch_picker(frame: &mut Frame, area: Rect, app: &App, p: &BranchPicker) {
+    let t = app.theme();
+    let muted = Style::new().fg(t.muted);
+    let mut lines = vec![
+        Line::styled(format!(" > {}▏", clean(&p.query)), Style::new().fg(t.text)),
+        Line::raw(""),
+    ];
+    // Border, query line and blank line.
+    let room = (area.height as usize).saturating_sub(4).clamp(1, 15);
+    match &p.choices {
+        None => lines.push(Line::styled(" loading branches…", muted)),
+        Some(Err(e)) => lines.push(Line::styled(
+            format!(" cannot list branches: {}", clean(e)),
+            Style::new().fg(t.bad),
+        )),
+        Some(Ok(c)) => {
+            let names = p.filtered();
+            if names.is_empty() {
+                lines.push(Line::styled(" no branch matches", muted));
+            }
+            let skip = (p.index + 1).saturating_sub(room);
+            for (i, name) in names.iter().enumerate().skip(skip).take(room) {
+                let mut spans = vec![Span::raw(format!(" {}", clean(name)))];
+                if *name == c.connected {
+                    spans.push(Span::styled("  (connected)", muted));
+                }
+                let mut line = Line::from(spans);
+                if i == p.index {
+                    line = line.style(Style::new().bg(t.select_bg).add_modifier(Modifier::BOLD));
+                }
+                lines.push(line);
+            }
+        }
+    }
+    let title = format!(" Deploy branch: {} ", clean(&p.target.service_name));
+    let rect = centered(area, 60, lines.len() as u16 + 2);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).block(popup(t, &title)), rect);
 }
 
 fn draw_env_picker(frame: &mut Frame, area: Rect, app: &App, index: usize) {

@@ -112,6 +112,9 @@ pub struct DeploymentSummary {
     pub created_at: DateTime<Utc>,
     pub commit_sha: Option<String>,
     pub commit_message: Option<String>,
+    /// `owner/name` of the GitHub repo it was built from.
+    pub repo: Option<String>,
+    pub branch: Option<String>,
     pub image: Option<String>,
     pub instances: Vec<Instance>,
 }
@@ -123,6 +126,15 @@ pub struct ServiceInstance {
     pub num_replicas: u32,
     pub latest: Option<DeploymentSummary>,
     pub active: Vec<DeploymentSummary>,
+}
+
+/// The GitHub trigger that decides which branch a service deploys from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trigger {
+    pub id: String,
+    pub branch: String,
+    /// `owner/name`.
+    pub repository: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -25,7 +25,7 @@ impl App {
         self.message = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
-            if self.deploys.is_empty() || self.force_quit_armed {
+            if !self.deploy_in_flight() || self.force_quit_armed {
                 out.push(Command::Quit);
             } else {
                 self.force_quit_armed = true;
@@ -39,6 +39,8 @@ impl App {
             self.command_key(key, now, out);
         } else if self.filter_input.is_some() {
             self.filter_key(key);
+        } else if self.branch_picker.is_some() {
+            self.branch_picker_key(key);
         } else if self.env_picker.is_some() {
             self.picker_key(key.code, now, out);
         } else if self.theme_picker.is_some() {
@@ -68,7 +70,7 @@ impl App {
 
     /// `q` and `:q`: refused while a deploy is in flight (Ctrl-C twice forces it).
     fn quit(&mut self, out: &mut Vec<Command>) {
-        if self.deploys.is_empty() {
+        if !self.deploy_in_flight() {
             out.push(Command::Quit);
         } else {
             self.message = Some(DEPLOY_IN_PROGRESS.into());
@@ -256,9 +258,35 @@ impl App {
             },
             KeyCode::Char('p') => self.open_pending(out),
             KeyCode::Char('e') => self.open_env_picker(now, out),
+            KeyCode::Char('D') => match selected {
+                Some(id) => self.request_deploy_latest(id),
+                None => self.message = Some("no service selected".into()),
+            },
+            KeyCode::Char('d') => match selected {
+                Some(id) => self.open_branch_picker(id, out),
+                None => self.message = Some("no service selected".into()),
+            },
             _ => return false,
         }
         true
+    }
+
+    /// Typing filters the branches; arrows move, Enter picks, Esc closes.
+    fn branch_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.branch_picker.as_mut() else {
+            return;
+        };
+        let last = picker.filtered().len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc => self.branch_picker = None,
+            KeyCode::Enter => self.pick_branch(),
+            KeyCode::Down => picker.index = (picker.index + 1).min(last),
+            KeyCode::Up => picker.index = picker.index.saturating_sub(1),
+            _ => {
+                edit_text(&mut picker.query, key);
+                picker.index = 0;
+            }
+        }
     }
 
     fn open_env_picker(&mut self, now: Instant, out: &mut Vec<Command>) {
@@ -279,6 +307,16 @@ impl App {
     }
 
     fn deployments_key(&mut self, code: KeyCode, out: &mut Vec<Command>) -> bool {
+        if let KeyCode::Char(c @ ('D' | 'd')) = code {
+            if let Some(id) = self.view_service_id(Kind::Deployments).map(String::from) {
+                if c == 'D' {
+                    self.request_deploy_latest(id);
+                } else {
+                    self.open_branch_picker(id, out);
+                }
+            }
+            return true;
+        }
         if code != KeyCode::Enter {
             return false;
         }
@@ -441,6 +479,7 @@ impl App {
                 out.push(Command::SavePending(self.pending.clone()));
             }
             Confirm::Deploy(d) => self.start_deploy(d, out),
+            Confirm::DeployLatest(c) => self.start_deploy_latest(*c, out),
         }
     }
 
