@@ -673,6 +673,10 @@ fn selected_rows_are_readable_in_every_theme() {
 }
 
 fn vars_app(env: &str, vars: &[(&str, &str)]) -> App {
+    vars_app_sealed(env, vars, &[])
+}
+
+fn vars_app_sealed(env: &str, vars: &[(&str, &str)], sealed: &[&str]) -> App {
     let mut app = services_app(vec![service(
         "api",
         deploy("d", DeploymentStatus::Success, &[InstanceStatus::Running]),
@@ -694,7 +698,7 @@ fn vars_app(env: &str, vars: &[(&str, &str)]) -> App {
             service_id: "svc-1".into(),
             revealed: Default::default(),
             reveal_all: false,
-            sealed: Default::default(),
+            sealed: sealed.iter().map(|s| s.to_string()).collect(),
             anchor: None,
         }),
     ];
@@ -743,6 +747,40 @@ fn values_hidden_until_revealed() {
     press(&mut app, 'r');
     let t = text(&render(&app, Instant::now()));
     assert!(t.contains("s3cret"), "{t}");
+}
+
+#[test]
+fn sealed_shows_opaque_even_when_revealed() {
+    let mut app = vars_app_sealed("staging", &[("TOKEN", "")], &["TOKEN", "GONE"]);
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("<Opaque>"), "{t}");
+    assert!(!t.contains("<Empty>") && !t.contains("••••••"), "{t}");
+    press(&mut app, 'R');
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("<Opaque>"), "{t}");
+    assert!(!t.contains("<Empty>"), "{t}");
+}
+
+#[test]
+fn empty_value_shows_empty_even_while_hidden() {
+    let app = vars_app("staging", &[("BLANK", ""), ("KEY", "s3cret")]);
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("<Empty>"), "{t}");
+    assert!(t.contains("••••••"), "{t}");
+}
+
+#[test]
+fn pending_set_to_empty_shows_empty() {
+    let mut app = vars_app("staging", &[("KEY", "s3cret")]);
+    add_pending(
+        &mut app,
+        "KEY",
+        crate::pending::Change::Set { value: "".into() },
+        Some("s3cret"),
+    );
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("<Empty>"), "{t}");
+    assert!(!t.contains("••••••"), "{t}");
 }
 
 #[test]

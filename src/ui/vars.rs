@@ -13,8 +13,15 @@ use crate::pending::Change;
 
 pub(super) const HIDDEN: &str = "••••••";
 
-/// The value as shown: dots while hidden, otherwise the first line, cleaned.
+pub(super) const OPAQUE: &str = "<Opaque>";
+pub(super) const EMPTY: &str = "<Empty>";
+
+/// The value as shown: `<Empty>` for an empty value, dots while hidden,
+/// otherwise the first line, cleaned.
 pub(super) fn shown(value: &str, revealed: bool) -> String {
+    if value.is_empty() {
+        return EMPTY.into();
+    }
     if !revealed {
         return HIDDEN.into();
     }
@@ -98,7 +105,11 @@ fn row(app: &App, view: &VarsView, r: &VarRow, selected: bool) -> Row<'static> {
             Style::new()
         }),
         Cell::from(clean(r.name)),
-        Cell::from(value.map_or(String::new(), |v| shown(v, revealed))),
+        Cell::from(if r.sealed {
+            OPAQUE.into()
+        } else {
+            value.map_or(String::new(), |v| shown(v, revealed))
+        }),
     ])
     .style(row_style(t, style, selected))
 }
