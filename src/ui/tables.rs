@@ -1,5 +1,7 @@
 //! Table views: projects, services, deployments and instances.
 
+use std::time::{Duration, Instant};
+
 use chrono::{DateTime, Utc};
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -9,7 +11,7 @@ use ratatui::Frame;
 
 use super::{box_style, clean};
 use crate::app::App;
-use crate::model::{DeploymentStatus, DeploymentSummary, InstanceStatus};
+use crate::model::{DeploymentStatus, DeploymentSummary, InstanceStatus, ServiceInstance};
 use crate::status::{box_colour, derive_row, Health, RowTag};
 use crate::theme::Theme;
 
@@ -80,6 +82,25 @@ pub(super) fn elapsed(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
 /// includes any time spent queued); `None` unless it is building now.
 pub(super) fn build_elapsed(d: &DeploymentSummary, now: DateTime<Utc>) -> Option<String> {
     (d.status == DeploymentStatus::Building).then(|| elapsed(d.created_at, now))
+}
+
+/// How long a scrolling name rests at each end, in steps.
+const MARQUEE_PAUSE: u64 = 6;
+/// How long each one-character scroll step lasts.
+const MARQUEE_STEP: Duration = Duration::from_millis(250);
+
+/// The `width`-character window of `text` to show `elapsed` into scrolling it:
+/// rest at the start, scroll one character per step to the end, rest, repeat.
+pub(super) fn marquee(text: &str, width: usize, elapsed: Duration) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let overflow = chars.len().saturating_sub(width) as u64;
+    if overflow == 0 {
+        return text.into();
+    }
+    let cycle = overflow + 2 * MARQUEE_PAUSE;
+    let step = (elapsed.as_millis() / MARQUEE_STEP.as_millis()) as u64 % cycle;
+    let offset = step.saturating_sub(MARQUEE_PAUSE).min(overflow) as usize;
+    chars[offset..offset + width].iter().collect()
 }
 
 fn short_sha(d: &DeploymentSummary) -> String {
@@ -176,7 +197,10 @@ fn service_empty_text(app: &App, none: &'static str) -> &'static str {
     }
 }
 
-pub fn services(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
+/// Width of the SERVICE column; a longer selected name scrolls within it.
+const SERVICE_WIDTH: u16 = 30;
+
+pub fn services(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>, tick: Instant) {
     let t = app.theme();
     let mut rows = Vec::new();
     let mut box_width = "INSTANCES".len() as u16;
@@ -204,7 +228,7 @@ pub fn services(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
         }
         rows.push(
             Row::new([
-                Cell::from(clean(&svc.service_name)),
+                Cell::from(service_name(app, svc, tick)),
                 Cell::from(Line::from(boxes)),
                 Cell::from(format!("{}/{}", row.ready, row.desired)).style(fg(t.muted)),
                 Cell::from(Line::from(status)),
@@ -234,7 +258,7 @@ pub fn services(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
         ),
         rows,
         vec![
-            Constraint::Length(24),
+            Constraint::Length(SERVICE_WIDTH),
             Constraint::Length(box_width),
             Constraint::Length(6),
             Constraint::Length(26),
@@ -245,6 +269,19 @@ pub fn services(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
         selected,
         Span::styled(empty, fg(t.muted)),
     );
+}
+
+/// The service's name, scrolled if it is the focused row and too long to fit.
+fn service_name(app: &App, svc: &ServiceInstance, tick: Instant) -> String {
+    let name = clean(&svc.service_name);
+    match &app.service_focus {
+        Some((id, since)) if *id == svc.service_id => marquee(
+            &name,
+            SERVICE_WIDTH as usize,
+            tick.saturating_duration_since(*since),
+        ),
+        _ => name,
+    }
 }
 
 pub fn deployments(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {

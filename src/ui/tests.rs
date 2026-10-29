@@ -1188,3 +1188,59 @@ fn logs_show_build_elapsed_while_building() {
     )]);
     assert!(!text(&render(&app, Instant::now())).contains("BUILDING"));
 }
+
+#[test]
+fn marquee_rests_scrolls_and_rests() {
+    let m = |ms| super::tables::marquee("abcdefgh", 5, Duration::from_millis(ms));
+    assert_eq!(
+        super::tables::marquee("abc", 5, Duration::from_secs(9)),
+        "abc"
+    );
+    assert_eq!(m(0), "abcde");
+    assert_eq!(m(1_499), "abcde");
+    assert_eq!(m(1_750), "bcdef");
+    assert_eq!(m(2_250), "defgh");
+    assert_eq!(m(3_500), "defgh");
+    // 3 scroll steps + 2 × 6 pause steps, then it starts over.
+    assert_eq!(m(3_750), "abcde");
+}
+
+#[test]
+fn focused_long_service_name_scrolls() {
+    let long = "a-very-long-service-name-that-overflows";
+    let mut app = services_app(vec![
+        service(long, deploy("d", DeploymentStatus::Success, &[]), vec![]),
+        service(
+            "zz-other-long-service-name-that-overflows",
+            deploy("e", DeploymentStatus::Success, &[]),
+            vec![],
+        ),
+    ]);
+    let since = Instant::now();
+    app.service_focus = Some((format!("{long}-id"), since));
+    let rows = |at| {
+        let buf = render_sized(&app, at, 120, 30);
+        (0..30).map(|y| row_text(&buf, y)).collect::<Vec<_>>()
+    };
+    let start = rows(since);
+    assert!(
+        start
+            .iter()
+            .any(|r| r.starts_with("a-very-long-service-name-that- ")),
+        "{start:?}"
+    );
+    let later = rows(since + Duration::from_millis(1_500 + 250 * 3));
+    assert!(
+        later
+            .iter()
+            .any(|r| r.starts_with("ery-long-service-name-that-ove")),
+        "{later:?}"
+    );
+    // Unfocused rows stay put.
+    assert!(
+        later
+            .iter()
+            .any(|r| r.starts_with("zz-other-long-service-name-tha")),
+        "{later:?}"
+    );
+}

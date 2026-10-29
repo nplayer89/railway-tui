@@ -58,7 +58,7 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
     draw_header(frame, head, app, now);
     let wall = Utc::now();
     match app.stack.last() {
-        Some(View::Services) => tables::services(frame, body, app, wall),
+        Some(View::Services) => tables::services(frame, body, app, wall, now),
         Some(View::Deployments { .. }) => tables::deployments(frame, body, app, wall),
         Some(View::Instances { .. }) => tables::instances(frame, body, app),
         Some(View::Logs(l)) => {

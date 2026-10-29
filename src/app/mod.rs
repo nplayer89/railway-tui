@@ -330,6 +330,9 @@ pub struct App {
     /// Edits not deployed yet, for every service.
     pub pending: Pending,
     pub selection: Selection,
+    /// The service under the cursor in the Services view and when it got there,
+    /// so a long name scrolls from its start.
+    pub service_focus: Option<(String, Instant)>,
     /// The variable name or value being typed in the Variables view.
     pub var_input: Option<VarInput>,
     /// The question being asked, answered with `y` or any other key.
@@ -390,6 +393,7 @@ impl App {
             variables: Loaded::default(),
             pending,
             selection: Selection::default(),
+            service_focus: None,
             var_input: None,
             confirm: None,
             deploys: BTreeMap::new(),
@@ -423,7 +427,20 @@ impl App {
         if self.deploys.is_empty() {
             self.force_quit_armed = false;
         }
+        self.track_service_focus(now);
         out
+    }
+
+    fn track_service_focus(&mut self, now: Instant) {
+        let focused = match self.kind() {
+            Kind::Services => self.selected_service().map(|s| s.service_id.clone()),
+            _ => None,
+        };
+        match focused {
+            Some(id) if self.service_focus.as_ref().is_some_and(|(f, _)| *f == id) => {}
+            Some(id) => self.service_focus = Some((id, now)),
+            None => self.service_focus = None,
+        }
     }
 
     // ---- rows for the table views (filtered by `table_filter`) ----
@@ -1664,6 +1681,19 @@ mod tests {
             ),
             service("svc-b", deploy("d3", DeploymentStatus::Success), vec![]),
         ]
+    }
+
+    #[test]
+    fn service_focus_restarts_when_the_cursor_moves_and_clears_off_services() {
+        let t0 = Instant::now();
+        let mut app = app_in_services(t0);
+        let t1 = t0 + Duration::from_secs(5);
+        app.update(key('j'), t1);
+        assert_eq!(app.service_focus, Some(("svc-b".into(), t1)));
+        app.update(AppEvent::Tick(t1), t1 + Duration::from_secs(3));
+        assert_eq!(app.service_focus, Some(("svc-b".into(), t1)));
+        app.update(code(KeyCode::Esc), t1);
+        assert_eq!(app.service_focus, None);
     }
 
     fn workspaces() -> Vec<Workspace> {
