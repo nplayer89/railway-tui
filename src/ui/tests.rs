@@ -673,6 +673,10 @@ fn selected_rows_are_readable_in_every_theme() {
 }
 
 fn vars_app(env: &str, vars: &[(&str, &str)]) -> App {
+    vars_app_sealed(env, vars, &[])
+}
+
+fn vars_app_sealed(env: &str, vars: &[(&str, &str)], sealed: &[&str]) -> App {
     let mut app = services_app(vec![service(
         "api",
         deploy("d", DeploymentStatus::Success, &[InstanceStatus::Running]),
@@ -694,6 +698,8 @@ fn vars_app(env: &str, vars: &[(&str, &str)]) -> App {
             service_id: "svc-1".into(),
             revealed: Default::default(),
             reveal_all: false,
+            sealed: sealed.iter().map(|s| s.to_string()).collect(),
+            anchor: None,
         }),
     ];
     app.variables.value = Some(
@@ -726,6 +732,7 @@ fn add_pending(app: &mut App, name: &str, change: crate::pending::Change, base: 
         crate::pending::PendingVar {
             change,
             base: base.map(Into::into),
+            base_sealed: false,
             applied: false,
         },
     );
@@ -741,6 +748,40 @@ fn values_hidden_until_revealed() {
     press(&mut app, 'r');
     let t = text(&render(&app, Instant::now()));
     assert!(t.contains("s3cret"), "{t}");
+}
+
+#[test]
+fn sealed_shows_opaque_even_when_revealed() {
+    let mut app = vars_app_sealed("staging", &[("TOKEN", "")], &["TOKEN", "GONE"]);
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("<Opaque>"), "{t}");
+    assert!(!t.contains("<Empty>") && !t.contains("••••••"), "{t}");
+    press(&mut app, 'R');
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("<Opaque>"), "{t}");
+    assert!(!t.contains("<Empty>"), "{t}");
+}
+
+#[test]
+fn empty_value_shows_empty_even_while_hidden() {
+    let app = vars_app("staging", &[("BLANK", ""), ("KEY", "s3cret")]);
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("<Empty>"), "{t}");
+    assert!(t.contains("••••••"), "{t}");
+}
+
+#[test]
+fn pending_set_to_empty_shows_empty() {
+    let mut app = vars_app("staging", &[("KEY", "s3cret")]);
+    add_pending(
+        &mut app,
+        "KEY",
+        crate::pending::Change::Set { value: "".into() },
+        Some("s3cret"),
+    );
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("<Empty>"), "{t}");
+    assert!(!t.contains("••••••"), "{t}");
 }
 
 #[test]
@@ -956,6 +997,41 @@ fn review_values_hidden_until_revealed() {
     let t = text(&render(&app, Instant::now()));
     assert!(t.contains("before → after"), "{t}");
     assert!(t.contains("newsecret") && t.contains("oldsecret"), "{t}");
+}
+
+#[test]
+fn variables_hint_fits_80_columns_and_keeps_help() {
+    let app = vars_app("staging", &[]);
+    let hint = super::hints(&app);
+    assert!(hint.chars().count() <= 80, "{hint}");
+    assert!(hint.ends_with("<?> help"), "{hint}");
+}
+
+#[test]
+fn review_shows_an_unread_sealed_base_as_opaque() {
+    let mut app = review_app();
+    add_pending(&mut app, "SEALED", crate::pending::Change::Delete, Some(""));
+    std::sync::Arc::make_mut(&mut app.pending)
+        .envs
+        .get_mut("e1")
+        .unwrap()
+        .get_mut("svc-1")
+        .unwrap()
+        .vars
+        .get_mut("SEALED")
+        .unwrap()
+        .base_sealed = true;
+    for reveal in [false, true] {
+        if reveal {
+            press(&mut app, 'r');
+        }
+        let t = text(&render(&app, Instant::now()));
+        let line = t.lines().find(|l| l.contains("- SEALED")).expect(&t);
+        assert!(
+            line.contains("<Opaque>") && !line.contains("<Empty>"),
+            "{t}"
+        );
+    }
 }
 
 #[test]
@@ -1380,4 +1456,45 @@ fn unlisted_branches_explain_why_wrapped_and_ask_for_a_name() {
     ] {
         assert!(screen.contains(want), "missing {want:?} in\n{screen}");
     }
+}
+
+#[test]
+fn visual_mode_shows_title_marker() {
+    let mut app = vars_app("staging", &[("A", "1"), ("B", "2")]);
+    let t = text(&render(&app, Instant::now()));
+    assert!(!t.contains("-- VISUAL --"), "{t}");
+    press(&mut app, 'v');
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("-- VISUAL --"), "{t}");
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    app.update(
+        crate::app::AppEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        Instant::now(),
+    );
+    let t = text(&render(&app, Instant::now()));
+    assert!(!t.contains("-- VISUAL --"), "{t}");
+    assert!(t.contains("api · variables"), "{t}");
+}
+
+#[test]
+fn visual_range_rows_are_highlighted_without_bold() {
+    let mut app = vars_app("staging", &[("AAA", "1"), ("BBB", "2"), ("CCC", "3")]);
+    app.selection.variable = Some("AAA".into());
+    press(&mut app, 'v');
+    press(&mut app, 'j');
+    let buf = render(&app, Instant::now());
+    let cell = |name: &str| {
+        let y = (0..buf.area.height)
+            .find(|&y| row_text(&buf, y).contains(name))
+            .unwrap();
+        let x = row_text(&buf, y).find(name).unwrap() as u16;
+        buf[(x, y)].clone()
+    };
+    let t = app.theme();
+    let (anchor, cursor, outside) = (cell("AAA"), cell("BBB"), cell("CCC"));
+    assert_eq!(anchor.bg, t.select_bg);
+    assert!(!anchor.modifier.contains(ratatui::style::Modifier::BOLD));
+    assert_eq!(cursor.bg, t.select_bg);
+    assert!(cursor.modifier.contains(ratatui::style::Modifier::BOLD));
+    assert_ne!(outside.bg, t.select_bg);
 }

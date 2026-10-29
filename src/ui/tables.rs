@@ -33,6 +33,11 @@ pub(super) fn row_style(t: &Theme, fg: Style, selected: bool) -> Style {
     }
 }
 
+/// A row inside a visual range, other than the cursor row: highlighted, not bold.
+pub(super) fn range_style(t: &Theme, fg: Style) -> Style {
+    fg.bg(t.select_bg)
+}
+
 fn health_colour(t: &Theme, h: Health) -> Color {
     match h {
         Health::Healthy => t.ok,

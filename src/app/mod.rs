@@ -5,6 +5,7 @@ mod keys;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -62,6 +63,10 @@ pub struct VarsView {
     /// Names whose value is shown.
     pub revealed: BTreeSet<String>,
     pub reveal_all: bool,
+    /// Names Railway reports as sealed (their values are never readable).
+    pub sealed: BTreeSet<String>,
+    /// Where a visual selection started.
+    pub anchor: Option<String>,
 }
 
 /// The review of every pending change in the open project.
@@ -306,6 +311,8 @@ pub enum DataEvent {
         service_id: String,
         purpose: VarsPurpose,
         result: Result<Secret<Variables>, String>,
+        /// Sealed names or why they are unknown; `Some` only for `VarsPurpose::View`.
+        sealed: Option<Result<BTreeSet<String>, String>>,
     },
     Deploy {
         env_id: String,
@@ -401,6 +408,10 @@ pub enum Command {
     EditExternal {
         name: String,
         initial: Secret<String>,
+    },
+    /// Handled by the main loop, not the worker: put `text` on the clipboard via OSC 52.
+    Copy {
+        text: Secret<String>,
     },
     /// Replaces the previous watch set; empty means stop.
     WatchDeployments {
@@ -701,20 +712,40 @@ impl App {
             .collect()
     }
 
+    /// Sealed names of the open Variables view.
+    fn sealed_names(&self) -> &BTreeSet<String> {
+        static NONE: BTreeSet<String> = BTreeSet::new();
+        match self.stack.last() {
+            Some(View::Variables(v)) => &v.sealed,
+            _ => &NONE,
+        }
+    }
+
     /// Railway's variables for the open service merged with its pending edits,
     /// by name, narrowed by the name filter (never the values).
     pub fn variable_rows(&self) -> Vec<VarRow<'_>> {
         let Some(service_id) = self.view_service_id(Kind::Variables) else {
             return Vec::new();
         };
+        let sealed = self.sealed_names();
         let mut rows: BTreeMap<&str, VarRow> = BTreeMap::new();
         for (name, value) in self.variables.value.iter().flatten() {
             let row = VarRow {
                 name,
                 current: Some(value),
                 pending: None,
+                sealed: sealed.contains(name),
             };
             rows.insert(name, row);
+        }
+        // Railway may leave sealed variables out of the map altogether.
+        for name in sealed {
+            rows.entry(name).or_insert(VarRow {
+                name,
+                current: None,
+                pending: None,
+                sealed: true,
+            });
         }
         let pending = self
             .env_id()
@@ -725,12 +756,27 @@ impl App {
                     name,
                     current: None,
                     pending: None,
+                    sealed: false,
                 })
                 .pending = Some(change);
         }
         rows.into_values()
             .filter(|r| self.passes_filter(&[r.name]))
             .collect()
+    }
+
+    /// Indices into `variable_rows()` from the visual anchor to the cursor, either way
+    /// round. None outside Variables, with no anchor, or when the anchor's row is gone
+    /// (or hidden by the filter).
+    pub fn visual_range(&self) -> Option<RangeInclusive<usize>> {
+        let Some(View::Variables(v)) = self.stack.last() else {
+            return None;
+        };
+        let anchor = v.anchor.as_deref()?;
+        let rows = self.variable_rows();
+        let start = rows.iter().position(|r| r.name == anchor)?;
+        let cursor = position(&rows, self.selection.variable.as_deref(), |r| r.name);
+        Some(start.min(cursor)..=start.max(cursor))
     }
 
     /// Pending changes of the open project: the current environment first, then the
@@ -863,6 +909,7 @@ impl App {
                 service_id,
                 purpose,
                 result,
+                sealed,
             } => match (purpose, result.map(Secret::into_inner)) {
                 (VarsPurpose::View, result) => {
                     if self.env_id() != Some(env_id.as_str())
@@ -871,6 +918,17 @@ impl App {
                         return;
                     }
                     self.variables.finish(result, now);
+                    match sealed {
+                        Some(Ok(names)) => {
+                            if let Some(View::Variables(v)) = self.stack.last_mut() {
+                                v.sealed = names;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            self.message = Some(format!("sealed status unknown: {e}"));
+                        }
+                        None => {}
+                    }
                 }
                 (VarsPurpose::Deploy, result) => self.on_deploy_check(env_id, service_id, result),
                 (VarsPurpose::Reconcile, result) => {
@@ -1200,6 +1258,8 @@ impl App {
                 service_id: service_id.clone(),
                 revealed: BTreeSet::new(),
                 reveal_all: false,
+                sealed: BTreeSet::new(),
+                anchor: None,
             }),
             out,
         );
@@ -1337,13 +1397,15 @@ impl App {
     }
 
     /// Only the top view subscribes: leaving Services stops its watch, leaving Logs closes the stream.
+    /// Leaving Variables (or covering it with another view) ends a visual selection.
     fn leave_top(&mut self, out: &mut Vec<Command>) {
         self.table_filter = None;
-        match self.stack.last() {
+        match self.stack.last_mut() {
             Some(View::Services) => out.push(Command::WatchDeployments { ids: Vec::new() }),
             Some(View::Logs(logs)) => out.push(Command::CloseLogs {
                 session: logs.session,
             }),
+            Some(View::Variables(v)) => v.anchor = None,
             _ => {}
         }
     }
@@ -1566,6 +1628,8 @@ pub struct VarRow<'a> {
     /// The value on Railway, if the variable exists there.
     pub current: Option<&'a str>,
     pub pending: Option<&'a PendingVar>,
+    /// Railway holds the value but never reveals it.
+    pub sealed: bool,
 }
 
 /// Values must never reach a log or panic message, so `Variables` is left out.

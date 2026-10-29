@@ -75,6 +75,8 @@ On launch it reopens the last-used project and environment.
 
 From Services press `v` (or `:vars`) to open the selected service's variables in the current
 environment. Values are hidden until revealed and are hidden again when you leave the view.
+Each open or reload costs at least two API requests (the values, then which are sealed, one more
+per 100 variables in the environment), so it uses the hourly request budget faster than other views.
 
 | key | action |
 | --- | --- |
@@ -85,7 +87,23 @@ environment. Values are hidden until revealed and are hidden again when you leav
 | `d` | mark the selected variable for deletion (toggle) |
 | `u` | undo the pending change to the selected variable |
 | `r` / `R` | reveal the selected value / all values |
+| `y` | copy the selected value to the clipboard (OSC 52) |
+| `Y` | copy the selected variable as a `NAME=VALUE` line |
+| `v` | start (or end) a visual selection of rows; move with `j` / `k` |
 | `p` | open the review |
+
+While a visual selection is active (the title shows `-- VISUAL --`):
+
+| key | action |
+| --- | --- |
+| `y` / `Y` | copy the selected values / `NAME=VALUE` lines, in table order (sealed rows are skipped) |
+| `d` | mark every selected variable for deletion (never unmarks) |
+| `r` | reveal every selected value, or hide them all if all are already revealed |
+| `v` / `esc` | end the selection (`esc` does not leave the view) |
+| `p` / `R` | still work: `p` opens the review and ends the selection, `R` toggles reveal-all |
+
+`a`, `e`, `E`, `enter` and `u` do nothing while a selection is active. Opening the filter (`/`) ends
+it. Sealed variables show `<Opaque>` and are never copied; empty ones show `<Empty>`.
 
 Edits are not sent to Railway immediately. They are kept as pending changes and shown in the view.
 
@@ -115,7 +133,8 @@ Do the first run on a non-production environment. Things not yet confirmed again
 
 - Does deleting a variable trigger a deploy by itself? (`variableDelete` has no `skipDeploys`; the
   worst case is an extra deploy that already carries the new values.)
-- How do "sealed" variables (which cannot be read back) and `RAILWAY_*` variables appear in the view?
+- Sealed variables (which cannot be read back) are now fetched via `isSealed` and shown as
+  `<Opaque>`; confirm that matches Railway. How do `RAILWAY_*` variables appear in the view?
 - What is Railway's exact "not found" wording when deleting a variable that is already gone?
 - Does `$EDITOR` (`E`) receive every keystroke cleanly, with no characters lost to the TUI?
 

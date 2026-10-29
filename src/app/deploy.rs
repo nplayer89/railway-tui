@@ -14,7 +14,7 @@ use super::{
     View,
 };
 use crate::model::{Variables, WriteFailure};
-use crate::pending::Change;
+use crate::pending::{Change, PendingVar};
 
 /// A deploy in flight: exactly what was sent, and the names to report it by.
 #[derive(Clone)]
@@ -363,7 +363,7 @@ impl App {
         let drift = sp
             .vars
             .iter()
-            .filter(|(_, v)| !v.applied)
+            .filter(|(_, v)| !v.applied && !v.base_sealed)
             .filter(|(name, v)| match &v.base {
                 Some(base) => current.get(*name) != Some(base),
                 None => current.contains_key(*name),
@@ -435,10 +435,10 @@ impl App {
         };
         match step {
             DeployStep::Upserted => {
-                self.mark_applied(&key, |name, change| {
+                self.mark_applied(&key, |name, var| {
                     sent.upserts
                         .get(name)
-                        .is_some_and(|v| *change == Change::Set { value: v.clone() })
+                        .is_some_and(|v| var.change == Change::Set { value: v.clone() })
                 });
                 out.push(self.save_pending());
                 self.message = Some(format!(
@@ -447,8 +447,10 @@ impl App {
                 ));
             }
             DeployStep::Deleted(deleted) => {
-                self.mark_applied(&key, |name, change| {
-                    name == deleted && sent.deletes.contains(&deleted) && *change == Change::Delete
+                self.mark_applied(&key, |name, var| {
+                    name == deleted
+                        && sent.deletes.contains(&deleted)
+                        && var.change == Change::Delete
                 });
                 out.push(self.save_pending());
                 self.message = Some(format!(
@@ -521,9 +523,11 @@ impl App {
                 return;
             }
         };
-        self.mark_applied(&key, |name, change| match change {
+        self.mark_applied(&key, |name, var| match &var.change {
             Change::Set { value } => current.get(name) == Some(value),
-            Change::Delete => !current.contains_key(name),
+            // A sealed variable the map omits is absent before and after its
+            // delete: absence proves nothing, so it stays unapplied for `D`.
+            Change::Delete => !var.base_sealed && !current.contains_key(name),
         });
         out.push(self.save_pending());
         if let Some(sp) = self.pending.service(&key.env_id, &key.service_id) {
@@ -536,9 +540,9 @@ impl App {
         }
     }
 
-    /// Marks unapplied entries for which `matches(name, change)` holds; once
+    /// Marks unapplied entries for which `matches(name, var)` holds; once
     /// every entry is applied the group is written but not deployed.
-    fn mark_applied(&mut self, key: &GroupKey, matches: impl Fn(&str, &Change) -> bool) {
+    fn mark_applied(&mut self, key: &GroupKey, matches: impl Fn(&str, &PendingVar) -> bool) {
         let Some(sp) = self
             .pending_mut()
             .envs
@@ -548,7 +552,7 @@ impl App {
             return;
         };
         for (name, var) in sp.vars.iter_mut().filter(|(_, v)| !v.applied) {
-            if matches(name, &var.change) {
+            if matches(name, var) {
                 var.applied = true;
             }
         }
