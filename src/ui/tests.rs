@@ -1570,7 +1570,7 @@ fn message_wins_over_filter_on_the_last_line() {
 fn narrow_statusline_drops_pieces_and_keeps_the_mode() {
     let app = vars_app("staging", &[("A", "1")]);
     let row = status_row(&render_sized(&app, Instant::now(), 40, 20));
-    assert!(row.contains("NORMAL") && !row.contains("proj"), "{row}");
+    assert!(row.contains("NORMAL") && !row.contains('\u{f07b}'), "{row}");
     let row = status_row(&render_sized(&app, Instant::now(), 24, 20));
     assert!(row.contains("NORMAL") && row.contains('…'), "{row}");
     for w in 0..12 {
@@ -1586,7 +1586,7 @@ fn statusline_drops_count_then_project_then_env_then_position() {
     let row = |w| status_row(&render_sized(&app, Instant::now(), w, 20));
     let full = row(120);
     assert!(
-        full.contains("2 selected") && full.contains("proj"),
+        full.contains("2 selected") && full.contains('\u{f07b}'),
         "{full}"
     );
     // Find the widest width at which each piece is still absent or present.
@@ -1595,13 +1595,13 @@ fn statusline_drops_count_then_project_then_env_then_position() {
         .find(|&w| !row(w).contains("selected"))
         .unwrap();
     let r = row(w_no_count);
-    assert!(r.contains("proj") && r.contains("staging"), "{r}");
+    assert!(r.contains('\u{f07b}') && r.contains("staging"), "{r}");
     let w_no_env = (1..120)
         .rev()
         .find(|&w| !row(w).contains("staging"))
         .unwrap();
     let r = row(w_no_env);
-    assert!(!r.contains("proj") && r.contains("2/2"), "{r}");
+    assert!(!r.contains('\u{f07b}') && r.contains("2/2"), "{r}");
 }
 
 #[test]

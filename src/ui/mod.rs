@@ -150,18 +150,7 @@ fn freshness_source(app: &App) -> Option<Freshness<'_>> {
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
     let t = app.theme();
-    let workspace = app
-        .workspace_id
-        .as_deref()
-        .and_then(|id| {
-            app.workspaces
-                .value
-                .iter()
-                .flatten()
-                .find(|w| w.id == id)
-                .map(|w| w.name.as_str())
-        })
-        .unwrap_or("-");
+    let workspace = app.workspace_name().unwrap_or("-");
     let project = app.project.as_ref().map_or("-", |p| p.name.as_str());
     let env = app.environment.as_ref().map_or("-", |e| e.name.as_str());
     let dim = Style::new().fg(t.muted);
