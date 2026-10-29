@@ -146,7 +146,7 @@ fn services_row_shows_coloured_boxes() {
         &[InstanceStatus::Running, InstanceStatus::Crashed],
     );
     let app = services_app(vec![service("api", d.clone(), vec![d])]);
-    let buf = render(&app, Instant::now());
+    let buf = render_sized(&app, Instant::now(), 120, 30);
     let cells = find(&buf, "■");
     assert_eq!(cells.len(), 2, "{}", text(&buf));
     assert_eq!(buf[cells[0]].fg, T.ok);
@@ -1127,4 +1127,64 @@ fn help_overlay_shows_every_line_in_full() {
             "help line truncated: {line:?}"
         );
     }
+}
+
+#[test]
+fn elapsed_is_compact() {
+    let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let at = |s| super::tables::elapsed(t0, t0 + chrono::Duration::seconds(s));
+    assert_eq!(at(-3), "0s");
+    assert_eq!(at(42), "42s");
+    assert_eq!(at(187), "3m07s");
+    assert_eq!(at(3840), "1h04m");
+}
+
+fn building_since(id: &str, secs: i64) -> DeploymentSummary {
+    DeploymentSummary {
+        created_at: Utc::now() - chrono::Duration::seconds(secs),
+        ..deploy(id, DeploymentStatus::Building, &[])
+    }
+}
+
+#[test]
+fn building_shows_elapsed_in_services_and_deployments() {
+    let app = services_app(vec![
+        service("api", building_since("b", 125), vec![]),
+        service("web", deploy("s", DeploymentStatus::Success, &[]), vec![]),
+    ]);
+    let buf = render(&app, Instant::now());
+    let rows: Vec<String> = (0..30).map(|y| row_text(&buf, y)).collect();
+    let api = rows.iter().find(|r| r.contains("api")).unwrap();
+    assert!(api.contains("BUILDING 2m0"), "{api}");
+    let web = rows.iter().find(|r| r.contains("web")).unwrap();
+    assert!(!web.contains("m0"), "{web}");
+
+    let mut app = app;
+    app.stack.push(View::Deployments {
+        service_id: "api-id".into(),
+    });
+    app.deployments.value = Some(vec![building_since("b", 125)]);
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("BUILDING 2m0"), "{t}");
+}
+
+#[test]
+fn logs_show_build_elapsed_while_building() {
+    let mut app = logs_app(vec![], StreamState::Live);
+    app.services.value = Some(vec![service("api", building_since("dep-1", 30), vec![])]);
+    let buf = render(&app, Instant::now());
+    let (y, row) = (0..30)
+        .map(|y| (y, row_text(&buf, y)))
+        .find(|(_, r)| r.contains("● LIVE"))
+        .unwrap();
+    let byte = row.find("BUILDING 3").unwrap_or_else(|| panic!("{row}"));
+    let x = row[..byte].chars().count() as u16;
+    assert_eq!(buf[(x, y)].fg, T.busy);
+
+    app.services.value = Some(vec![service(
+        "api",
+        deploy("dep-1", DeploymentStatus::Deploying, &[]),
+        vec![],
+    )]);
+    assert!(!text(&render(&app, Instant::now())).contains("BUILDING"));
 }

@@ -61,7 +61,12 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
         Some(View::Services) => tables::services(frame, body, app, wall),
         Some(View::Deployments { .. }) => tables::deployments(frame, body, app, wall),
         Some(View::Instances { .. }) => tables::instances(frame, body, app),
-        Some(View::Logs(l)) => logs::draw(frame, body, l, t),
+        Some(View::Logs(l)) => {
+            let building = app
+                .find_deployment(&l.deployment_id)
+                .and_then(|d| tables::build_elapsed(d, wall));
+            logs::draw(frame, body, l, building.as_deref(), t)
+        }
         Some(View::Pending(v)) => pending::draw(frame, body, app, v),
         Some(View::Variables(v)) => vars::draw(frame, body, app, v),
         Some(View::Projects) | None => tables::projects(frame, body, app),
@@ -85,17 +90,19 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
 fn hints(app: &App) -> &'static str {
     match app.stack.last() {
         Some(View::Services) => {
-            "<e> env  <l> logs  <i> inst  <v> vars  <p> pending  </> filter  <?> help"
+            "<e> env  <l> logs  <i> inst  <v> vars  <p> pending  <r> reload  </> filter  <?> help"
         }
         Some(View::Deployments { .. }) | Some(View::Instances { .. }) => {
-            "<enter> logs  </> filter  <esc> back  <?> help"
+            "<enter> logs  <r> reload  </> filter  <esc> back  <?> help"
         }
         Some(View::Variables(_)) => {
             "<e> edit  <a> add  <d> del  <u> undo  <r> reveal  <p> review  <?> help"
         }
         Some(View::Pending(_)) => "<D> deploy  <x> discard  <r> reveal  <esc> back  <?> help",
-        Some(View::Logs(_)) => "<b> build/runtime  <f> follow  </> filter  <esc> back  <?> help",
-        _ => "<enter> open  </> filter  <:> command  <t> theme  <?> help",
+        Some(View::Logs(_)) => {
+            "<b> build/runtime  <f> follow  <r> reload  </> filter  <esc> back  <?> help"
+        }
+        _ => "<enter> open  <r> reload  </> filter  <:> command  <t> theme  <?> help",
     }
 }
 

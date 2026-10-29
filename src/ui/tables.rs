@@ -66,6 +66,22 @@ fn relative(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
     }
 }
 
+/// Compact elapsed time such as `42s`, `3m07s`, `1h04m`.
+pub(super) fn elapsed(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let secs = (now - then).num_seconds().max(0);
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m{:02}s", s / 60, s % 60),
+        s => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
+    }
+}
+
+/// How long a deployment has been building, measured from its creation (so it
+/// includes any time spent queued); `None` unless it is building now.
+pub(super) fn build_elapsed(d: &DeploymentSummary, now: DateTime<Utc>) -> Option<String> {
+    (d.status == DeploymentStatus::Building).then(|| elapsed(d.created_at, now))
+}
+
 fn short_sha(d: &DeploymentSummary) -> String {
     d.commit_sha
         .as_deref()
@@ -183,6 +199,9 @@ pub fn services(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
         }
         status.push(Span::styled(clean(&row.label), Style::new().fg(colour)));
         let latest = svc.latest.as_ref();
+        if let Some(e) = latest.and_then(|d| build_elapsed(d, now)) {
+            status.push(Span::styled(format!(" {e}"), fg(t.muted)));
+        }
         rows.push(
             Row::new([
                 Cell::from(clean(&svc.service_name)),
@@ -215,7 +234,7 @@ pub fn services(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
         ),
         rows,
         vec![
-            Constraint::Length(20),
+            Constraint::Length(24),
             Constraint::Length(box_width),
             Constraint::Length(6),
             Constraint::Length(26),
@@ -242,10 +261,16 @@ pub fn deployments(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>)
                 Some(RowTag::Active) => "ACTIVE",
                 None => "",
             };
+            let mut status = vec![Span::styled(
+                clean(&d.status.label()),
+                Style::new().fg(deployment_colour(t, &d.status)),
+            )];
+            if let Some(e) = build_elapsed(d, now) {
+                status.push(Span::styled(format!(" {e}"), fg(t.muted)));
+            }
             Row::new([
                 Cell::from(tag).style(Style::new().fg(t.hint)),
-                Cell::from(clean(&d.status.label()))
-                    .style(Style::new().fg(deployment_colour(t, &d.status))),
+                Cell::from(Line::from(status)),
                 Cell::from(relative(d.created_at, now)).style(fg(t.muted)),
                 Cell::from(short_sha(d)).style(fg(t.muted)),
                 Cell::from(message(d)),
@@ -265,7 +290,7 @@ pub fn deployments(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>)
         rows,
         vec![
             Constraint::Length(8),
-            Constraint::Length(14),
+            Constraint::Length(18),
             Constraint::Length(10),
             Constraint::Length(8),
             Constraint::Fill(1),

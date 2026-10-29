@@ -12,7 +12,8 @@ use crate::logs::follow::StreamState;
 use crate::model::LogKind;
 use crate::theme::Theme;
 
-pub fn draw(frame: &mut Frame, area: Rect, logs: &LogsView, t: &Theme) {
+/// `building` is the elapsed build time while the deployment is building.
+pub fn draw(frame: &mut Frame, area: Rect, logs: &LogsView, building: Option<&str>, t: &Theme) {
     let [title, badges, body] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -60,10 +61,18 @@ pub fn draw(frame: &mut Frame, area: Rect, logs: &LogsView, t: &Theme) {
         ),
     };
     let follow = if logs.follow { "FOLLOW" } else { "PAUSED" };
-    frame.render_widget(
-        Paragraph::new(Line::from(format!("{stream}  {follow}"))).style(line_style),
-        badges,
-    );
+    let mut badge = vec![Span::raw(format!("{stream}  {follow}"))];
+    if let Some(e) = building {
+        badge.push(Span::raw("  "));
+        // On a banner background the line's own colours keep it readable.
+        let style = if line_style.bg.is_none() {
+            Style::new().fg(t.busy)
+        } else {
+            Style::new()
+        };
+        badge.push(Span::styled(format!("BUILDING {e}"), style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(badge)).style(line_style), badges);
 
     let lines = logs
         .buffer

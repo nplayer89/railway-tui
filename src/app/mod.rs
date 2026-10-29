@@ -450,6 +450,16 @@ impl App {
         rows
     }
 
+    /// A loaded deployment by id: a service's latest or active one, or the history.
+    pub fn find_deployment(&self, id: &str) -> Option<&DeploymentSummary> {
+        let services = self.services.value.iter().flatten();
+        let history = self.deployments.value.iter().flatten();
+        services
+            .flat_map(|s| s.latest.iter().chain(&s.active))
+            .chain(history)
+            .find(|d| d.id == id)
+    }
+
     /// The Deployments view: failed latest, then active, then history (see `deployment_rows`).
     pub fn deployment_table(&self) -> Vec<DeploymentRow> {
         let Some(service_id) = self.view_service_id(Kind::Deployments) else {
