@@ -74,8 +74,17 @@ pub struct PendingView {
 pub struct PendingGroup {
     pub env_id: String,
     pub service_id: String,
-    /// The environment is not in the loaded list, so nothing can be written to it.
-    pub orphaned: bool,
+    /// What no longer exists, so nothing can be written to it.
+    pub orphaned: Option<Orphan>,
+}
+
+/// Why a pending group can only be discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Orphan {
+    /// The environment is not in the loaded list.
+    Environment,
+    /// The environment is the current one and its loaded services lack this one.
+    Service,
 }
 
 impl PendingGroup {
@@ -527,6 +536,7 @@ impl App {
         };
         let current = self.env_id();
         let loaded = self.environments.value.as_deref();
+        let services = self.services.value.as_deref();
         let mut found: Vec<(bool, &str, &str, &str, &str)> = Vec::new();
         for (env_id, services) in &self.pending.envs {
             for (service_id, sp) in services {
@@ -544,10 +554,21 @@ impl App {
         found.sort();
         found
             .into_iter()
-            .map(|(_, _, _, env_id, service_id)| PendingGroup {
-                env_id: env_id.to_string(),
-                service_id: service_id.to_string(),
-                orphaned: loaded.is_some_and(|l| !l.iter().any(|e| e.id == env_id)),
+            .map(|(_, _, _, env_id, service_id)| {
+                let env_gone = loaded.is_some_and(|l| !l.iter().any(|e| e.id == env_id));
+                let service_gone = current == Some(env_id)
+                    && services.is_some_and(|l| !l.iter().any(|s| s.service_id == service_id));
+                PendingGroup {
+                    env_id: env_id.to_string(),
+                    service_id: service_id.to_string(),
+                    orphaned: if env_gone {
+                        Some(Orphan::Environment)
+                    } else if service_gone {
+                        Some(Orphan::Service)
+                    } else {
+                        None
+                    },
+                }
             })
             .collect()
     }
@@ -2976,8 +2997,14 @@ mod tests {
     }
 
     /// Three groups in two environments plus another project's, then the review open.
+    /// Production's services include s1 and s2.
     fn app_in_review(now: Instant) -> App {
         let mut app = app_in_services(now);
+        let mut loaded = services();
+        for id in ["s1", "s2"] {
+            loaded.push(service(id, deploy("d9", DeploymentStatus::Success), vec![]));
+        }
+        data(&mut app, services_event("e-prod", Ok(loaded)), now);
         add_pending(&mut app, ("e-stg", "staging"), ("s1", "web"), "A", "1");
         add_pending(
             &mut app,
@@ -3038,15 +3065,49 @@ mod tests {
         let mut app = app_in_review(now);
         add_pending(&mut app, ("e-gone", "preview"), ("s1", "web"), "Z", "9");
         let groups = app.pending_groups();
-        assert_eq!(groups.iter().filter(|g| g.orphaned).count(), 1);
+        assert_eq!(groups.iter().filter(|g| g.orphaned.is_some()).count(), 1);
         // Current env first, then "preview" before "staging".
-        assert!(groups[2].orphaned && groups[2].env_id == "e-gone");
+        assert_eq!(groups[2].orphaned, Some(Orphan::Environment));
+        assert_eq!(groups[2].env_id, "e-gone");
         for _ in 0..2 {
             app.update(key('j'), now);
         }
         app.update(key('D'), now);
         assert!(app.message.is_some());
         assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn group_of_a_service_gone_from_the_current_env_is_orphaned() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        add_pending(
+            &mut app,
+            ("e-prod", "production"),
+            ("s-gone", "old"),
+            "Z",
+            "9",
+        );
+        // Another environment's services are not loaded: not judged.
+        add_pending(&mut app, ("e-stg", "staging"), ("s-other", "x"), "Z", "9");
+        let groups = app.pending_groups();
+        let orphans: Vec<(&str, Option<Orphan>)> = groups
+            .iter()
+            .filter(|g| g.orphaned.is_some())
+            .map(|g| (g.service_id.as_str(), g.orphaned))
+            .collect();
+        assert_eq!(orphans, [("s-gone", Some(Orphan::Service))]);
+        // Groups sort by service name: "old" is after "api" and before "worker".
+        assert_eq!(groups[1].service_id, "s-gone");
+        app.update(key('j'), now);
+        assert!(app.update(key('D'), now).is_empty());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("cannot deploy: the service no longer exists")
+        );
+        // Not judged before the services list has loaded.
+        app.services = Loaded::default();
+        assert!(app.pending_groups().iter().all(|g| g.orphaned.is_none()));
     }
 
     #[test]

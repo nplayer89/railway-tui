@@ -9,7 +9,7 @@ use ratatui::Frame;
 use super::tables::fg;
 use super::vars::{shown, HIDDEN};
 use super::{centered, clean, is_production, popup};
-use crate::app::{App, DeployConfirm, PendingView, View};
+use crate::app::{App, DeployConfirm, Orphan, PendingView, View};
 use crate::pending::{Change, PendingVar};
 
 /// Lines of the deploy confirm around its list of changes: title, service,
@@ -50,8 +50,10 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, view: &PendingView) {
         let start = lines.len();
         let applied = sp.vars.values().filter(|v| v.applied).count();
         let mut head = format!("  {}", clean(&sp.service_name));
-        if g.orphaned {
-            head.push_str("  (environment no longer exists)");
+        match g.orphaned {
+            Some(Orphan::Environment) => head.push_str("  (environment no longer exists)"),
+            Some(Orphan::Service) => head.push_str("  (service no longer exists)"),
+            None => {}
         }
         if sp.written_not_deployed {
             head.push_str("  written, not deployed");

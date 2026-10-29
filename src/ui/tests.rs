@@ -914,6 +914,15 @@ fn review_orphan_label_and_discard_prompt() {
     );
 }
 
+#[test]
+fn review_labels_a_group_whose_service_is_gone() {
+    let mut app = review_app();
+    app.services.value.as_mut().unwrap()[0].service_id = "svc-other".into();
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("(service no longer exists)"), "{t}");
+    assert!(!t.contains("(environment no longer exists)"), "{t}");
+}
+
 fn deploy_confirm(app: &mut App, drift: &[&str]) {
     app.confirm = Some(crate::app::Confirm::Deploy(crate::app::DeployConfirm {
         env_id: "e1".into(),

@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use super::{App, Command, Confirm, Kind, LogsView, VarInput, View};
+use super::{App, Command, Confirm, Kind, LogsView, Orphan, PendingGroup, VarInput, View};
 use crate::model::LogKind;
 use crate::pending::{Change, Pending, Target};
 use crate::status::default_log_kind;
@@ -407,8 +407,15 @@ impl App {
                 }
             }
             KeyCode::Char('D') => match self.selected_group() {
-                Some(g) if g.orphaned => {
-                    self.message = Some("cannot deploy: the environment no longer exists".into());
+                Some(PendingGroup {
+                    orphaned: Some(orphan),
+                    ..
+                }) => {
+                    let gone = match orphan {
+                        Orphan::Environment => "environment",
+                        Orphan::Service => "service",
+                    };
+                    self.message = Some(format!("cannot deploy: the {gone} no longer exists"));
                 }
                 Some(g) => out.extend(self.request_deploy(g.env_id, g.service_id)),
                 None => {}
