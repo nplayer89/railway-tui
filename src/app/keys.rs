@@ -11,6 +11,9 @@ use crate::pending::{Change, Pending, Target};
 use crate::status::default_log_kind;
 use crate::theme::THEMES;
 
+const DEPLOY_IN_PROGRESS: &str =
+    "a deploy is in progress — wait for it to finish, or press ctrl-c twice to force quit";
+
 /// Lines moved by PgUp/PgDn in the log view.
 const PAGE: usize = 20;
 
@@ -22,7 +25,12 @@ impl App {
         self.message = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
-            out.push(Command::Quit);
+            if self.deploys.is_empty() || self.force_quit_armed {
+                out.push(Command::Quit);
+            } else {
+                self.force_quit_armed = true;
+                self.message = Some(DEPLOY_IN_PROGRESS.into());
+            }
         } else if self.confirm.is_some() {
             self.confirm_key(key.code, out);
         } else if self.var_input.is_some() {
@@ -41,7 +49,7 @@ impl App {
             }
         } else {
             match key.code {
-                KeyCode::Char('q') => out.push(Command::Quit),
+                KeyCode::Char('q') => self.quit(out),
                 KeyCode::Char(':') => self.command_line = Some(String::new()),
                 KeyCode::Char('/') => {
                     let current = match self.logs_mut() {
@@ -55,6 +63,15 @@ impl App {
                 KeyCode::Esc if self.help => self.help = false,
                 code => self.view_key(code, now, out),
             }
+        }
+    }
+
+    /// `q` and `:q`: refused while a deploy is in flight (Ctrl-C twice forces it).
+    fn quit(&mut self, out: &mut Vec<Command>) {
+        if self.deploys.is_empty() {
+            out.push(Command::Quit);
+        } else {
+            self.message = Some(DEPLOY_IN_PROGRESS.into());
         }
     }
 
@@ -75,7 +92,7 @@ impl App {
 
     fn run_command(&mut self, text: &str, now: Instant, out: &mut Vec<Command>) {
         match text.trim().trim_start_matches(':') {
-            "q" | "quit" => out.push(Command::Quit),
+            "q" | "quit" => self.quit(out),
             "projects" => self.truncate(1, out),
             "services" => {
                 self.goto_services(out);

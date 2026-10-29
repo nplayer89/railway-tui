@@ -327,6 +327,9 @@ pub struct App {
     pub confirm: Option<Confirm>,
     /// Deploys sent to the worker and not finished, by (env id, service id).
     deploys: BTreeMap<(String, String), deploy::Sent>,
+    /// Ctrl-C was pressed once while deploys are in flight; a second one quits.
+    /// Cleared once no deploy is in flight.
+    force_quit_armed: bool,
     /// Applied name filter for the current table view (cleared on view change).
     pub table_filter: Option<String>,
     /// Filter text being typed after `/` (table or logs, by the top view).
@@ -381,6 +384,7 @@ impl App {
             var_input: None,
             confirm: None,
             deploys: BTreeMap::new(),
+            force_quit_armed: false,
             table_filter: None,
             filter_input: None,
             command_line: None,
@@ -406,6 +410,9 @@ impl App {
             AppEvent::Key(key) => self.on_key(key, now, &mut out),
             AppEvent::Tick(_) => self.on_tick(now, &mut out),
             AppEvent::Data(data) => self.on_data(data, now, &mut out),
+        }
+        if self.deploys.is_empty() {
+            self.force_quit_armed = false;
         }
         out
     }
@@ -3491,6 +3498,45 @@ mod tests {
         assert!(app.confirm.is_none());
         assert!(app.message.as_deref().unwrap().contains("deploying"));
         assert!(app.pending.service("e-prod", "s1").is_some());
+    }
+
+    const DEPLOY_IN_PROGRESS: &str =
+        "a deploy is in progress — wait for it to finish, or press ctrl-c twice to force quit";
+
+    #[test]
+    fn quit_refused_while_deploying_and_ctrl_c_twice_forces_it() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        deploy_first_group(&mut app, vars(&[]), now);
+        assert!(app.update(key('q'), now).is_empty());
+        assert_eq!(app.message.as_deref(), Some(DEPLOY_IN_PROGRESS));
+        typed(&mut app, ":q", now);
+        assert!(app.update(code(KeyCode::Enter), now).is_empty());
+        assert_eq!(app.message.as_deref(), Some(DEPLOY_IN_PROGRESS));
+        assert!(app.update(ctrl('c'), now).is_empty());
+        assert_eq!(app.message.as_deref(), Some(DEPLOY_IN_PROGRESS));
+        assert_eq!(app.update(ctrl('c'), now), vec![Command::Quit]);
+    }
+
+    #[test]
+    fn ctrl_c_arming_ends_with_the_deploy() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        deploy_first_group(&mut app, vars(&[]), now);
+        assert!(app.update(ctrl('c'), now).is_empty());
+        let failed = DeployStep::Failed {
+            during: Phase::Upsert,
+            error: "Railway API returned HTTP 400".into(),
+            unknown: false,
+        };
+        data(&mut app, step("e-prod", "s1", failed), now);
+        // A new deploy is a new in-flight period: one ctrl-c only warns.
+        deploy_first_group(&mut app, vars(&[]), now);
+        assert!(app.update(ctrl('c'), now).is_empty());
+        assert_eq!(app.message.as_deref(), Some(DEPLOY_IN_PROGRESS));
+        data(&mut app, step("e-prod", "s1", DeployStep::Upserted), now);
+        data(&mut app, step("e-prod", "s1", DeployStep::Redeployed), now);
+        assert_eq!(app.update(key('q'), now), vec![Command::Quit]);
     }
 
     #[test]

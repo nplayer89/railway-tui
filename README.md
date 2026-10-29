@@ -65,7 +65,7 @@ On launch it reopens the last-used project and environment.
 | `ctrl-r` | reload (in the log view: reconnect the stream) |
 | `t` | theme picker (also `:theme`): moving previews, `enter` keeps and remembers, `esc` reverts |
 | `?` | toggle the help overlay |
-| `q`, `ctrl-c` | quit |
+| `q`, `ctrl-c` | quit (refused while a deploy is in flight; `ctrl-c` twice forces it) |
 
 ## Variables
 
