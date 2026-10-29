@@ -304,27 +304,30 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
+const HELP_LINES: [&str; 19] = [
+    "j/k, arrows  move / scroll",
+    "enter        open",
+    "esc          back / clear filter",
+    "/            filter",
+    ":            command (projects services deploys logs)",
+    "             also :vars :pending :theme :q",
+    "e            environment picker (services)",
+    "l            latest logs   i  instances",
+    "b            build/runtime logs",
+    "f, G         follow logs",
+    "ctrl-r       reload (in logs: reconnect)",
+    "t            theme picker (:theme)",
+    "v            service variables (:vars)",
+    "  e/enter edit  E $EDITOR  a add  d delete  u undo",
+    "  r reveal  R reveal all  p review  / name filter",
+    "p            review pending changes (:pending)",
+    "  D deploy  x discard  r/R reveal  (y confirms)",
+    "?            toggle help",
+    "q            quit",
+];
+
 fn draw_help(frame: &mut Frame, area: Rect, t: &Theme) {
-    let text = [
-        "j/k, arrows  move / scroll",
-        "enter        open",
-        "esc          back / clear filter",
-        "/            filter",
-        ":            command (projects services deploys logs vars pending q)",
-        "e            environment picker (services)",
-        "l            latest logs   i  instances",
-        "b            build/runtime logs",
-        "f, G         follow logs",
-        "ctrl-r       reload (in logs: reconnect)",
-        "t            theme picker (:theme)",
-        "v            service variables (:vars)",
-        "  e/enter edit  E $EDITOR  a add  d delete  u undo",
-        "  r reveal  R reveal all  p review  / name filter",
-        "p            review pending changes (:pending)",
-        "  D deploy  x discard  r/R reveal  (y confirms)",
-        "?            toggle help",
-        "q            quit",
-    ];
+    let text = HELP_LINES;
     let rect = centered(area, 64, text.len() as u16 + 2);
     frame.render_widget(Clear, rect);
     let lines: Vec<Line> = text.iter().map(|t| Line::from(*t)).collect();

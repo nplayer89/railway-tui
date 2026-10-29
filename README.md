@@ -87,10 +87,10 @@ Edits are not sent to Railway immediately. They are kept as pending changes and 
 
 ### Review and deploy
 
-`p` (or `:pending`) lists pending changes grouped by environment, then service, with the current
-environment first. `D` deploys the selected group: a confirmation shows the diff, and any variable
+`p` (or `:pending`) lists the pending changes in the open project, grouped by environment, then service, with the
+current environment first. `D` deploys the selected group: a confirmation shows the diff, and any variable
 that "changed on Railway since your edit". `y` deploys; any other key cancels. `x` discards a group
-(also confirmed), and `r` / `R` reveal values. A group cannot be discarded while it is deploying.
+(also confirmed), and `r` / `R` both toggle reveal-all. A group cannot be discarded while it is deploying.
 
 Deploy order for one service: upsert the changed variables without triggering a deploy, then the
 deletes, then a redeploy of that service only. If something fails, the group stays pending and a

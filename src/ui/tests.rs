@@ -1000,3 +1000,16 @@ fn long_deploy_confirm_keeps_the_prompt() {
     );
     assert!(t.contains("more changes"), "{t}");
 }
+
+#[test]
+fn help_overlay_shows_every_line_in_full() {
+    let mut app = services_app(vec![]);
+    app.help = true;
+    let out = text(&render_sized(&app, Instant::now(), 100, 40));
+    for line in super::HELP_LINES {
+        assert!(
+            out.contains(line.trim_end()),
+            "help line truncated: {line:?}"
+        );
+    }
+}
