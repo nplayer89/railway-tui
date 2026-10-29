@@ -152,12 +152,18 @@ pub struct BranchPicker {
     pub index: usize,
 }
 
+/// A service's deploy triggers and its repo's branch names, or why the names
+/// could not be listed (the trigger is still usable then).
+pub type BranchReply = (Vec<Trigger>, Result<Vec<String>, String>);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchChoices {
     pub trigger_id: String,
     /// The branch the service deploys from now.
     pub connected: String,
     pub names: Vec<String>,
+    /// Why no branch list could be had; the typed name is picked instead.
+    pub unlisted: Option<String>,
 }
 
 impl BranchPicker {
@@ -291,11 +297,12 @@ pub enum DataEvent {
         service_id: String,
         outcome: LatestOutcome,
     },
-    /// The service's deploy triggers and its repo's branches, for the picker.
+    /// The service's deploy triggers and its repo's branches (or why they
+    /// could not be listed), for the picker.
     Branches {
         env_id: String,
         service_id: String,
-        result: Result<(Vec<Trigger>, Vec<String>), String>,
+        result: Result<BranchReply, String>,
     },
     /// Saving the pending file failed; the text never holds a value.
     SaveFailed(String),
@@ -4046,6 +4053,7 @@ mod tests {
 
     // ---- deploy a picked branch ----
 
+    /// The picker's reply with the branches listed.
     fn branches_event(
         service_id: &str,
         result: Result<(Vec<Trigger>, Vec<String>), String>,
@@ -4053,7 +4061,7 @@ mod tests {
         DataEvent::Branches {
             env_id: "e-prod".into(),
             service_id: service_id.into(),
-            result,
+            result: result.map(|(triggers, names)| (triggers, Ok(names))),
         }
     }
 
@@ -4254,5 +4262,33 @@ mod tests {
             [Command::LoadBranches { service_id, .. }] if service_id == "svc-a"
         ));
         assert!(app.branch_picker.is_some());
+    }
+
+    #[test]
+    fn unlisted_branches_let_the_typed_name_be_picked() {
+        let now = Instant::now();
+        let mut app = app_with_git_service(now);
+        app.update(key('d'), now);
+        let unlisted = DataEvent::Branches {
+            env_id: "e-prod".into(),
+            service_id: "svc-a".into(),
+            result: Ok((vec![trigger()], Err("gh is not installed".into()))),
+        };
+        data(&mut app, unlisted, now);
+        let choices = app.branch_picker.as_ref().unwrap().choices.clone();
+        assert!(
+            matches!(&choices, Some(Ok(c)) if c.unlisted.as_deref() == Some("gh is not installed"))
+        );
+        app.update(code(KeyCode::Enter), now);
+        assert!(app.confirm.is_none(), "nothing typed yet");
+        typed(&mut app, " feat/typed ", now);
+        app.update(code(KeyCode::Enter), now);
+        let Some(Confirm::DeployLatest(c)) = &app.confirm else {
+            panic!("expected the confirm, got {:?}", app.confirm);
+        };
+        assert_eq!(
+            c.switch.as_ref().map(|sw| (&sw.from[..], &sw.to[..])),
+            Some(("main", "feat/typed"))
+        );
     }
 }

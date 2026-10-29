@@ -9,10 +9,10 @@
 use std::time::Instant;
 
 use super::{
-    App, BranchChoices, BranchPicker, BranchSwitch, Command, Confirm, DeployConfirm, DeployStep,
-    Kind, LatestConfirm, LatestOutcome, Phase, VarsPurpose, View,
+    App, BranchChoices, BranchPicker, BranchReply, BranchSwitch, Command, Confirm, DeployConfirm,
+    DeployStep, Kind, LatestConfirm, LatestOutcome, Phase, VarsPurpose, View,
 };
-use crate::model::{Trigger, Variables};
+use crate::model::Variables;
 use crate::pending::Change;
 
 /// A deploy in flight: exactly what was sent, and the names to report it by.
@@ -81,7 +81,7 @@ impl App {
         &mut self,
         env_id: &str,
         service_id: &str,
-        result: Result<(Vec<Trigger>, Vec<String>), String>,
+        result: Result<BranchReply, String>,
     ) {
         let Some(picker) = self.branch_picker.as_mut() else {
             return;
@@ -90,17 +90,22 @@ impl App {
             return;
         }
         let repo = picker.target.repo.as_deref().unwrap_or_default();
-        picker.choices = Some(result.and_then(|(triggers, mut names)| {
+        picker.choices = Some(result.and_then(|(triggers, names)| {
             let trigger = triggers
                 .iter()
                 .find(|t| t.repository == repo)
                 .or(triggers.first())
                 .ok_or("the service has no GitHub deploy trigger in this environment")?;
+            let (mut names, unlisted) = match names {
+                Ok(names) => (names, None),
+                Err(why) => (Vec::new(), Some(why)),
+            };
             names.sort();
             Ok(BranchChoices {
                 trigger_id: trigger.id.clone(),
                 connected: trigger.branch.clone(),
                 names,
+                unlisted,
             })
         }));
         picker.index = 0;
@@ -114,7 +119,12 @@ impl App {
         let Some(Ok(choices)) = &picker.choices else {
             return;
         };
-        let Some(name) = picker.filtered().get(picker.index).map(|n| n.to_string()) else {
+        let name = if choices.unlisted.is_some() {
+            Some(picker.query.trim().to_string()).filter(|n| !n.is_empty())
+        } else {
+            picker.filtered().get(picker.index).map(|n| n.to_string())
+        };
+        let Some(name) = name else {
             return;
         };
         let switch = (name != choices.connected).then(|| BranchSwitch {

@@ -265,12 +265,14 @@ impl Api {
     }
 
     /// Branch names of a GitHub repo (`owner/name`), as Railway's GitHub app sees them.
+    /// Railway refuses this to `railway login` tokens, so a refusal is reported
+    /// as such and never makes the token refresh.
     pub async fn branches(&self, repo: &str) -> Result<Vec<String>, ApiError> {
         let Some((owner, name)) = repo.split_once('/') else {
             return Err(ApiError::Decode(format!("not an owner/name repo: {repo}")));
         };
         let data = self
-            .query::<ops::GitHubRepoBranches>(ops::git_hub_repo_branches::Variables {
+            .query_once::<ops::GitHubRepoBranches>(ops::git_hub_repo_branches::Variables {
                 owner: owner.to_string(),
                 repo: name.to_string(),
             })
@@ -509,6 +511,21 @@ impl Api {
             Ok(data) => Ok(data),
             Err(Attempt::Failed(e) | Attempt::Unsent(e)) => Err(e),
             Err(Attempt::Rejected) => Err(ApiError::Auth(AuthError::Rejected)),
+        }
+    }
+
+    /// Like [`Api::query`] without the refresh: for queries Railway refuses to
+    /// some valid tokens, where "Not Authorized" says nothing about the token.
+    async fn query_once<Q: GraphQLQuery>(
+        &self,
+        variables: Q::Variables,
+    ) -> Result<Q::ResponseData, ApiError> {
+        let body = Q::build_query(variables);
+        let token = self.auth(|t| t.token()).await?;
+        match self.attempt::<Q>(&body, &token).await {
+            Ok(data) => Ok(data),
+            Err(Attempt::Failed(e) | Attempt::Unsent(e)) => Err(e),
+            Err(Attempt::Rejected) => Err(ApiError::GraphQl(vec!["Not Authorized".into()])),
         }
     }
 
