@@ -225,13 +225,14 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
         ));
     }
     // Hints sit right-aligned, after the status. Whole groups are dropped from the right
-    // until the rest fits; `<?> help` is the last one standing.
+    // until the rest fits; `<?> help` is the last one standing. A space keeps them off the edge.
+    const RIGHT_PAD: usize = 1;
     let left = Line::from(spans.clone()).width();
-    let room = (area.width as usize).saturating_sub(left + 2);
+    let room = (area.width as usize).saturating_sub(left + 2 + RIGHT_PAD);
     let hints = fit_hints(hints(app), room);
     let hint_width = hints.chars().count();
     if hint_width > 0 {
-        let gap = area.width as usize - left - hint_width;
+        let gap = area.width as usize - left - hint_width - RIGHT_PAD;
         spans.push(Span::raw(" ".repeat(gap)));
         spans.push(Span::styled(hints, Style::new().fg(t.hint)));
     }
