@@ -540,7 +540,7 @@ impl App {
         }
     }
 
-    /// Marks unapplied entries for which `matches(name, change)` holds; once
+    /// Marks unapplied entries for which `matches(name, var)` holds; once
     /// every entry is applied the group is written but not deployed.
     fn mark_applied(&mut self, key: &GroupKey, matches: impl Fn(&str, &PendingVar) -> bool) {
         let Some(sp) = self
