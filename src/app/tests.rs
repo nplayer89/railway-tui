@@ -1491,6 +1491,7 @@ fn add_pending(app: &mut App, env: (&str, &str), svc: (&str, &str), name: &str, 
         crate::pending::PendingVar {
             change: crate::pending::Change::Set { value: v.into() },
             base: None,
+            base_sealed: false,
             applied: false,
         },
     );
@@ -1745,6 +1746,7 @@ fn delete_var(base: &str) -> PendingVar {
     PendingVar {
         change: crate::pending::Change::Delete,
         base: Some(base.into()),
+        base_sealed: false,
         applied: false,
     }
 }
@@ -1809,6 +1811,7 @@ fn drift_listed_in_confirm() {
     let set = |v: &str, base: &str, applied| PendingVar {
         change: crate::pending::Change::Set { value: v.into() },
         base: Some(base.into()),
+        base_sealed: false,
         applied,
     };
     let sp = sp_mut(&mut app, "e-prod", "s1");
@@ -2691,6 +2694,70 @@ fn a_sealed_row_missing_from_the_map_can_be_deleted() {
     assert_eq!(
         sp.vars.get("HIDDEN_KEY").map(|v| &v.change),
         Some(&crate::pending::Change::Delete)
+    );
+    assert!(sp.vars["HIDDEN_KEY"].base_sealed);
+}
+
+/// A delete of a sealed variable Railway left out of the value map.
+fn sealed_delete() -> PendingVar {
+    PendingVar {
+        base: Some(String::new()),
+        base_sealed: true,
+        ..delete_var("")
+    }
+}
+
+#[test]
+fn an_unread_sealed_delete_is_not_drift() {
+    let now = Instant::now();
+    let mut app = app_in_review(now);
+    let sp = sp_mut(&mut app, "e-prod", "s1");
+    sp.vars.insert("HIDDEN_KEY".into(), sealed_delete());
+    // A sealed delete whose value Railway did return still drifts as before.
+    sp.vars.insert("SEEN".into(), delete_var("old"));
+    app.update(key('D'), now);
+    let current = vars(&[("SEEN", "changed")]);
+    data(&mut app, deploy_vars_event("e-prod", "s1", current), now);
+    assert_eq!(
+        confirm(&app),
+        Some(&Confirm::Deploy(DeployConfirm {
+            env_id: "e-prod".into(),
+            service_id: "s1".into(),
+            drift: vec!["SEEN".into()],
+        }))
+    );
+}
+
+#[test]
+fn reconcile_never_infers_an_unread_sealed_delete_applied() {
+    let now = Instant::now();
+    let mut app = app_in_review(now);
+    sp_mut(&mut app, "e-prod", "s1")
+        .vars
+        .insert("HIDDEN_KEY".into(), sealed_delete());
+    deploy_first_group(&mut app, vars(&[]), now);
+    let unknown = DeployStep::Failed {
+        during: Phase::Upsert,
+        error: "timed out".into(),
+        failure: WriteFailure::Unknown,
+    };
+    data(&mut app, step("e-prod", "s1", unknown), now);
+    // Railway omits the sealed variable whether or not it was deleted.
+    let reply = DataEvent::Variables {
+        env_id: "e-prod".into(),
+        service_id: "s1".into(),
+        purpose: VarsPurpose::Reconcile,
+        result: Ok(Secret::new(vars(&[("C", "3")]))),
+        sealed: None,
+    };
+    data(&mut app, reply, now);
+    let sp = app.pending.service("e-prod", "s1").unwrap();
+    assert!(sp.vars["C"].applied && !sp.vars["HIDDEN_KEY"].applied);
+    // `D` resends the delete.
+    let cmds = deploy_first_group(&mut app, vars(&[("C", "3")]), now);
+    assert_eq!(
+        deploy_cmd(&cmds),
+        (vars(&[]), vec!["HIDDEN_KEY".to_string()], false)
     );
 }
 

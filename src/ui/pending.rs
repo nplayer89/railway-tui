@@ -7,7 +7,7 @@ use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
 use super::tables::fg;
-use super::vars::{shown, HIDDEN};
+use super::vars::{shown, HIDDEN, OPAQUE};
 use super::{centered, clean, is_production, popup};
 use crate::app::{App, DeployConfirm, Orphan, PendingView, View};
 use crate::pending::{Change, PendingVar};
@@ -82,16 +82,21 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, view: &PendingView) {
 
 fn change_line(app: &App, reveal: bool, name: &str, var: &PendingVar) -> Line<'static> {
     let t = app.theme();
+    // A sealed base Railway never returned is unknown, not empty.
+    let old_value = |old: &str| {
+        if var.base_sealed {
+            OPAQUE.into()
+        } else {
+            shown(old, reveal)
+        }
+    };
     let (marker, text) = match (&var.change, &var.base) {
         (Change::Set { value }, None) => ("+", shown(value, reveal)),
         (Change::Set { value }, Some(old)) => (
             "~",
-            format!("{} → {}", shown(old, reveal), shown(value, reveal)),
+            format!("{} → {}", old_value(old), shown(value, reveal)),
         ),
-        (Change::Delete, old) => (
-            "-",
-            old.as_deref().map_or(HIDDEN.into(), |o| shown(o, reveal)),
-        ),
+        (Change::Delete, old) => ("-", old.as_deref().map_or(HIDDEN.into(), old_value)),
     };
     let tick = if var.applied { "✓" } else { " " };
     Line::from(vec![

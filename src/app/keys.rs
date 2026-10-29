@@ -745,7 +745,9 @@ impl App {
     fn stage_delete(&mut self, name: &str) -> bool {
         let current = self.var_state(name).0;
         // A sealed variable the value map omits still exists on Railway.
-        let current = current.or_else(|| self.sealed_names().contains(name).then(String::new));
+        if current.is_none() && self.sealed_names().contains(name) {
+            return self.with_target(|p, t| p.delete_sealed(t, name));
+        }
         self.with_target(|p, t| p.delete(t, name, current.as_deref()))
     }
 

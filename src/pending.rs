@@ -28,6 +28,11 @@ pub struct PendingVar {
     pub change: Change,
     /// Value on Railway when first edited; `None` = the variable was added.
     pub base: Option<String>,
+    /// The variable is sealed and Railway left it out of the value map: it
+    /// exists, but `base` is a placeholder for a value nobody can read. Its
+    /// absence from the map says nothing, so it is never drift or proof of a delete.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub base_sealed: bool,
     pub applied: bool,
 }
 
@@ -36,6 +41,7 @@ impl fmt::Debug for PendingVar {
         f.debug_struct("PendingVar")
             .field("change", &self.change)
             .field("base", &self.base.as_ref().map(|_| "<redacted>"))
+            .field("base_sealed", &self.base_sealed)
             .field("applied", &self.applied)
             .finish()
     }
@@ -49,6 +55,7 @@ impl PendingVar {
             Change::Set { value } => Some(value.clone()),
             Change::Delete => None,
         };
+        self.base_sealed = false;
         self.applied = false;
     }
 }
@@ -120,11 +127,11 @@ impl Pending {
                 v.rebase_on_written();
             }
         }
-        let base = match sp.vars.get(name) {
-            Some(v) => v.base.clone(),
-            None => current.map(str::to_string),
+        let (base, base_sealed) = match sp.vars.get(name) {
+            Some(v) => (v.base.clone(), v.base_sealed),
+            None => (current.map(str::to_string), false),
         };
-        if base.as_deref() == Some(value.as_str()) {
+        if !base_sealed && base.as_deref() == Some(value.as_str()) {
             sp.vars.remove(name);
         } else {
             sp.vars.insert(
@@ -132,6 +139,7 @@ impl Pending {
                 PendingVar {
                     change: Change::Set { value },
                     base,
+                    base_sealed,
                     applied: false,
                 },
             );
@@ -141,6 +149,16 @@ impl Pending {
 
     /// Like `set`: an applied entry is re-based on what it wrote first.
     pub fn delete(&mut self, t: &Target, name: &str, current: Option<&str>) {
+        self.stage_delete(t, name, current, false);
+    }
+
+    /// Deletes a sealed variable Railway left out of the value map: it exists,
+    /// but its value is unknown (see `PendingVar::base_sealed`).
+    pub fn delete_sealed(&mut self, t: &Target, name: &str) {
+        self.stage_delete(t, name, Some(""), true);
+    }
+
+    fn stage_delete(&mut self, t: &Target, name: &str, current: Option<&str>, sealed: bool) {
         let sp = self.entry(t);
         if let Some(v) = sp.vars.get_mut(name) {
             if v.applied {
@@ -150,9 +168,9 @@ impl Pending {
                 v.rebase_on_written();
             }
         }
-        let base = match sp.vars.get(name) {
-            Some(v) => v.base.clone(),
-            None => current.map(str::to_string),
+        let (base, base_sealed) = match sp.vars.get(name) {
+            Some(v) => (v.base.clone(), v.base_sealed),
+            None => (current.map(str::to_string), sealed),
         };
         if base.is_none() {
             sp.vars.remove(name);
@@ -162,6 +180,7 @@ impl Pending {
                 PendingVar {
                     change: Change::Delete,
                     base,
+                    base_sealed,
                     applied: false,
                 },
             );
@@ -495,6 +514,7 @@ mod tests {
             p.set(&tg, k, v, Some("old"));
         }
         p.delete(&tg, "GONE", Some("a\nb"));
+        p.delete_sealed(&tg, "SEALED");
         p.envs
             .get_mut("e")
             .unwrap()
@@ -503,6 +523,38 @@ mod tests {
             .written_not_deployed = true;
         save_pending(&path, &p).unwrap();
         assert_eq!(load_pending(&path).unwrap(), p);
+    }
+
+    #[test]
+    fn a_file_saved_before_base_sealed_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending.toml");
+        let old = "[envs.e.s]\nproject_id = \"p\"\nenv_name = \"e\"\nservice_name = \"s\"\n\
+                   written_not_deployed = false\n\n[envs.e.s.vars.A]\nchange = \"Delete\"\n\
+                   base = \"one\"\napplied = false\n";
+        std::fs::write(&path, old).unwrap();
+        let p = load_pending(&path).unwrap();
+        let v = &p.service("e", "s").unwrap().vars["A"];
+        assert_eq!(v.base.as_deref(), Some("one"));
+        assert!(!v.base_sealed);
+    }
+
+    #[test]
+    fn delete_sealed_marks_the_base_and_keeps_it_through_a_set() {
+        let mut p = Pending::default();
+        let tg = t("p", "e", "s");
+        p.delete_sealed(&tg, "K");
+        assert!(p.service("e", "s").unwrap().vars["K"].base_sealed);
+        // Setting it to "" is a real change: the old value is unknown, not empty.
+        p.set(&tg, "K", String::new(), None);
+        let v = &p.service("e", "s").unwrap().vars["K"];
+        assert!(v.base_sealed);
+        assert_eq!(
+            v.change,
+            Change::Set {
+                value: String::new()
+            }
+        );
     }
 
     #[test]

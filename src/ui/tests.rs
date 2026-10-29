@@ -732,6 +732,7 @@ fn add_pending(app: &mut App, name: &str, change: crate::pending::Change, base: 
         crate::pending::PendingVar {
             change,
             base: base.map(Into::into),
+            base_sealed: false,
             applied: false,
         },
     );
@@ -996,6 +997,33 @@ fn review_values_hidden_until_revealed() {
     let t = text(&render(&app, Instant::now()));
     assert!(t.contains("before → after"), "{t}");
     assert!(t.contains("newsecret") && t.contains("oldsecret"), "{t}");
+}
+
+#[test]
+fn review_shows_an_unread_sealed_base_as_opaque() {
+    let mut app = review_app();
+    add_pending(&mut app, "SEALED", crate::pending::Change::Delete, Some(""));
+    std::sync::Arc::make_mut(&mut app.pending)
+        .envs
+        .get_mut("e1")
+        .unwrap()
+        .get_mut("svc-1")
+        .unwrap()
+        .vars
+        .get_mut("SEALED")
+        .unwrap()
+        .base_sealed = true;
+    for reveal in [false, true] {
+        if reveal {
+            press(&mut app, 'r');
+        }
+        let t = text(&render(&app, Instant::now()));
+        let line = t.lines().find(|l| l.contains("- SEALED")).expect(&t);
+        assert!(
+            line.contains("<Opaque>") && !line.contains("<Empty>"),
+            "{t}"
+        );
+    }
 }
 
 #[test]
