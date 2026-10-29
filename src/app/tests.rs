@@ -3227,6 +3227,57 @@ fn cursor_branch_follows_the_selected_deployment() {
 }
 
 #[test]
+fn cursor_branch_follows_real_navigation_on_every_screen() {
+    let now = Instant::now();
+    let mut app = app_in_services(now);
+    {
+        let svcs = app.services.value.as_mut().unwrap();
+        svcs[0].active[0].branch = Some("rel".into());
+    }
+    // Services: the latest deployment of the selected service.
+    assert_eq!(app.cursor_branch(), Some("main"));
+
+    // Deployments: before the history loads, after it, and after `j`.
+    app.update(code(KeyCode::Enter), now);
+    assert!(matches!(app.stack.last(), Some(View::Deployments { .. })));
+    assert_eq!(app.cursor_branch(), Some("main"));
+    let history = DeploymentSummary {
+        branch: Some("old".into()),
+        ..deploy("d0", DeploymentStatus::Removed)
+    };
+    data(
+        &mut app,
+        DataEvent::Deployments {
+            service_id: "svc-a".into(),
+            env_id: "e-prod".into(),
+            result: Ok(vec![history]),
+        },
+        now,
+    );
+    assert_eq!(app.cursor_branch(), Some("main"));
+    app.update(key('j'), now);
+    assert_eq!(app.cursor_branch(), Some("rel"));
+    app.update(key('j'), now);
+    assert_eq!(app.cursor_branch(), Some("old"));
+    app.update(code(KeyCode::Esc), now);
+
+    // Instances, and Logs opened from the selected instance.
+    app.update(key('i'), now);
+    assert!(matches!(app.stack.last(), Some(View::Instances { .. })));
+    assert_eq!(app.cursor_branch(), Some("rel"));
+    app.update(code(KeyCode::Enter), now);
+    assert!(matches!(app.stack.last(), Some(View::Logs(_))));
+    assert_eq!(app.cursor_branch(), Some("rel"));
+    app.update(code(KeyCode::Esc), now);
+    app.update(code(KeyCode::Esc), now);
+
+    // Variables: the service's latest deployment.
+    app.update(key('v'), now);
+    assert!(matches!(app.stack.last(), Some(View::Variables(_))));
+    assert_eq!(app.cursor_branch(), Some("main"));
+}
+
+#[test]
 fn cursor_branch_is_none_for_image_deploys_and_unknown_logs() {
     let now = Instant::now();
     let mut app = app_in_services(now);

@@ -1605,7 +1605,27 @@ fn marquee_pads_short_text_and_scrolls_long_text() {
     assert_eq!(marquee("abcdef", 4, 3), "def ");
     assert_eq!(marquee("abcdef", 4, 7), "  ab");
     assert_eq!(marquee("abcdef", 4, 9), "abcd");
-    assert_eq!(marquee("éé😀abc", 3, 2), "😀ab");
+    // A wide char counts as two cells: the field is 3 cells, so "😀a" fits and "b" does not.
+    assert_eq!(marquee("éé😀abc", 3, 2), "😀a");
+}
+
+#[test]
+fn marquee_is_exactly_the_width_in_cells_with_wide_characters() {
+    use unicode_width::UnicodeWidthStr;
+    for name in [
+        "東京のチーム ワークスペース名",
+        "team 🚀 launch 🚀 pad crew",
+        "日本語",
+    ] {
+        for step in 0..40 {
+            let m = marquee(name, 20, step);
+            assert_eq!(
+                UnicodeWidthStr::width(m.as_str()),
+                20,
+                "{name:?} step {step}: {m:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1621,9 +1641,40 @@ fn header_is_one_line_with_status_left_and_hints_right() {
 }
 
 #[test]
+fn header_at_80_columns_keeps_help_and_the_first_hint_group() {
+    let app = services_app(vec![]);
+    for w in [80, 100] {
+        let row = row_text(&render_sized(&app, Instant::now(), w, 20), 0);
+        assert!(row.contains("updated"), "{row}");
+        assert!(
+            row.contains("<e> env") && row.trim_end().ends_with("<?> help"),
+            "{row}"
+        );
+    }
+}
+
+#[test]
+fn header_shows_help_alone_when_only_it_fits() {
+    let app = services_app(vec![]);
+    let row = row_text(&render_sized(&app, Instant::now(), 26, 20), 0);
+    assert!(
+        row.contains("updated") && row.trim_end().ends_with("<?> help"),
+        "{row}"
+    );
+    assert!(!row.contains("<e> env"), "{row}");
+}
+
+#[test]
+fn header_shows_no_hint_when_not_even_help_fits() {
+    let app = services_app(vec![]);
+    let row = row_text(&render_sized(&app, Instant::now(), 22, 20), 0);
+    assert!(row.contains("updated") && !row.contains("<?>"), "{row}");
+}
+
+#[test]
 fn narrow_header_keeps_status_and_drops_hints() {
     let app = services_app(vec![]);
-    let row = row_text(&render_sized(&app, Instant::now(), 30, 20), 0);
+    let row = row_text(&render_sized(&app, Instant::now(), 20, 20), 0);
     assert!(
         row.contains("updated") && !row.contains("<?> help"),
         "{row}"

@@ -5,6 +5,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{clean, is_production};
 use crate::app::{App, Confirm, Modal, Mode};
@@ -44,21 +45,31 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-/// `width` chars of `text`: padded when it fits, otherwise a window onto the endless loop
-/// `text` + three spaces, starting `step` chars in. Slices by chars, never bytes.
+/// `width` display cells of `text`: padded when it fits, otherwise a window onto the endless
+/// loop `text` + three spaces, starting `step` chars in. Slices by chars, never bytes, and
+/// counts cells, so wide characters never push the field past `width`.
 pub(super) fn marquee(text: &str, width: usize, step: u64) -> String {
-    let len = text.chars().count();
-    if len <= width {
-        return format!("{text:<width$}");
+    let pad = |mut out: String| {
+        let used = UnicodeWidthStr::width(out.as_str());
+        out.push_str(&" ".repeat(width.saturating_sub(used)));
+        out
+    };
+    if UnicodeWidthStr::width(text) <= width {
+        return pad(text.to_string());
     }
-    let period = len + 3;
+    let period = text.chars().count() + 3;
     let start = (step % period as u64) as usize;
-    text.chars()
-        .chain("   ".chars())
-        .cycle()
-        .skip(start)
-        .take(width)
-        .collect()
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars().chain("   ".chars()).cycle().skip(start) {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > width {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    pad(out)
 }
 
 fn width(spans: &[Span]) -> usize {

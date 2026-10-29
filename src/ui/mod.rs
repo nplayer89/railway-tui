@@ -128,6 +128,26 @@ fn hints(app: &App) -> &'static str {
     }
 }
 
+/// The hint groups (split on double spaces) that fit in `room` cells: leading groups are
+/// kept and whole groups dropped from the right, but the trailing `<?> help` group always
+/// stays last when it alone fits. Empty when not even that fits.
+fn fit_hints(hints: &str, room: usize) -> String {
+    const HELP: &str = "<?> help";
+    let mut groups: Vec<&str> = hints.split("  ").collect();
+    if groups.last() == Some(&HELP) {
+        groups.pop();
+    }
+    for keep in (0..=groups.len()).rev() {
+        let mut shown = groups[..keep].to_vec();
+        shown.push(HELP);
+        let joined = shown.join("  ");
+        if joined.chars().count() <= room {
+            return joined;
+        }
+    }
+    String::new()
+}
+
 /// What the freshness indicator shows of a load.
 struct Freshness<'a> {
     loading: bool,
@@ -204,12 +224,13 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
             Style::new().fg(t.busy),
         ));
     }
-    // Hints sit right-aligned and are the first thing dropped when the row is too narrow.
-    let hints = hints(app);
+    // Hints sit right-aligned, after the status. Whole groups are dropped from the right
+    // until the rest fits; `<?> help` is the last one standing.
     let left = Line::from(spans.clone()).width();
     let room = (area.width as usize).saturating_sub(left + 2);
+    let hints = fit_hints(hints(app), room);
     let hint_width = hints.chars().count();
-    if hint_width > 0 && hint_width <= room {
+    if hint_width > 0 {
         let gap = area.width as usize - left - hint_width;
         spans.push(Span::raw(" ".repeat(gap)));
         spans.push(Span::styled(hints, Style::new().fg(t.hint)));
