@@ -7,6 +7,10 @@ updates:
     groups:
       cargo:
         patterns: ["*"]
+    ignore:
+      # Each minor release tracks a new reqwest minor; bump it together with reqwest by hand.
+      - dependency-name: reqwest-websocket
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
