@@ -916,12 +916,25 @@ fn vars(pairs: &[(&str, &str)]) -> Variables {
 }
 
 fn vars_event(service_id: &str, result: Result<Variables, String>) -> DataEvent {
+    vars_event_sealed(service_id, result, Ok(BTreeSet::new()))
+}
+
+fn vars_event_sealed(
+    service_id: &str,
+    result: Result<Variables, String>,
+    sealed: Result<BTreeSet<String>, String>,
+) -> DataEvent {
     DataEvent::Variables {
         env_id: "e-prod".into(),
         service_id: service_id.into(),
         purpose: VarsPurpose::View,
         result: result.map(Secret::new),
+        sealed: Some(sealed),
     }
+}
+
+fn sealed_set(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(|n| n.to_string()).collect()
 }
 
 fn names(app: &App) -> Vec<String> {
@@ -1677,6 +1690,7 @@ fn deploy_vars_event(env_id: &str, service_id: &str, current: Variables) -> Data
         service_id: service_id.into(),
         purpose: VarsPurpose::Deploy,
         result: Ok(Secret::new(current)),
+        sealed: None,
     }
 }
 
@@ -1975,6 +1989,7 @@ fn unknown_write_reconciles_and_unknown_redeploy_is_reported() {
         service_id: "s1".into(),
         purpose: VarsPurpose::Reconcile,
         result: Ok(Secret::new(vars(&[("C", "3"), ("N", "other")]))),
+        sealed: None,
     };
     let cmds = data(&mut app, reply, now);
     let sp = app.pending.service("e-prod", "s1").unwrap();
@@ -2058,6 +2073,7 @@ fn debug_never_prints_a_secret() {
                 service_id: "s".into(),
                 purpose: VarsPurpose::View,
                 result: Ok(Secret::new(vars(&[("KEY", SECRET)]))),
+                sealed: None,
             }
         ),
     ];
@@ -2613,4 +2629,67 @@ fn same_name_ignores_case_beyond_ascii() {
     assert!(same_name("ÉTÉ", "été"));
     assert!(!same_name("prod", "production"));
     assert!(!same_name("production", "prod"));
+}
+
+#[test]
+fn sealed_names_mark_rows_and_add_missing_ones() {
+    let now = Instant::now();
+    let mut app = app_in_services(now);
+    app.update(key('v'), now);
+    let loaded = vars(&[("DB_URL", "postgres://x"), ("PORT", "")]);
+    let sealed = sealed_set(&["PORT", "HIDDEN_KEY"]);
+    data(
+        &mut app,
+        vars_event_sealed("svc-a", Ok(loaded), Ok(sealed)),
+        now,
+    );
+    assert_eq!(names(&app), ["DB_URL", "HIDDEN_KEY", "PORT"]);
+    let rows = app.variable_rows();
+    let flags: Vec<(&str, bool, bool)> = rows
+        .iter()
+        .map(|r| (r.name, r.sealed, r.current.is_none()))
+        .collect();
+    assert_eq!(
+        flags,
+        [
+            ("DB_URL", false, false),
+            ("HIDDEN_KEY", true, true),
+            ("PORT", true, false)
+        ]
+    );
+}
+
+#[test]
+fn sealed_lookup_failure_still_loads_with_a_message() {
+    let now = Instant::now();
+    let mut app = app_in_services(now);
+    app.update(key('v'), now);
+    let loaded = vars(&[("A", "1")]);
+    data(
+        &mut app,
+        vars_event_sealed("svc-a", Ok(loaded), Err("boom".into())),
+        now,
+    );
+    assert_eq!(names(&app), ["A"]);
+    assert_eq!(app.message.as_deref(), Some("sealed status unknown: boom"));
+}
+
+#[test]
+fn a_sealed_row_missing_from_the_map_can_be_deleted() {
+    let now = Instant::now();
+    let mut app = app_in_services(now);
+    app.update(key('v'), now);
+    let sealed = sealed_set(&["HIDDEN_KEY"]);
+    data(
+        &mut app,
+        vars_event_sealed("svc-a", Ok(vars(&[("A", "1")])), Ok(sealed)),
+        now,
+    );
+    app.update(key('j'), now);
+    app.update(key('d'), now);
+    let sp = app.pending.service("e-prod", "svc-a").unwrap();
+    assert_eq!(
+        sp.vars.get("HIDDEN_KEY").map(|v| &v.change),
+        Some(&crate::pending::Change::Delete)
+    );
 }

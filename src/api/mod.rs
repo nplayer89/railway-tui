@@ -1,6 +1,7 @@
 //! Railway's public GraphQL API over HTTP. Reads live here; the only writes
 //! (five allowlisted mutations) live in [`write`].
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,14 @@ mod ops {
         response_derives = "Debug"
     )]
     pub struct Variables;
+
+    #[derive(GraphQLQuery)]
+    #[graphql(
+        schema_path = "graphql/schema.json",
+        query_path = "graphql/SealedVariables.graphql",
+        response_derives = "Debug"
+    )]
+    pub struct SealedVariables;
 
     #[derive(GraphQLQuery)]
     #[graphql(
@@ -274,6 +283,37 @@ impl Api {
             })
             .await?;
         Ok(data.variables)
+    }
+
+    /// Names of the service's sealed variables. Railway lists them with the
+    /// environment's variables (all services), so the pages are filtered here.
+    pub async fn sealed_variables(
+        &self,
+        env_id: &str,
+        service_id: &str,
+    ) -> Result<BTreeSet<String>, ApiError> {
+        let mut sealed = BTreeSet::new();
+        let mut after = None;
+        loop {
+            let data = self
+                .query::<ops::SealedVariables>(ops::sealed_variables::Variables {
+                    environment_id: env_id.to_string(),
+                    after,
+                })
+                .await?;
+            let page = data.environment.variables;
+            sealed.extend(
+                page.edges
+                    .into_iter()
+                    .map(|e| e.node)
+                    .filter(|n| n.is_sealed && n.service_id.as_deref() == Some(service_id))
+                    .map(|n| n.name),
+            );
+            if !page.page_info.has_next_page {
+                return Ok(sealed);
+            }
+            after = page.page_info.end_cursor;
+        }
     }
 
     /// Branch names of a GitHub repo (`owner/name`), as Railway's GitHub app sees them.

@@ -694,6 +694,8 @@ fn vars_app(env: &str, vars: &[(&str, &str)]) -> App {
             service_id: "svc-1".into(),
             revealed: Default::default(),
             reveal_all: false,
+            sealed: Default::default(),
+            anchor: None,
         }),
     ];
     app.variables.value = Some(

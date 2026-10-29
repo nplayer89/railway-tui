@@ -269,13 +269,34 @@ impl Worker {
                 purpose,
             } => {
                 let (e, s) = (env_id.clone(), service_id.clone());
+                let view = purpose == crate::app::VarsPurpose::View;
                 self.load(
-                    async move { api.variables(&project_id, &e, &s).await },
-                    move |result| DataEvent::Variables {
-                        env_id,
-                        service_id,
-                        purpose,
-                        result: result.map(Secret::new),
+                    async move {
+                        if !view {
+                            return api.variables(&project_id, &e, &s).await.map(|v| (v, None));
+                        }
+                        let (vars, sealed) = tokio::join!(
+                            api.variables(&project_id, &e, &s),
+                            api.sealed_variables(&e, &s)
+                        );
+                        // A failed sealed lookup must not hide the variables.
+                        vars.map(|v| (v, Some(sealed.map_err(|e| e.to_string()))))
+                    },
+                    move |result| match result {
+                        Ok((vars, sealed)) => DataEvent::Variables {
+                            env_id,
+                            service_id,
+                            purpose,
+                            result: Ok(Secret::new(vars)),
+                            sealed,
+                        },
+                        Err(e) => DataEvent::Variables {
+                            env_id,
+                            service_id,
+                            purpose,
+                            result: Err(e),
+                            sealed: None,
+                        },
                     },
                 )
             }
@@ -1874,6 +1895,57 @@ mod tests {
             ["VariableCollectionUpsert", "Variables"],
             "never resent"
         );
+    }
+
+    async fn variables_event(h: &mut Harness) -> DataEvent {
+        loop {
+            match h.next().await {
+                DataEvent::Budget { .. } => continue,
+                event => return event,
+            }
+        }
+    }
+
+    fn load_variables(purpose: crate::app::VarsPurpose) -> Command {
+        Command::LoadVariables {
+            project_id: "p1".into(),
+            env_id: "e1".into(),
+            service_id: "svc".into(),
+            purpose,
+        }
+    }
+
+    #[tokio::test]
+    async fn view_load_reports_sealed_names_for_the_service() {
+        let mut h = Harness::start(None).await;
+        let vars = json!({"data": {"variables": {"A": "1", "S": ""}}});
+        mount(&h.server, "query Variables", 200, vars).await;
+        let node = |name: &str, service: &str, sealed: bool| json!({"node": {"name": name, "serviceId": service, "isSealed": sealed}});
+        let sealed = json!({"data": {"environment": {"variables": {
+            "edges": [node("S", "svc", true), node("A", "svc", false), node("S2", "other", true)],
+            "pageInfo": {"hasNextPage": false, "endCursor": null}
+        }}}});
+        mount(&h.server, "query SealedVariables", 200, sealed).await;
+        h.send(load_variables(crate::app::VarsPurpose::View)).await;
+        let DataEvent::Variables { sealed, .. } = variables_event(&mut h).await else {
+            panic!("expected Variables");
+        };
+        assert_eq!(sealed, Some(Ok(["S".to_string()].into())));
+    }
+
+    #[tokio::test]
+    async fn deploy_load_skips_the_sealed_query() {
+        let mut h = Harness::start(None).await;
+        let vars = json!({"data": {"variables": {"A": "1"}}});
+        mount(&h.server, "query Variables", 200, vars).await;
+        h.send(load_variables(crate::app::VarsPurpose::Deploy))
+            .await;
+        let DataEvent::Variables { sealed, .. } = variables_event(&mut h).await else {
+            panic!("expected Variables");
+        };
+        assert_eq!(sealed, None);
+        let ops: Vec<String> = sent(&h).await.into_iter().map(|(o, _)| o).collect();
+        assert_eq!(ops, ["Variables"]);
     }
 
     #[tokio::test]

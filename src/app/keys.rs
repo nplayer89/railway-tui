@@ -625,6 +625,8 @@ impl App {
 
     fn toggle_delete(&mut self, name: &str, out: &mut Vec<Command>) {
         let (current, pending) = self.var_state(name);
+        // A sealed variable the value map omits still exists on Railway.
+        let current = current.or_else(|| self.sealed_names().contains(name).then(String::new));
         if pending == Some(Change::Delete) {
             self.undo_variable(name, out);
         } else if self.with_target(|p, t| p.delete(t, name, current.as_deref())) {

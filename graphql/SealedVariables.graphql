@@ -1,0 +1,17 @@
+query SealedVariables($environmentId: String!, $after: String) {
+  environment(id: $environmentId) {
+    variables(first: 100, after: $after) {
+      edges {
+        node {
+          name
+          serviceId
+          isSealed
+        }
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+}
