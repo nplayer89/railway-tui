@@ -16,7 +16,7 @@ const SEPARATOR: &str = "\u{e0bc}";
 const ICON_VIM: &str = "\u{e62b}";
 const ICON_FILE: &str = "\u{f15b}";
 const ICON_BRANCH: &str = "\u{e725}";
-const ICON_SITEMAP: &str = "\u{f0e8}";
+const ICON_SITEMAP: &str = "\u{f0631}";
 const ICON_LIST: &str = "\u{f03a}";
 
 /// Widest the environment name field grows before the name scrolls.
