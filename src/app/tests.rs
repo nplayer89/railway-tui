@@ -3301,9 +3301,3 @@ fn cursor_branch_is_none_for_image_deploys_and_unknown_logs() {
     }));
     assert_eq!(app.cursor_branch(), None);
 }
-
-#[test]
-fn workspace_name_resolves_the_current_workspace() {
-    let app = app_in_services(Instant::now());
-    assert_eq!(app.workspace_name(), Some("Team"));
-}

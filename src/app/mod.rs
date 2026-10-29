@@ -943,17 +943,6 @@ impl App {
         deployment?.branch.as_deref()
     }
 
-    /// The name of the current workspace, once the workspace list has loaded.
-    pub fn workspace_name(&self) -> Option<&str> {
-        let id = self.workspace_id.as_deref()?;
-        self.workspaces
-            .value
-            .iter()
-            .flatten()
-            .find(|w| w.id == id)
-            .map(|w| w.name.as_str())
-    }
-
     // ---- data events ----
 
     fn on_data(&mut self, data: DataEvent, now: Instant, out: &mut Vec<Command>) {
