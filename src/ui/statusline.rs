@@ -15,8 +15,12 @@ const SEPARATOR: &str = "\u{e0bc}";
 const ICON_VIM: &str = "\u{e62b}";
 const ICON_FILE: &str = "\u{f15b}";
 const ICON_BRANCH: &str = "\u{e725}";
+const ICON_GLOBE: &str = "\u{f0ac}";
 const ICON_FOLDER: &str = "\u{f07b}";
 const ICON_LIST: &str = "\u{f03a}";
+
+/// Width of the workspace name field in the statusline.
+const WORKSPACE_CELLS: usize = 20;
 
 fn mode_colour(t: &Theme, mode: Mode) -> ratatui::style::Color {
     match mode {
@@ -40,11 +44,28 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+/// `width` chars of `text`: padded when it fits, otherwise a window onto the endless loop
+/// `text` + three spaces, starting `step` chars in. Slices by chars, never bytes.
+pub(super) fn marquee(text: &str, width: usize, step: u64) -> String {
+    let len = text.chars().count();
+    if len <= width {
+        return format!("{text:<width$}");
+    }
+    let period = len + 3;
+    let start = (step % period as u64) as usize;
+    text.chars()
+        .chain("   ".chars())
+        .cycle()
+        .skip(start)
+        .take(width)
+        .collect()
+}
+
 fn width(spans: &[Span]) -> usize {
     Line::from(spans.to_vec()).width()
 }
 
-pub(super) fn draw_statusline(frame: &mut Frame, area: Rect, app: &App) {
+pub(super) fn draw_statusline(frame: &mut Frame, area: Rect, app: &App, step: u64) {
     let t = app.theme();
     let mode = app.mode();
     let colour = mode_colour(t, mode);
@@ -70,21 +91,27 @@ pub(super) fn draw_statusline(frame: &mut Frame, area: Rect, app: &App) {
         ]
     };
     let env_block = app.environment.as_ref().map(|e| {
-        let fg = if is_production(&e.name) {
-            t.bad
+        let style = if is_production(&e.name) {
+            Style::new().fg(t.bad).bg(t.bg).add_modifier(Modifier::BOLD)
         } else {
-            t.muted
+            Style::new().fg(t.text).bg(t.bg)
         };
         vec![Span::styled(
-            format!(" {ICON_BRANCH} {} ", clean(&e.name)),
-            Style::new().fg(fg).bg(t.bg),
+            format!(" {ICON_GLOBE} {} ", clean(&e.name)),
+            style,
         )]
     });
-    let project_block = app.project.as_ref().map(|p| {
+    let branch_block = app.cursor_branch().map(|b| {
+        vec![Span::styled(
+            format!(" {ICON_BRANCH} {} ", clean(b)),
+            Style::new().fg(t.text).bg(t.bg),
+        )]
+    });
+    let workspace_block = app.workspace_name().map(|name| {
         vec![
             Span::styled(format!(" {ICON_FOLDER} "), Style::new().fg(t.bg).bg(t.bad)),
             Span::styled(
-                format!(" {} ", clean(&p.name)),
+                marquee(&clean(name), WORKSPACE_CELLS, step),
                 Style::new().fg(t.text).bg(t.select_bg),
             ),
         ]
@@ -105,11 +132,12 @@ pub(super) fn draw_statusline(frame: &mut Frame, area: Rect, app: &App) {
         )]),
         _ => None,
     };
-    // In drop order: selection count, project, env, position.
-    let mut optional = [count_block, project_block, env_block, position_block];
+    // In drop order: selection count, workspace, branch, position. Mode and env stay.
+    let mut optional = [count_block, workspace_block, branch_block, position_block];
     let max = area.width as usize;
+    let fixed = width(&mode_block) + env_block.as_ref().map_or(0, |b| width(b));
     let total = |optional: &[Option<Vec<Span>>], label: &str| {
-        width(&mode_block)
+        fixed
             + width(&view_block(label))
             + optional.iter().flatten().map(|b| width(b)).sum::<usize>()
     };
@@ -125,12 +153,13 @@ pub(super) fn draw_statusline(frame: &mut Frame, area: Rect, app: &App) {
         let keep = label.chars().count().saturating_sub(over);
         label = truncate(&label, keep);
     }
-    let [count_block, project_block, env_block, position_block] = optional;
+    let [count_block, workspace_block, branch_block, position_block] = optional;
 
     let mut spans = mode_block.clone();
     spans.extend(view_block(&label));
     spans.extend(env_block.iter().flatten().cloned());
-    let right: Vec<Span> = [&count_block, &project_block, &position_block]
+    spans.extend(branch_block.iter().flatten().cloned());
+    let right: Vec<Span> = [&count_block, &workspace_block, &position_block]
         .into_iter()
         .flatten()
         .flatten()
