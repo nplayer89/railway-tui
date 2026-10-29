@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use super::{App, Command, Kind, LogsView, VarInput, View};
+use super::{App, Command, Confirm, Kind, LogsView, VarInput, View};
 use crate::model::LogKind;
 use crate::pending::{Change, Pending, Target};
 use crate::status::default_log_kind;
@@ -23,6 +23,8 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             out.push(Command::Quit);
+        } else if self.confirm.is_some() {
+            self.confirm_key(key.code, out);
         } else if self.var_input.is_some() {
             self.var_input_key(key, out);
         } else if self.command_line.is_some() {
@@ -97,6 +99,11 @@ impl App {
                         Some(id) => self.open_variables(id, now, out),
                         None => self.message = Some("no service selected".into()),
                     }
+                }
+            }
+            "pending" => {
+                if self.goto_services(out) {
+                    self.open_pending(out);
                 }
             }
             "theme" => self.theme_picker = Some(self.theme),
@@ -184,6 +191,7 @@ impl App {
             Kind::Deployments => self.deployments_key(code, out),
             Kind::Instances => self.instances_key(code, out),
             Kind::Variables => self.variables_key(code, out),
+            Kind::Pending => self.pending_key(code),
             Kind::Logs => self.logs_key(code, out),
         };
         if handled {
@@ -227,6 +235,7 @@ impl App {
                 Some(id) => self.open_variables(id, now, out),
                 None => self.message = Some("no service selected".into()),
             },
+            KeyCode::Char('p') => self.open_pending(out),
             KeyCode::Char('e') => self.open_env_picker(now, out),
             _ => return false,
         }
@@ -343,6 +352,7 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('p') => self.open_pending(out),
             KeyCode::Char('R') => {
                 if let Some(View::Variables(v)) = self.stack.last_mut() {
                     v.reveal_all = !v.reveal_all;
@@ -351,6 +361,44 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    fn pending_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                if let Some(View::Pending(v)) = self.stack.last_mut() {
+                    v.reveal_all = !v.reveal_all;
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(g) = self.selected_group() {
+                    self.confirm = Some(Confirm::Discard {
+                        env_id: g.env_id,
+                        service_id: g.service_id,
+                    });
+                }
+            }
+            KeyCode::Char('D') => match self.selected_group() {
+                Some(g) if g.orphaned => {
+                    self.message = Some("cannot deploy: the environment no longer exists".into());
+                }
+                Some(_) => self.message = Some("deploy: not yet available".into()),
+                None => {}
+            },
+            _ => return false,
+        }
+        true
+    }
+
+    /// `y` answers the question; any other key cancels it.
+    fn confirm_key(&mut self, code: KeyCode, out: &mut Vec<Command>) {
+        let Some(Confirm::Discard { env_id, service_id }) = self.confirm.take() else {
+            return;
+        };
+        if code == KeyCode::Char('y') {
+            self.pending.discard(&env_id, &service_id);
+            out.push(Command::SavePending(self.pending.clone()));
+        }
     }
 
     /// Keys while a variable name or value is being typed.

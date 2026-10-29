@@ -11,10 +11,10 @@ use super::{clean, is_production};
 use crate::app::{App, VarRow, VarsView};
 use crate::pending::Change;
 
-const HIDDEN: &str = "••••••";
+pub(super) const HIDDEN: &str = "••••••";
 
 /// The value as shown: dots while hidden, otherwise the first line, cleaned.
-fn shown(value: &str, revealed: bool) -> String {
+pub(super) fn shown(value: &str, revealed: bool) -> String {
     if !revealed {
         return HIDDEN.into();
     }

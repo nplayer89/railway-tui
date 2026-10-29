@@ -50,6 +50,7 @@ pub enum View {
     Instances { service_id: String },
     Logs(LogsView),
     Variables(VarsView),
+    Pending(PendingView),
 }
 
 /// The Variables view of one service. Dropping it re-hides every value.
@@ -59,6 +60,34 @@ pub struct VarsView {
     /// Names whose value is shown.
     pub revealed: BTreeSet<String>,
     pub reveal_all: bool,
+}
+
+/// The review of every pending change in the open project.
+#[derive(Debug, Default)]
+pub struct PendingView {
+    pub reveal_all: bool,
+}
+
+/// One service's pending changes in one environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingGroup {
+    pub env_id: String,
+    pub service_id: String,
+    /// The environment is not in the loaded list, so nothing can be written to it.
+    pub orphaned: bool,
+}
+
+impl PendingGroup {
+    /// The selection key of this group.
+    pub fn id(&self) -> String {
+        format!("{}/{}", self.env_id, self.service_id)
+    }
+}
+
+/// A question waiting for `y`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Confirm {
+    Discard { env_id: String, service_id: String },
 }
 
 #[derive(Debug)]
@@ -201,6 +230,7 @@ pub struct Selection {
     pub deployment: Option<String>,
     pub instance: Option<String>,
     pub variable: Option<String>,
+    pub pending: Option<String>,
 }
 
 pub struct App {
@@ -222,6 +252,8 @@ pub struct App {
     pub selection: Selection,
     /// The variable name or value being typed in the Variables view.
     pub var_input: Option<VarInput>,
+    /// The question being asked, answered with `y` or any other key.
+    pub confirm: Option<Confirm>,
     /// Applied name filter for the current table view (cleared on view change).
     pub table_filter: Option<String>,
     /// Filter text being typed after `/` (table or logs, by the top view).
@@ -274,6 +306,7 @@ impl App {
             pending,
             selection: Selection::default(),
             var_input: None,
+            confirm: None,
             table_filter: None,
             filter_input: None,
             command_line: None,
@@ -403,6 +436,51 @@ impl App {
         rows.into_values()
             .filter(|r| self.passes_filter(&[r.name]))
             .collect()
+    }
+
+    /// Pending changes of the open project: the current environment first, then the
+    /// others by name, and by service name within each.
+    pub fn pending_groups(&self) -> Vec<PendingGroup> {
+        let Some(project_id) = self.project_id() else {
+            return Vec::new();
+        };
+        let current = self.env_id();
+        let loaded = self.environments.value.as_deref();
+        let mut found: Vec<(bool, &str, &str, &str, &str)> = Vec::new();
+        for (env_id, services) in &self.pending.envs {
+            for (service_id, sp) in services {
+                if sp.project_id == project_id {
+                    found.push((
+                        current != Some(env_id.as_str()),
+                        &sp.env_name,
+                        &sp.service_name,
+                        env_id,
+                        service_id,
+                    ));
+                }
+            }
+        }
+        found.sort();
+        found
+            .into_iter()
+            .map(|(_, _, _, env_id, service_id)| PendingGroup {
+                env_id: env_id.to_string(),
+                service_id: service_id.to_string(),
+                orphaned: loaded.is_some_and(|l| !l.iter().any(|e| e.id == env_id)),
+            })
+            .collect()
+    }
+
+    fn selected_group(&self) -> Option<PendingGroup> {
+        let groups = self.pending_groups();
+        let ids: Vec<String> = groups.iter().map(|g| g.id()).collect();
+        let i = position(&ids, self.selection.pending.as_deref());
+        groups.into_iter().nth(i)
+    }
+
+    fn open_pending(&mut self, out: &mut Vec<Command>) {
+        self.selection.pending = None;
+        self.push(View::Pending(PendingView::default()), out);
     }
 
     /// The active theme (the previewed one while the picker is open).
@@ -663,7 +741,7 @@ impl App {
                 self.requested.variables,
                 self.variables.loading,
             ),
-            Kind::Logs => return,
+            Kind::Pending | Kind::Logs => return,
         };
         let last = fetched_at.max(requested);
         if !loading && last.is_some_and(|t| t + self.backstop <= now) {
@@ -690,6 +768,7 @@ impl App {
                     self.load_variables(id, now, out);
                 }
             }
+            Kind::Pending => {}
             Kind::Logs => self.reopen_logs(None, out),
         }
     }
@@ -999,6 +1078,7 @@ impl App {
                 .iter()
                 .map(|r| r.name.to_string())
                 .collect(),
+            Kind::Pending => self.pending_groups().iter().map(|g| g.id()).collect(),
             Kind::Logs => Vec::new(),
         }
     }
@@ -1010,6 +1090,7 @@ impl App {
             Kind::Deployments => Some(&self.selection.deployment),
             Kind::Instances => Some(&self.selection.instance),
             Kind::Variables => Some(&self.selection.variable),
+            Kind::Pending => Some(&self.selection.pending),
             Kind::Logs => None,
         }
     }
@@ -1021,6 +1102,7 @@ impl App {
             Kind::Deployments => Some(&mut self.selection.deployment),
             Kind::Instances => Some(&mut self.selection.instance),
             Kind::Variables => Some(&mut self.selection.variable),
+            Kind::Pending => Some(&mut self.selection.pending),
             Kind::Logs => None,
         }
     }
@@ -1064,6 +1146,7 @@ impl App {
             Some(View::Instances { .. }) => Kind::Instances,
             Some(View::Logs(_)) => Kind::Logs,
             Some(View::Variables(_)) => Kind::Variables,
+            Some(View::Pending(_)) => Kind::Pending,
         }
     }
 
@@ -1157,6 +1240,7 @@ enum Kind {
     Deployments,
     Instances,
     Variables,
+    Pending,
     Logs,
 }
 
@@ -2593,5 +2677,157 @@ mod tests {
         let mut app = app_in_variables(now);
         app.update(key('a'), now);
         assert_eq!(app.update(ctrl('c'), now), vec![Command::Quit]);
+    }
+
+    // ---- review screen ----
+
+    fn add_pending(app: &mut App, env: (&str, &str), svc: (&str, &str), name: &str, v: &str) {
+        let sp = app
+            .pending
+            .envs
+            .entry(env.0.into())
+            .or_default()
+            .entry(svc.0.into())
+            .or_default();
+        sp.project_id = "p2".into();
+        sp.env_name = env.1.into();
+        sp.service_name = svc.1.into();
+        sp.vars.insert(
+            name.into(),
+            crate::pending::PendingVar {
+                change: crate::pending::Change::Set { value: v.into() },
+                base: None,
+                applied: false,
+            },
+        );
+    }
+
+    /// Three groups in two environments plus another project's, then the review open.
+    fn app_in_review(now: Instant) -> App {
+        let mut app = app_in_services(now);
+        add_pending(&mut app, ("e-stg", "staging"), ("s1", "web"), "A", "1");
+        add_pending(
+            &mut app,
+            ("e-prod", "production"),
+            ("s2", "worker"),
+            "B",
+            "2",
+        );
+        add_pending(&mut app, ("e-prod", "production"), ("s1", "api"), "C", "3");
+        add_pending(&mut app, ("e-x", "other"), ("s1", "api"), "D", "4");
+        app.pending
+            .envs
+            .get_mut("e-x")
+            .unwrap()
+            .get_mut("s1")
+            .unwrap()
+            .project_id = "p9".into();
+        app.update(key('p'), now);
+        assert!(matches!(app.stack.last(), Some(View::Pending(_))));
+        app
+    }
+
+    #[test]
+    fn review_lists_all_envs_current_first() {
+        let now = Instant::now();
+        let app = app_in_review(now);
+        assert_eq!(app.environment.as_ref().unwrap().id, "e-prod");
+        let ids: Vec<(String, String)> = app
+            .pending_groups()
+            .into_iter()
+            .map(|g| (g.env_id, g.service_id))
+            .collect();
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            ids,
+            [
+                pair("e-prod", "s1"),
+                pair("e-prod", "s2"),
+                pair("e-stg", "s1")
+            ]
+        );
+    }
+
+    #[test]
+    fn review_selection_moves_between_groups() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        assert_eq!(app.selected_index(), Some(0));
+        app.update(key('j'), now);
+        app.update(key('j'), now);
+        app.update(key('j'), now);
+        assert_eq!(app.selected_index(), Some(2));
+    }
+
+    #[test]
+    fn orphaned_group_is_labelled_and_cannot_deploy() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        add_pending(&mut app, ("e-gone", "preview"), ("s1", "web"), "Z", "9");
+        let groups = app.pending_groups();
+        assert_eq!(groups.iter().filter(|g| g.orphaned).count(), 1);
+        // Current env first, then "preview" before "staging".
+        assert!(groups[2].orphaned && groups[2].env_id == "e-gone");
+        for _ in 0..2 {
+            app.update(key('j'), now);
+        }
+        app.update(key('D'), now);
+        assert!(app.message.is_some());
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn discard_requires_y() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        app.update(key('x'), now);
+        assert_eq!(
+            app.confirm,
+            Some(Confirm::Discard {
+                env_id: "e-prod".into(),
+                service_id: "s1".into()
+            })
+        );
+        assert!(app.update(key('n'), now).is_empty());
+        assert!(app.confirm.is_none());
+        assert_eq!(app.pending_groups().len(), 3);
+
+        app.update(key('x'), now);
+        let cmds = app.update(key('y'), now);
+        assert!(app.confirm.is_none());
+        assert_eq!(app.pending_groups().len(), 2);
+        assert!(
+            matches!(cmds.as_slice(), [Command::SavePending(p)] if p.service("e-prod", "s1").is_none())
+        );
+    }
+
+    #[test]
+    fn pending_command_and_p_from_variables_open_review() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        app.update(key('p'), now);
+        assert!(matches!(app.stack.last(), Some(View::Pending(_))));
+        app.update(code(KeyCode::Esc), now);
+        assert!(matches!(app.stack.last(), Some(View::Variables(_))));
+        let mut app = app_in_services(now);
+        app.update(key(':'), now);
+        typed(&mut app, "pending", now);
+        app.update(code(KeyCode::Enter), now);
+        assert!(matches!(app.stack.last(), Some(View::Pending(_))));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn review_r_and_R_toggle_reveal_all() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        let all = |app: &App| match app.stack.last() {
+            Some(View::Pending(v)) => v.reveal_all,
+            _ => panic!(),
+        };
+        app.update(key('r'), now);
+        assert!(all(&app));
+        app.update(key('R'), now);
+        assert!(!all(&app));
     }
 }

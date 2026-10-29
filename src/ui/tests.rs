@@ -849,3 +849,67 @@ fn footer_shows_variable_input() {
     });
     assert!(row_text(&render(&app, Instant::now()), 29).contains("A = val▏"));
 }
+
+fn review_app() -> App {
+    let mut app = vars_app("production", &[]);
+    app.environments.value = Some(vec![crate::model::Environment {
+        id: "e1".into(),
+        name: "production".into(),
+    }]);
+    let set = |value: &str| crate::pending::Change::Set {
+        value: value.into(),
+    };
+    add_pending(&mut app, "NEW", set("newsecret"), None);
+    add_pending(&mut app, "CHG", set("after"), Some("before"));
+    add_pending(
+        &mut app,
+        "GONE",
+        crate::pending::Change::Delete,
+        Some("oldsecret"),
+    );
+    let sp = app
+        .pending
+        .envs
+        .get_mut("e1")
+        .unwrap()
+        .get_mut("svc-1")
+        .unwrap();
+    sp.env_name = "production".into();
+    sp.service_name = "api".into();
+    sp.vars.get_mut("CHG").unwrap().applied = true;
+    app.stack.push(View::Pending(Default::default()));
+    app
+}
+
+#[test]
+fn review_values_hidden_until_revealed() {
+    let mut app = review_app();
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("ENV production"), "{t}");
+    assert!(t.contains("partly written"), "{t}");
+    assert!(t.contains("+ NEW"), "{t}");
+    assert!(t.contains("~ CHG"), "{t}");
+    assert!(t.contains("- GONE"), "{t}");
+    assert!(t.contains('✓'), "{t}");
+    for secret in ["newsecret", "after", "before", "oldsecret"] {
+        assert!(!t.contains(secret), "{t}");
+    }
+    press(&mut app, 'r');
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("before → after"), "{t}");
+    assert!(t.contains("newsecret") && t.contains("oldsecret"), "{t}");
+}
+
+#[test]
+fn review_orphan_label_and_discard_prompt() {
+    let mut app = review_app();
+    app.environments.value = Some(vec![]);
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("(environment no longer exists)"), "{t}");
+    press(&mut app, 'x');
+    let t = text(&render(&app, Instant::now()));
+    assert!(
+        t.contains("Discard pending changes for api in production? (y/n)"),
+        "{t}"
+    );
+}
