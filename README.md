@@ -19,6 +19,8 @@ your unsent variable changes).
 
 Requires a Rust toolchain.
 
+Icons need a Nerd Font (v3) in your terminal.
+
 ```sh
 cargo install --path .
 ```

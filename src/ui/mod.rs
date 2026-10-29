@@ -2,6 +2,7 @@
 
 mod logs;
 mod pending;
+mod statusline;
 mod tables;
 #[cfg(test)]
 mod tests;
@@ -48,9 +49,10 @@ pub fn is_production(env_name: &str) -> bool {
 pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
     let t = app.theme();
     frame.render_widget(Block::new().style(base(t)), frame.area());
-    let [head, body, foot] = Layout::vertical([
+    let [head, body, status, cmd] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(0),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(frame.area());
@@ -71,7 +73,8 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
         Some(View::Variables(v)) => vars::draw(frame, body, app, v),
         Some(View::Projects) | None => tables::projects(frame, body, app),
     }
-    draw_footer(frame, foot, app);
+    statusline::draw_statusline(frame, status, app);
+    statusline::draw_cmdline(frame, cmd, app);
 
     if app.help {
         draw_help(frame, body, t);
@@ -84,7 +87,7 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
         }
         Some(Modal::BranchPicker(picker)) => draw_branch_picker(frame, body, app, picker),
         Some(Modal::Confirm(Confirm::DeployLatest(c))) => draw_latest_confirm(frame, body, app, c),
-        // Drawn in the footer.
+        // Drawn in the command line.
         Some(Modal::Confirm(Confirm::Discard { .. }))
         | Some(Modal::VarInput(_))
         | Some(Modal::Command(_))
@@ -218,73 +221,6 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
         ));
     }
     frame.render_widget(Paragraph::new(vec![line1, Line::from(spans)]), area);
-}
-
-fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let t = app.theme();
-    match &app.modal {
-        Some(Modal::Confirm(Confirm::Discard { env_id, service_id })) => {
-            let sp = app.pending.service(env_id, service_id);
-            let service = sp.map_or(service_id.as_str(), |s| s.service_name.as_str());
-            let env = sp.map_or(env_id.as_str(), |s| s.env_name.as_str());
-            let line = format!(
-                "Discard pending changes for {} in {}? (y/n)",
-                clean(service),
-                clean(env)
-            );
-            frame.render_widget(Paragraph::new(line).style(Style::new().fg(t.busy)), area);
-            return;
-        }
-        Some(Modal::VarInput(input)) => {
-            let line = match &input.name {
-                None => format!("name: {}▏", clean(input.text.expose())),
-                Some(name) => format!("{} = {}▏", clean(name), clean(input.text.expose())),
-            };
-            frame.render_widget(Paragraph::new(line), area);
-            return;
-        }
-        Some(Modal::Command(text)) => {
-            frame.render_widget(Paragraph::new(format!(":{}▏", clean(text))), area);
-            return;
-        }
-        Some(Modal::Filter(text)) => {
-            frame.render_widget(Paragraph::new(format!("/{}▏", clean(text))), area);
-            return;
-        }
-        _ => {}
-    }
-    let mut crumbs = vec!["projects".to_string()];
-    for view in app.stack.iter().skip(1) {
-        crumbs.push(match view {
-            View::Projects => "projects".into(),
-            View::Services => app
-                .project
-                .as_ref()
-                .map_or("services".into(), |p| clean(&p.name)),
-            View::Deployments { .. } => "deployments".into(),
-            View::Instances { .. } => "instances".into(),
-            View::Variables(_) => "variables".into(),
-            View::Pending(_) => "pending".into(),
-            View::Logs(_) => "logs".into(),
-        });
-    }
-    let mut spans = vec![Span::styled(
-        format!(" {} ", crumbs.join(" > ")),
-        Style::new().fg(t.bg).bg(t.accent),
-    )];
-    if let Some(filter) = &app.table_filter {
-        spans.push(Span::styled(
-            format!(" filter: {}", clean(filter)),
-            Style::new().fg(t.hint),
-        ));
-    }
-    if let Some(msg) = &app.message {
-        spans.push(Span::styled(
-            format!("  {}", clean(msg)),
-            Style::new().fg(t.busy),
-        ));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Default text on the theme background.

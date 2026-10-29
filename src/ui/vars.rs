@@ -48,19 +48,13 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, view: &VarsView) {
     let env = app.environment.as_ref().map_or("-", |e| e.name.as_str());
     let env_colour = if is_production(env) { t.bad } else { t.accent };
     let visual = app.visual_range();
-    let mut spans = vec![
+    let spans = vec![
         Span::styled(
             format!("{} · variables · ENV ", clean(service)),
             fg(t.accent).add_modifier(Modifier::BOLD),
         ),
         Span::styled(clean(env), fg(env_colour).add_modifier(Modifier::BOLD)),
     ];
-    if visual.is_some() {
-        spans.push(Span::styled(
-            " -- VISUAL --",
-            fg(t.hint).add_modifier(Modifier::BOLD),
-        ));
-    }
     frame.render_widget(Paragraph::new(ratatui::text::Line::from(spans)), title);
 
     let selected = app.selected_index();
