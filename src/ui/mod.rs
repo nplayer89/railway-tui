@@ -77,6 +77,9 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
     if app.theme_picker.is_some() {
         draw_theme_picker(frame, body, app);
     }
+    if let Some(Confirm::Deploy(d)) = &app.confirm {
+        pending::draw_deploy_confirm(frame, body, app, d);
+    }
 }
 
 fn hints(app: &App) -> &'static str {

@@ -1,5 +1,6 @@
 //! App state machine: `update(event, now) -> commands`. No IO, no rendering.
 
+mod deploy;
 mod keys;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -88,6 +89,58 @@ impl PendingGroup {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Confirm {
     Discard { env_id: String, service_id: String },
+    Deploy(DeployConfirm),
+}
+
+/// Deploying one pending group. The ids come from the group, never from the
+/// open project or environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployConfirm {
+    pub env_id: String,
+    pub service_id: String,
+    /// Names changed on Railway since they were edited.
+    pub drift: Vec<String>,
+}
+
+/// Why variables were loaded: for the Variables view, to check a deploy
+/// before confirming it, or to find out what an interrupted write applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VarsPurpose {
+    View,
+    Deploy,
+    Reconcile,
+}
+
+/// One finished step of a deploy, reported by the worker as it goes.
+/// Error texts are Railway's messages; they never hold a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeployStep {
+    Upserted,
+    Deleted(String),
+    Redeployed,
+    Failed {
+        during: Phase,
+        error: String,
+        /// Sent, but Railway may or may not have applied it.
+        unknown: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Phase {
+    Upsert,
+    Delete(String),
+    Redeploy,
+}
+
+impl fmt::Display for Phase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Phase::Upsert => f.write_str("upsert"),
+            Phase::Delete(name) => write!(f, "delete {name}"),
+            Phase::Redeploy => f.write_str("redeploy"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -131,7 +184,13 @@ pub enum DataEvent {
     Variables {
         env_id: String,
         service_id: String,
+        purpose: VarsPurpose,
         result: Result<Variables, String>,
+    },
+    Deploy {
+        env_id: String,
+        service_id: String,
+        step: DeployStep,
     },
     /// Saving the pending file failed; the text never holds a value.
     SaveFailed(String),
@@ -176,8 +235,20 @@ pub enum Command {
         project_id: String,
         env_id: String,
         service_id: String,
+        purpose: VarsPurpose,
     },
     SavePending(Pending),
+    /// Writes one group's unapplied changes, then redeploys: upsert (skipped
+    /// when `upserts` is empty), each delete, then the redeploy, stopping at
+    /// the first failure. `redeploy_only` skips the writes.
+    DeployService {
+        project_id: String,
+        env_id: String,
+        service_id: String,
+        upserts: Variables,
+        deletes: Vec<String>,
+        redeploy_only: bool,
+    },
     /// Handled by the main loop, not the worker: edit `initial` in `$VISUAL`/`$EDITOR`.
     EditExternal {
         name: String,
@@ -254,6 +325,8 @@ pub struct App {
     pub var_input: Option<VarInput>,
     /// The question being asked, answered with `y` or any other key.
     pub confirm: Option<Confirm>,
+    /// Deploys sent to the worker and not finished, by (env id, service id).
+    deploys: BTreeMap<(String, String), deploy::Sent>,
     /// Applied name filter for the current table view (cleared on view change).
     pub table_filter: Option<String>,
     /// Filter text being typed after `/` (table or logs, by the top view).
@@ -307,6 +380,7 @@ impl App {
             selection: Selection::default(),
             var_input: None,
             confirm: None,
+            deploys: BTreeMap::new(),
             table_filter: None,
             filter_input: None,
             command_line: None,
@@ -549,15 +623,25 @@ impl App {
             DataEvent::Variables {
                 env_id,
                 service_id,
+                purpose,
                 result,
-            } => {
-                if self.env_id() != Some(env_id.as_str())
-                    || self.view_service_id(Kind::Variables) != Some(service_id.as_str())
-                {
-                    return;
+            } => match purpose {
+                VarsPurpose::View => {
+                    if self.env_id() != Some(env_id.as_str())
+                        || self.view_service_id(Kind::Variables) != Some(service_id.as_str())
+                    {
+                        return;
+                    }
+                    self.variables.finish(result, now);
                 }
-                self.variables.finish(result, now);
-            }
+                VarsPurpose::Deploy => self.on_deploy_check(env_id, service_id, result),
+                VarsPurpose::Reconcile => self.on_reconcile(env_id, service_id, result, out),
+            },
+            DataEvent::Deploy {
+                env_id,
+                service_id,
+                step,
+            } => self.on_deploy_step(env_id, service_id, step, now, out),
             DataEvent::SaveFailed(message) => self.message = Some(message),
             DataEvent::Edited { name, result } => match result {
                 Ok(value) => self.set_variable(&name, value, out),
@@ -821,6 +905,7 @@ impl App {
             project_id: project_id.to_string(),
             env_id: env_id.to_string(),
             service_id,
+            purpose: VarsPurpose::View,
         });
         self.variables.loading = true;
         self.requested.variables = Some(now);
@@ -1297,6 +1382,7 @@ impl fmt::Debug for DataEvent {
             DataEvent::Variables {
                 env_id,
                 service_id,
+                purpose,
                 result,
             } => {
                 let shown = match result {
@@ -1306,9 +1392,20 @@ impl fmt::Debug for DataEvent {
                 f.debug_struct("Variables")
                     .field("env_id", env_id)
                     .field("service_id", service_id)
+                    .field("purpose", purpose)
                     .field("result", &format_args!("{shown}"))
                     .finish()
             }
+            DataEvent::Deploy {
+                env_id,
+                service_id,
+                step,
+            } => f
+                .debug_struct("Deploy")
+                .field("env_id", env_id)
+                .field("service_id", service_id)
+                .field("step", step)
+                .finish(),
             DataEvent::SaveFailed(m) => f.debug_tuple("SaveFailed").field(m).finish(),
             DataEvent::Edited { name, result } => f
                 .debug_struct("Edited")
@@ -1378,13 +1475,31 @@ impl fmt::Debug for Command {
                 project_id,
                 env_id,
                 service_id,
+                purpose,
             } => f
                 .debug_struct("LoadVariables")
                 .field("project_id", project_id)
                 .field("env_id", env_id)
                 .field("service_id", service_id)
+                .field("purpose", purpose)
                 .finish(),
             Command::SavePending(p) => f.debug_tuple("SavePending").field(p).finish(),
+            Command::DeployService {
+                project_id,
+                env_id,
+                service_id,
+                upserts,
+                deletes,
+                redeploy_only,
+            } => f
+                .debug_struct("DeployService")
+                .field("project_id", project_id)
+                .field("env_id", env_id)
+                .field("service_id", service_id)
+                .field("upserts", &upserts.keys().collect::<Vec<_>>())
+                .field("deletes", deletes)
+                .field("redeploy_only", redeploy_only)
+                .finish(),
             Command::EditExternal { name, .. } => f
                 .debug_struct("EditExternal")
                 .field("name", name)
@@ -2292,6 +2407,7 @@ mod tests {
         DataEvent::Variables {
             env_id: "e-prod".into(),
             service_id: service_id.into(),
+            purpose: VarsPurpose::View,
             result,
         }
     }
@@ -2330,6 +2446,7 @@ mod tests {
                     project_id: "p2".into(),
                     env_id: "e-prod".into(),
                     service_id: "svc-a".into(),
+                    purpose: VarsPurpose::View,
                 },
             ]
         );
@@ -2829,5 +2946,350 @@ mod tests {
         assert!(all(&app));
         app.update(key('R'), now);
         assert!(!all(&app));
+    }
+
+    // ---- deploy ----
+
+    fn deploy_vars_event(env_id: &str, service_id: &str, current: Variables) -> DataEvent {
+        DataEvent::Variables {
+            env_id: env_id.into(),
+            service_id: service_id.into(),
+            purpose: VarsPurpose::Deploy,
+            result: Ok(current),
+        }
+    }
+
+    fn step(env_id: &str, service_id: &str, step: DeployStep) -> DataEvent {
+        DataEvent::Deploy {
+            env_id: env_id.into(),
+            service_id: service_id.into(),
+            step,
+        }
+    }
+
+    fn sp_mut<'a>(
+        app: &'a mut App,
+        env: &str,
+        svc: &str,
+    ) -> &'a mut crate::pending::ServicePending {
+        app.pending.envs.get_mut(env).unwrap().get_mut(svc).unwrap()
+    }
+
+    /// The review open on (e-prod, s1 "api"): `D`, the check's reply, then `y`.
+    fn deploy_first_group(app: &mut App, current: Variables, now: Instant) -> Vec<Command> {
+        let cmds = app.update(key('D'), now);
+        assert_eq!(
+            cmds,
+            vec![Command::LoadVariables {
+                project_id: "p2".into(),
+                env_id: "e-prod".into(),
+                service_id: "s1".into(),
+                purpose: VarsPurpose::Deploy,
+            }]
+        );
+        assert!(app.confirm.is_none(), "no confirm before Railway is read");
+        assert!(data(app, deploy_vars_event("e-prod", "s1", current), now).is_empty());
+        assert!(matches!(app.confirm, Some(Confirm::Deploy(_))));
+        app.update(key('y'), now)
+    }
+
+    fn deploy_cmd(cmds: &[Command]) -> (Variables, Vec<String>, bool) {
+        match cmds {
+            [Command::DeployService {
+                upserts,
+                deletes,
+                redeploy_only,
+                ..
+            }] => (upserts.clone(), deletes.clone(), *redeploy_only),
+            other => panic!("expected one DeployService, got {other:?}"),
+        }
+    }
+
+    fn delete_var(base: &str) -> PendingVar {
+        PendingVar {
+            change: crate::pending::Change::Delete,
+            base: Some(base.into()),
+            applied: false,
+        }
+    }
+
+    #[test]
+    fn deploy_targets_group_not_current_env() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        // Switch to staging and queue an edit there.
+        app.update(key('e'), now);
+        app.update(key('k'), now);
+        app.update(code(KeyCode::Enter), now);
+        assert_eq!(app.env_id(), Some("e-stg"));
+        data(&mut app, services_event("e-stg", Ok(services())), now);
+        app.update(key('v'), now);
+        app.update(key('a'), now);
+        typed(&mut app, "NEW", now);
+        app.update(code(KeyCode::Enter), now);
+        typed(&mut app, "v", now);
+        app.update(code(KeyCode::Enter), now);
+        assert!(app.pending.service("e-stg", "svc-a").is_some());
+        // Back to production, then deploy the staging group from the review.
+        app.update(code(KeyCode::Esc), now);
+        app.update(key('e'), now);
+        app.update(key('j'), now);
+        app.update(code(KeyCode::Enter), now);
+        assert_eq!(app.env_id(), Some("e-prod"));
+        app.update(key('p'), now);
+        let cmds = app.update(key('D'), now);
+        assert_eq!(
+            cmds,
+            vec![Command::LoadVariables {
+                project_id: "p2".into(),
+                env_id: "e-stg".into(),
+                service_id: "svc-a".into(),
+                purpose: VarsPurpose::Deploy,
+            }]
+        );
+        data(
+            &mut app,
+            deploy_vars_event("e-stg", "svc-a", vars(&[])),
+            now,
+        );
+        let cmds = app.update(key('y'), now);
+        assert_eq!(
+            cmds,
+            vec![Command::DeployService {
+                project_id: "p2".into(),
+                env_id: "e-stg".into(),
+                service_id: "svc-a".into(),
+                upserts: vars(&[("NEW", "v")]),
+                deletes: vec![],
+                redeploy_only: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn drift_listed_in_confirm() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        let set = |v: &str, base: &str, applied| PendingVar {
+            change: crate::pending::Change::Set { value: v.into() },
+            base: Some(base.into()),
+            applied,
+        };
+        let sp = sp_mut(&mut app, "e-prod", "s1");
+        sp.vars.insert("X".into(), set("new", "old", false));
+        sp.vars.insert("Y".into(), delete_var("keep"));
+        sp.vars.insert("Z".into(), set("new", "same", false));
+        sp.vars.insert("W".into(), set("new", "b", true));
+        app.update(key('D'), now);
+        // C was added and now exists; X changed; Y is gone; Z is as edited; W is already applied.
+        let current = vars(&[("C", "theirs"), ("X", "other"), ("Z", "same"), ("W", "new")]);
+        data(&mut app, deploy_vars_event("e-prod", "s1", current), now);
+        assert_eq!(
+            app.confirm,
+            Some(Confirm::Deploy(DeployConfirm {
+                env_id: "e-prod".into(),
+                service_id: "s1".into(),
+                drift: vec!["C".into(), "X".into(), "Y".into()],
+            }))
+        );
+    }
+
+    #[test]
+    fn only_y_deploys() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        for cancel in [key('n'), key('Y'), code(KeyCode::Enter), code(KeyCode::Esc)] {
+            app.update(key('D'), now);
+            data(&mut app, deploy_vars_event("e-prod", "s1", vars(&[])), now);
+            assert!(app.confirm.is_some());
+            assert!(app.update(cancel, now).is_empty());
+            assert!(app.confirm.is_none());
+        }
+        assert!(matches!(app.stack.last(), Some(View::Pending(_))));
+        let cmds = deploy_first_group(&mut app, vars(&[]), now);
+        assert_eq!(deploy_cmd(&cmds), (vars(&[("C", "3")]), vec![], false));
+    }
+
+    #[test]
+    fn d_refused_without_environments_or_while_deploying() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        let envs = app.environments.value.take();
+        assert!(app.update(key('D'), now).is_empty());
+        assert!(app.message.as_deref().unwrap().contains("not loaded"));
+        app.environments.value = envs;
+        deploy_first_group(&mut app, vars(&[]), now);
+        assert!(app.update(key('D'), now).is_empty());
+        assert!(app
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("already deploying"));
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn steps_mark_applied_then_redeployed_discards_and_reloads() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        add_pending(&mut app, ("e-prod", "production"), ("s1", "api"), "N", "n");
+        sp_mut(&mut app, "e-prod", "s1")
+            .vars
+            .insert("OLD".into(), delete_var("x"));
+        let cmds = deploy_first_group(&mut app, vars(&[("OLD", "x")]), now);
+        assert_eq!(
+            deploy_cmd(&cmds),
+            (vars(&[("C", "3"), ("N", "n")]), vec!["OLD".into()], false)
+        );
+        let cmds = data(&mut app, step("e-prod", "s1", DeployStep::Upserted), now);
+        let sp = app.pending.service("e-prod", "s1").unwrap();
+        assert!(sp.vars["C"].applied && sp.vars["N"].applied && !sp.vars["OLD"].applied);
+        assert!(!sp.written_not_deployed);
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(p)] if p == &app.pending));
+        let deleted = DeployStep::Deleted("OLD".into());
+        let cmds = data(&mut app, step("e-prod", "s1", deleted), now);
+        let sp = app.pending.service("e-prod", "s1").unwrap();
+        assert!(sp.vars.values().all(|v| v.applied) && sp.written_not_deployed);
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(p)] if p == &app.pending));
+        let cmds = data(&mut app, step("e-prod", "s1", DeployStep::Redeployed), now);
+        assert!(app.pending.service("e-prod", "s1").is_none());
+        assert_eq!(app.message.as_deref(), Some("deployed api to production"));
+        assert!(matches!(cmds.first(), Some(Command::SavePending(p)) if p == &app.pending));
+        assert!(cmds.contains(&load_services("e-prod")), "{cmds:?}");
+    }
+
+    #[test]
+    fn edit_during_deploy_is_not_marked_applied() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        deploy_first_group(&mut app, vars(&[]), now);
+        // C is edited again while its upsert is on the way.
+        sp_mut(&mut app, "e-prod", "s1")
+            .vars
+            .get_mut("C")
+            .unwrap()
+            .change = crate::pending::Change::Set { value: "4".into() };
+        data(&mut app, step("e-prod", "s1", DeployStep::Upserted), now);
+        assert!(!app.pending.service("e-prod", "s1").unwrap().vars["C"].applied);
+        data(&mut app, step("e-prod", "s1", DeployStep::Redeployed), now);
+        let sp = app.pending.service("e-prod", "s1").unwrap();
+        assert_eq!(sp.vars.len(), 1, "the unsent edit is kept");
+        assert!(!sp.written_not_deployed);
+    }
+
+    #[test]
+    fn redeploy_failure_retry_is_redeploy_only() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        deploy_first_group(&mut app, vars(&[]), now);
+        data(&mut app, step("e-prod", "s1", DeployStep::Upserted), now);
+        let failed = DeployStep::Failed {
+            during: Phase::Redeploy,
+            error: "Railway API returned HTTP 400".into(),
+            unknown: false,
+        };
+        assert!(data(&mut app, step("e-prod", "s1", failed), now).is_empty());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("deploy failed during redeploy: Railway API returned HTTP 400")
+        );
+        let sp = app.pending.service("e-prod", "s1").unwrap();
+        assert!(sp.vars["C"].applied && sp.written_not_deployed);
+        // C now matches Railway, but it is applied: no drift.
+        let cmds = deploy_first_group(&mut app, vars(&[("C", "3")]), now);
+        assert_eq!(deploy_cmd(&cmds), (vars(&[]), vec![], true));
+    }
+
+    #[test]
+    fn failed_write_keeps_entries_and_retry_sends_only_unapplied() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        sp_mut(&mut app, "e-prod", "s1")
+            .vars
+            .insert("OLD".into(), delete_var("x"));
+        deploy_first_group(&mut app, vars(&[("OLD", "x")]), now);
+        data(&mut app, step("e-prod", "s1", DeployStep::Upserted), now);
+        let failed = DeployStep::Failed {
+            during: Phase::Delete("OLD".into()),
+            error: "Railway API returned HTTP 400".into(),
+            unknown: false,
+        };
+        data(&mut app, step("e-prod", "s1", failed), now);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("deploy failed during delete OLD: Railway API returned HTTP 400")
+        );
+        let sp = app.pending.service("e-prod", "s1").unwrap();
+        assert!(sp.vars["C"].applied && !sp.vars["OLD"].applied && !sp.written_not_deployed);
+        let cmds = deploy_first_group(&mut app, vars(&[("OLD", "x"), ("C", "3")]), now);
+        assert_eq!(deploy_cmd(&cmds), (vars(&[]), vec!["OLD".into()], false));
+    }
+
+    #[test]
+    fn unknown_write_reconciles_and_unknown_redeploy_is_reported() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        add_pending(&mut app, ("e-prod", "production"), ("s1", "api"), "N", "n");
+        deploy_first_group(&mut app, vars(&[]), now);
+        let unknown = DeployStep::Failed {
+            during: Phase::Upsert,
+            error: "timed out".into(),
+            unknown: true,
+        };
+        let cmds = data(&mut app, step("e-prod", "s1", unknown), now);
+        assert_eq!(
+            cmds,
+            vec![Command::LoadVariables {
+                project_id: "p2".into(),
+                env_id: "e-prod".into(),
+                service_id: "s1".into(),
+                purpose: VarsPurpose::Reconcile,
+            }]
+        );
+        // Still in flight until Railway has been read.
+        assert!(app.update(key('D'), now).is_empty());
+        let reply = DataEvent::Variables {
+            env_id: "e-prod".into(),
+            service_id: "s1".into(),
+            purpose: VarsPurpose::Reconcile,
+            result: Ok(vars(&[("C", "3"), ("N", "other")])),
+        };
+        let cmds = data(&mut app, reply, now);
+        let sp = app.pending.service("e-prod", "s1").unwrap();
+        assert!(sp.vars["C"].applied && !sp.vars["N"].applied);
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(_)]));
+        // Retry: only N; then the redeploy's outcome is unknown.
+        let cmds = deploy_first_group(&mut app, vars(&[("C", "3")]), now);
+        assert_eq!(deploy_cmd(&cmds), (vars(&[("N", "n")]), vec![], false));
+        data(&mut app, step("e-prod", "s1", DeployStep::Upserted), now);
+        let unknown = DeployStep::Failed {
+            during: Phase::Redeploy,
+            error: "timed out".into(),
+            unknown: true,
+        };
+        assert!(data(&mut app, step("e-prod", "s1", unknown), now).is_empty());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("redeploy outcome unknown — check the deployments view")
+        );
+        let sp = app.pending.service("e-prod", "s1").unwrap();
+        assert!(sp.written_not_deployed);
+    }
+
+    #[test]
+    fn deploy_debug_hides_values() {
+        let cmd = Command::DeployService {
+            project_id: "p".into(),
+            env_id: "e".into(),
+            service_id: "s".into(),
+            upserts: vars(&[("KEY", "s3cret-value")]),
+            deletes: vec!["OLD".into()],
+            redeploy_only: false,
+        };
+        let out = format!("{cmd:?}");
+        assert!(out.contains("KEY") && out.contains("OLD"), "{out}");
+        assert!(!out.contains("s3cret-value"), "{out}");
+        let ev = deploy_vars_event("e", "s", vars(&[("KEY", "s3cret-value")]));
+        assert!(!format!("{ev:?}").contains("s3cret-value"));
     }
 }

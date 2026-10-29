@@ -913,3 +913,90 @@ fn review_orphan_label_and_discard_prompt() {
         "{t}"
     );
 }
+
+fn deploy_confirm(app: &mut App, drift: &[&str]) {
+    app.confirm = Some(crate::app::Confirm::Deploy(crate::app::DeployConfirm {
+        env_id: "e1".into(),
+        service_id: "svc-1".into(),
+        drift: drift.iter().map(|d| d.to_string()).collect(),
+    }));
+}
+
+/// The column of `needle` in `row`, counted in cells.
+fn col(row: &str, needle: &str) -> u16 {
+    row[..row.find(needle).unwrap()].chars().count() as u16
+}
+
+#[test]
+fn production_confirm_shows_env_in_bad_colour() {
+    let mut app = review_app();
+    deploy_confirm(&mut app, &["NEW"]);
+    let buf = render(&app, Instant::now());
+    let t = text(&buf);
+    assert!(
+        t.contains("Deploy? y to confirm, any other key cancels"),
+        "{t}"
+    );
+    assert!(t.contains("service: api"), "{t}");
+    // Unapplied changes only (the review behind shows CHG), values hidden.
+    let top = (0..30)
+        .find(|y| row_text(&buf, *y).contains("┌ Deploy"))
+        .unwrap_or_else(|| panic!("no overlay\n{t}"));
+    let overlay: String = (top..30).map(|y| row_text(&buf, y)).collect();
+    assert!(
+        overlay.contains("+ NEW") && overlay.contains("- GONE"),
+        "{t}"
+    );
+    assert!(!overlay.contains("CHG"), "{t}");
+    for secret in ["newsecret", "oldsecret"] {
+        assert!(!t.contains(secret), "{t}");
+    }
+    let drift = (0..30)
+        .map(|y| row_text(&buf, y))
+        .find(|r| r.contains("changed on Railway since your edit"))
+        .unwrap_or_else(|| panic!("no drift line\n{t}"));
+    assert!(drift.contains("NEW"), "{drift}");
+    let y = (0..30)
+        .find(|y| row_text(&buf, *y).contains("Deploy to production"))
+        .unwrap_or_else(|| panic!("no title\n{t}"));
+    let x = col(&row_text(&buf, y), "production");
+    assert_eq!(buf[(x, y)].fg, T.bad);
+
+    let mut app = review_app();
+    app.pending
+        .envs
+        .get_mut("e1")
+        .unwrap()
+        .get_mut("svc-1")
+        .unwrap()
+        .env_name = "staging".into();
+    deploy_confirm(&mut app, &[]);
+    let buf = render(&app, Instant::now());
+    let t = text(&buf);
+    assert!(!t.contains("changed on Railway"), "{t}");
+    let y = (0..30)
+        .find(|y| row_text(&buf, *y).contains("Deploy to staging"))
+        .unwrap_or_else(|| panic!("no title\n{t}"));
+    let x = col(&row_text(&buf, y), "staging");
+    assert_eq!(buf[(x, y)].fg, T.accent);
+}
+
+#[test]
+fn long_deploy_confirm_keeps_the_prompt() {
+    let mut app = review_app();
+    for i in 0..60 {
+        add_pending(
+            &mut app,
+            &format!("V{i:02}"),
+            crate::pending::Change::Delete,
+            Some("x"),
+        );
+    }
+    deploy_confirm(&mut app, &[]);
+    let t = text(&render(&app, Instant::now()));
+    assert!(
+        t.contains("Deploy? y to confirm, any other key cancels"),
+        "{t}"
+    );
+    assert!(t.contains("more"), "{t}");
+}

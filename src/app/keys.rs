@@ -191,7 +191,7 @@ impl App {
             Kind::Deployments => self.deployments_key(code, out),
             Kind::Instances => self.instances_key(code, out),
             Kind::Variables => self.variables_key(code, out),
-            Kind::Pending => self.pending_key(code),
+            Kind::Pending => self.pending_key(code, out),
             Kind::Logs => self.logs_key(code, out),
         };
         if handled {
@@ -363,7 +363,7 @@ impl App {
         true
     }
 
-    fn pending_key(&mut self, code: KeyCode) -> bool {
+    fn pending_key(&mut self, code: KeyCode, out: &mut Vec<Command>) -> bool {
         match code {
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 if let Some(View::Pending(v)) = self.stack.last_mut() {
@@ -382,7 +382,7 @@ impl App {
                 Some(g) if g.orphaned => {
                     self.message = Some("cannot deploy: the environment no longer exists".into());
                 }
-                Some(_) => self.message = Some("deploy: not yet available".into()),
+                Some(g) => out.extend(self.request_deploy(g.env_id, g.service_id)),
                 None => {}
             },
             _ => return false,
@@ -392,12 +392,18 @@ impl App {
 
     /// `y` answers the question; any other key cancels it.
     fn confirm_key(&mut self, code: KeyCode, out: &mut Vec<Command>) {
-        let Some(Confirm::Discard { env_id, service_id }) = self.confirm.take() else {
+        let Some(confirm) = self.confirm.take() else {
             return;
         };
-        if code == KeyCode::Char('y') {
-            self.pending.discard(&env_id, &service_id);
-            out.push(Command::SavePending(self.pending.clone()));
+        if code != KeyCode::Char('y') {
+            return;
+        }
+        match confirm {
+            Confirm::Discard { env_id, service_id } => {
+                self.pending.discard(&env_id, &service_id);
+                out.push(Command::SavePending(self.pending.clone()));
+            }
+            Confirm::Deploy(d) => self.start_deploy(d, out),
         }
     }
 
