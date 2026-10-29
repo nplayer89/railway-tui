@@ -2337,6 +2337,21 @@ mod tests {
     }
 
     #[test]
+    fn r_reloads_before_the_backstop_except_where_it_reveals() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        let early = now + Duration::from_secs(1);
+        assert_eq!(app.update(key('r'), early), vec![load_services("e-prod")]);
+        assert!(app.services.loading);
+
+        let mut app = app_in_variables(now);
+        assert!(
+            app.update(key('r'), now).is_empty(),
+            "r reveals in Variables"
+        );
+    }
+
+    #[test]
     fn load_error_keeps_old_value_and_sets_error() {
         let now = Instant::now();
         let mut app = app_in_services(now);

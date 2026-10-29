@@ -315,7 +315,7 @@ const HELP_LINES: [&str; 19] = [
     "l            latest logs   i  instances",
     "b            build/runtime logs",
     "f, G         follow logs",
-    "ctrl-r       reload (in logs: reconnect)",
+    "r, ctrl-r    reload (in logs: reconnect)",
     "t            theme picker (:theme)",
     "v            service variables (:vars)",
     "  e/enter edit  E $EDITOR  a add  d delete  u undo",
