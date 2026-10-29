@@ -457,6 +457,38 @@ fn draw_latest_confirm(frame: &mut Frame, area: Rect, app: &App, c: &LatestConfi
     frame.render_widget(Paragraph::new(lines).block(popup(t, " Deploy ")), rect);
 }
 
+const BRANCH_PICKER_WIDTH: u16 = 60;
+/// Room for text inside the picker: its width less the borders and a margin each side.
+const BRANCH_PICKER_TEXT: usize = BRANCH_PICKER_WIDTH as usize - 4;
+
+/// Splits `text` into lines of at most `width` characters, at spaces where it
+/// can and mid-word where a word alone is too long.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let mut word: Vec<char> = word.chars().collect();
+        while word.len() > width {
+            if !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+            }
+            lines.push(word.drain(..width).collect());
+        }
+        let word: String = word.into_iter().collect();
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(&word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
 /// The branch picker: the query, then the matching branches (connected one
 /// first and marked), scrolled to keep the highlighted one in view.
 fn draw_branch_picker(frame: &mut Frame, area: Rect, app: &App, p: &BranchPicker) {
@@ -470,10 +502,28 @@ fn draw_branch_picker(frame: &mut Frame, area: Rect, app: &App, p: &BranchPicker
     let room = (area.height as usize).saturating_sub(4).clamp(1, 15);
     match &p.choices {
         None => lines.push(Line::styled(" loading branches…", muted)),
-        Some(Err(e)) => lines.push(Line::styled(
-            format!(" cannot list branches: {}", clean(e)),
-            Style::new().fg(t.bad),
-        )),
+        Some(Err(e)) => {
+            let text = format!("cannot list branches: {}", clean(e));
+            for l in wrap(&text, BRANCH_PICKER_TEXT) {
+                lines.push(Line::styled(format!(" {l}"), Style::new().fg(t.bad)));
+            }
+        }
+        Some(Ok(c)) if c.unlisted.is_some() => {
+            let why = c.unlisted.as_deref().unwrap_or_default();
+            let text = format!("could not list branches: {}", clean(why));
+            for l in wrap(&text, BRANCH_PICKER_TEXT) {
+                lines.push(Line::styled(format!(" {l}"), Style::new().fg(t.busy)));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                " type the exact branch name, enter to pick",
+                Style::new().fg(t.text),
+            ));
+            lines.push(Line::styled(
+                format!(" connected: {}", clean(&c.connected)),
+                muted,
+            ));
+        }
         Some(Ok(c)) => {
             let names = p.filtered();
             if names.is_empty() {
@@ -494,7 +544,7 @@ fn draw_branch_picker(frame: &mut Frame, area: Rect, app: &App, p: &BranchPicker
         }
     }
     let title = format!(" Deploy branch: {} ", clean(&p.target.service_name));
-    let rect = centered(area, 60, lines.len() as u16 + 2);
+    let rect = centered(area, BRANCH_PICKER_WIDTH, lines.len() as u16 + 2);
     frame.render_widget(Clear, rect);
     frame.render_widget(Paragraph::new(lines).block(popup(t, &title)), rect);
 }

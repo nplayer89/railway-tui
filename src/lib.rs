@@ -5,6 +5,7 @@ pub mod app;
 pub mod auth;
 pub mod budget;
 pub mod config;
+pub mod github;
 pub mod logs;
 pub mod model;
 pub mod pending;

@@ -1339,6 +1339,7 @@ fn branch_picker_shows_loading_then_the_filtered_list() {
         trigger_id: "t1".into(),
         connected: "feat/a".into(),
         names: vec!["feat/a".into(), "feat/b".into(), "main".into()],
+        unlisted: None,
     }));
     app.branch_picker = Some(picker);
     let buf = render(&app, Instant::now());
@@ -1354,4 +1355,32 @@ fn branch_picker_shows_loading_then_the_filtered_list() {
         app.theme().select_bg,
         "feat/b is highlighted"
     );
+}
+
+#[test]
+fn unlisted_branches_explain_why_wrapped_and_ask_for_a_name() {
+    let mut app = services_app(vec![]);
+    let why = "gh: HTTP 404: Not Found; Railway: Railway API error: Not Authorized (this is long)";
+    app.branch_picker = Some(BranchPicker {
+        target: latest_confirm(None),
+        choices: Some(Ok(BranchChoices {
+            trigger_id: "t1".into(),
+            connected: "main".into(),
+            names: vec![],
+            unlisted: Some(why.into()),
+        })),
+        query: "feat/x".into(),
+        index: 0,
+    });
+    let screen = text(&render(&app, Instant::now()));
+    for want in [
+        "│ could not list branches: gh: HTTP 404: Not Found;        │",
+        "│ Railway: Railway API error: Not Authorized (this is      │",
+        "│ long)",
+        "type the exact branch name, enter to pick",
+        "connected: main",
+        "> feat/x▏",
+    ] {
+        assert!(screen.contains(want), "missing {want:?} in\n{screen}");
+    }
 }

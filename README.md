@@ -62,7 +62,7 @@ On launch it reopens the last-used project and environment.
 | `v` | variables of the selected service (Services; also `:vars`) |
 | `p` | review pending variable changes (Services and Variables; also `:pending`) |
 | `D` | deploy the latest commit of the service's branch (Services and Deployments): a confirmation shows the environment, service, repo, branch and the commit running now; `y` deploys, any other key cancels. Variable changes already written to Railway ship with it. Refused for a service that runs an image |
-| `d` | pick a branch to deploy (Services and Deployments): type to filter the repo's branches, arrows to move, `enter` to pick, `esc` to close. Picking a branch other than the connected one switches the service's deploy trigger to it before deploying, and the service **stays on that branch** (pushes to it deploy if auto-deploy is on); pick the old branch again to go back. The confirm shows `old → new`. Needs your Railway login to have GitHub access to the repo |
+| `d` | pick a branch to deploy (Services and Deployments): type to filter the repo's branches, arrows to move, `enter` to pick, `esc` to close. Picking a branch other than the connected one switches the service's deploy trigger to it before deploying, and the service **stays on that branch** (pushes to it deploy if auto-deploy is on); pick the old branch again to go back. The confirm shows `old → new`. Branches are listed with the GitHub CLI (`gh api`, your GitHub login), falling back to Railway, which refuses `railway login` tokens; if neither can list them, type the exact branch name |
 | `b` | switch between build and runtime logs (Logs) |
 | `f`, `G` | resume following the log (Logs) |
 | `PageUp` / `PageDown` | scroll the log by a page (Logs) |

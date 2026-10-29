@@ -100,6 +100,7 @@ async fn tui(
         state_path,
         pending_file,
         config.refresh_interval_secs,
+        PathBuf::from(railway_tui::github::GH),
         cmd_rx,
         event_tx,
     ));

@@ -10,6 +10,7 @@
 //! Output never includes tokens, and log messages are truncated.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -425,4 +426,55 @@ async fn live_build_logs() {
         }
         _ => println!("0 build lines"),
     }
+}
+
+/// The branch picker's reads for the first service built from a repo: its
+/// deploy trigger, its branches through `gh`, and whether Railway lists them
+/// too (it refuses `railway login` tokens). Costs about 1 + 2 per project scanned.
+#[tokio::test]
+#[ignore]
+async fn live_branch_picker_reads() {
+    if !live() {
+        return;
+    }
+    let api = api(tokens());
+    let workspaces = api.workspaces().await.expect("workspaces");
+    for project in workspaces.iter().flat_map(|w| &w.projects) {
+        let envs = api.environments(&project.id).await.expect("environments");
+        for env in &envs {
+            let services = api
+                .service_instances(&project.id, &env.id)
+                .await
+                .expect("service instances");
+            let Some((service_id, repo)) = services.iter().find_map(|s| {
+                let repo = s.latest.as_ref()?.repo.clone()?;
+                Some((s.service_id.clone(), repo))
+            }) else {
+                continue;
+            };
+            println!("target: service …{} repo {repo}", tail(&service_id));
+            let triggers = api
+                .triggers(&project.id, &env.id, &service_id)
+                .await
+                .expect("deploy triggers");
+            let trigger = triggers
+                .iter()
+                .find(|t| t.repository == repo)
+                .expect("a trigger for the repo");
+            let names = railway_tui::github::branches(Path::new(railway_tui::github::GH), &repo)
+                .await
+                .expect("branches through gh");
+            println!("gh listed {} branches", names.len());
+            assert!(
+                names.contains(&trigger.branch),
+                "the connected branch is among gh's"
+            );
+            match api.branches(&repo).await {
+                Ok(n) => println!("Railway also listed {} branches", n.len()),
+                Err(e) => println!("Railway refused to list branches: {e}"),
+            }
+            return;
+        }
+    }
+    panic!("no service built from a repo found");
 }

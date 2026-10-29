@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,7 @@ pub async fn run_worker(
     remembered_path: PathBuf,
     pending_path: PathBuf,
     configured_interval: Option<u64>,
+    gh: PathBuf,
     mut cmds: mpsc::Receiver<Command>,
     events: mpsc::Sender<AppEvent>,
 ) {
@@ -54,6 +55,7 @@ pub async fn run_worker(
         remembered_path,
         save_pending,
         configured_interval,
+        gh,
         events,
         followers: HashMap::new(),
         watch: Watch::default(),
@@ -136,6 +138,8 @@ struct Worker {
     remembered_path: PathBuf,
     save_pending: mpsc::UnboundedSender<Pending>,
     configured_interval: Option<u64>,
+    /// The `gh` program used to list a repo's branches.
+    gh: PathBuf,
     events: mpsc::Sender<AppEvent>,
     followers: HashMap<u64, JoinHandle<()>>,
     watch: Watch,
@@ -196,8 +200,13 @@ impl Worker {
                 repo,
             } => {
                 let (e, s) = (env_id.clone(), service_id.clone());
+                let gh = self.gh.clone();
                 let request = async move {
-                    tokio::try_join!(api.triggers(&project_id, &e, &s), api.branches(&repo))
+                    let (triggers, names) = tokio::join!(
+                        api.triggers(&project_id, &e, &s),
+                        list_branches(&api, &gh, &repo)
+                    );
+                    Ok((triggers?, names))
                 };
                 self.load(request, |result| DataEvent::Branches {
                     env_id,
@@ -458,6 +467,18 @@ async fn run_deploy(
         Err(e) => failed(Phase::Redeploy, e),
     };
     send(step).await.is_ok()
+}
+
+/// A repo's branches from `gh` (the user's GitHub login), else from Railway,
+/// which refuses `railway login` tokens; the error says why both failed.
+async fn list_branches(api: &Api, gh: &Path, repo: &str) -> Result<Vec<String>, String> {
+    let gh_error = match crate::github::branches(gh, repo).await {
+        Ok(names) => return Ok(names),
+        Err(e) => e,
+    };
+    api.branches(repo)
+        .await
+        .map_err(|e| format!("{gh_error}; Railway: {e}"))
 }
 
 /// Switches the service's branch when asked, then deploys the latest commit;
@@ -725,6 +746,10 @@ mod tests {
 
     impl Harness {
         async fn start(configured_interval: Option<u64>) -> Self {
+            Self::start_with_gh(configured_interval, PathBuf::from("/nonexistent/gh")).await
+        }
+
+        async fn start_with_gh(configured_interval: Option<u64>, gh: PathBuf) -> Self {
             let server = MockServer::start().await;
             let budget = Arc::new(Mutex::new(RateBudget::new(None)));
             let tokens: Arc<dyn TokenSource> = Arc::new(EnvTokenSource("t".into()));
@@ -745,6 +770,7 @@ mod tests {
                 state_dir.path().join("state.toml"),
                 state_dir.path().join("pending.toml"),
                 configured_interval,
+                gh,
                 cmd_rx,
                 ev_tx,
             ));
@@ -792,6 +818,7 @@ mod tests {
             PathBuf::from("unused"),
             PathBuf::from("unused"),
             Some(42),
+            PathBuf::from("unused"),
             cmd_rx,
             ev_tx,
         ));
@@ -947,6 +974,7 @@ mod tests {
             PathBuf::from("unused"),
             blocker.join("pending.toml"),
             None,
+            PathBuf::from("unused"),
             cmd_rx,
             tx,
         ));
@@ -1006,6 +1034,7 @@ mod tests {
     // ---- deploy: the app and the worker together, against wiremock ----
 
     use crate::app::{App, Confirm, DeployConfirm, DeployStep, Phase, StartPrefs};
+    use crate::model::Trigger;
     use crate::pending::{Change, Target};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use wiremock::matchers::body_string_contains;
@@ -1271,7 +1300,7 @@ mod tests {
         };
         let (triggers, names) = result.unwrap();
         assert_eq!(triggers[0].id, "t1");
-        assert_eq!(names, ["main", "feat/x"]);
+        assert_eq!(names.unwrap(), ["main", "feat/x"]);
         let requests = h.server.received_requests().await.unwrap();
         let branch_req = requests
             .iter()
@@ -1282,6 +1311,77 @@ mod tests {
             branch_req["variables"],
             json!({"owner": "acme", "repo": "api"})
         );
+    }
+
+    async fn mount_trigger(server: &MockServer) {
+        let triggers = json!({"data": {"deploymentTriggers": {"edges": [
+            {"node": {"id": "t1", "branch": "main", "repository": "acme/api"}}
+        ]}}});
+        mount(server, "deploymentTriggers", 200, triggers).await;
+    }
+
+    fn load_branches() -> Command {
+        Command::LoadBranches {
+            project_id: "p1".into(),
+            env_id: "e1".into(),
+            service_id: "s1".into(),
+            repo: "acme/api".into(),
+        }
+    }
+
+    async fn branches_reply(h: &mut Harness) -> (Vec<Trigger>, Result<Vec<String>, String>) {
+        loop {
+            match h.next().await {
+                DataEvent::Branches { result, .. } => return result.unwrap(),
+                DataEvent::Budget { .. } => continue,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn branches_come_from_gh_first() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let gh = dir.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\nprintf 'main\\nfeat/from-gh\\n'\n").unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut h = Harness::start_with_gh(None, gh).await;
+        mount_trigger(&h.server).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("githubRepoBranches"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&h.server)
+            .await;
+        h.send(load_branches()).await;
+        let (triggers, names) = branches_reply(&mut h).await;
+        assert_eq!(triggers[0].branch, "main");
+        assert_eq!(names.unwrap(), ["main", "feat/from-gh"]);
+    }
+
+    #[tokio::test]
+    async fn railway_refusing_branches_is_reported_once_without_a_refresh() {
+        let mut h = Harness::start(None).await;
+        mount_trigger(&h.server).await;
+        let refused = json!({"data": null, "errors": [{"message": "Not Authorized"}]});
+        mount(&h.server, "githubRepoBranches", 200, refused).await;
+        h.send(load_branches()).await;
+        let (triggers, names) = branches_reply(&mut h).await;
+        assert_eq!(triggers.len(), 1, "the trigger still loads");
+        assert_eq!(
+            names.unwrap_err(),
+            "gh is not installed; Railway: Railway API error: Not Authorized"
+        );
+        let asked = h
+            .server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| String::from_utf8_lossy(&r.body).contains("githubRepoBranches"))
+            .count();
+        assert_eq!(asked, 1, "a refusal is not retried");
     }
 
     async fn mount(server: &MockServer, op: &str, status: u16, body: serde_json::Value) {
