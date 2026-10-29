@@ -375,6 +375,8 @@ async fn run_deploy(
         };
         events.send(AppEvent::Data(data))
     };
+    // Railway's error text may quote what was sent; it is shown unrevealed.
+    let sent = writes.as_ref().map(|(u, _)| u.clone()).unwrap_or_default();
     let failed = |during: Phase, e: WriteError| {
         let (error, unknown) = match e {
             WriteError::Refused(e) => (e.to_string(), false),
@@ -382,7 +384,7 @@ async fn run_deploy(
         };
         DeployStep::Failed {
             during,
-            error,
+            error: mask_sent(error, &sent),
             unknown,
         }
     };
@@ -420,6 +422,21 @@ async fn run_deploy(
         Err(e) => failed(Phase::Redeploy, e),
     };
     send(step).await.is_ok()
+}
+
+/// Replaces every non-empty sent value in `error` with the hidden marker, the
+/// longest first so a value containing another is masked whole.
+fn mask_sent(mut error: String, sent: &crate::model::Variables) -> String {
+    let mut values: Vec<&str> = sent
+        .values()
+        .map(String::as_str)
+        .filter(|v| !v.is_empty())
+        .collect();
+    values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    for value in values {
+        error = error.replace(value, "••••••");
+    }
+    error
 }
 
 /// Time left on a rate-limit block, rounded up to whole seconds.
@@ -1125,6 +1142,47 @@ mod tests {
         let msg = app.message.clone().unwrap();
         assert!(msg.starts_with("deploy failed during delete X: "), "{msg}");
         assert!(!msg.contains("new-a") && !msg.contains("new-b"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn railway_error_echoing_a_sent_value_is_masked() {
+        let mut h = Harness::start(None).await;
+        // Railway's own message quotes what was submitted.
+        let reply = json!({
+            "data": null,
+            "errors": [{ "message": "invalid value \"new-a\" for A; new-b too" }]
+        });
+        mount(&h.server, "variableCollectionUpsert", 200, reply).await;
+        let mut app = deploy_app();
+        let cmds = confirm_deploy(&mut app);
+        let steps = drive(&mut h, &mut app, cmds).await;
+        let [DeployStep::Failed {
+            during: Phase::Upsert,
+            error,
+            unknown: false,
+        }] = steps.as_slice()
+        else {
+            panic!("{steps:?}");
+        };
+        for shown in [error.clone(), app.message.clone().unwrap()] {
+            assert!(
+                !shown.contains("new-a") && !shown.contains("new-b"),
+                "{shown}"
+            );
+            assert!(shown.contains("invalid value \"••••••\" for A"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn mask_sent_values_longest_first_and_skips_empty() {
+        let sent: crate::model::Variables = [("A", "abc"), ("B", "abcdef"), ("C", "")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(
+            mask_sent("got abcdef and abc".into(), &sent),
+            "got •••••• and ••••••"
+        );
     }
 
     #[tokio::test]

@@ -112,7 +112,7 @@ pub enum VarsPurpose {
 }
 
 /// One finished step of a deploy, reported by the worker as it goes.
-/// Error texts are Railway's messages; they never hold a value.
+/// Error texts are Railway's messages with every sent value masked by the worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeployStep {
     Upserted,
