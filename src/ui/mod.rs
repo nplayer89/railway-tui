@@ -105,7 +105,7 @@ fn hints(app: &App) -> &'static str {
             "<enter> logs  <r> reload  </> filter  <esc> back  <?> help"
         }
         Some(View::Variables(_)) => {
-            "<e> edit  <a> add  <d> del  <u> undo  <r> reveal  <p> review  <?> help"
+            "<e> edit  <a> add  <d> del  <u> undo  <r> reveal  <y/Y> copy  <v> select  <p> review  <?> help"
         }
         Some(View::Pending(_)) => "<D> deploy  <x> discard  <r> reveal  <esc> back  <?> help",
         Some(View::Logs(_)) => {
@@ -337,7 +337,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
-const HELP_LINES: [&str; 21] = [
+const HELP_LINES: [&str; 22] = [
     "j/k, arrows  move / scroll",
     "enter        open",
     "esc          back / clear filter",
@@ -355,6 +355,7 @@ const HELP_LINES: [&str; 21] = [
     "v            service variables (:vars)",
     "  e/enter edit  E $EDITOR  a add  d delete  u undo",
     "  r reveal  R reveal all  p review  / name filter",
+    "  y copy value  Y copy NAME=VALUE  v select rows",
     "p            review pending changes (:pending)",
     "  D deploy  x discard  r/R reveal  (y confirms)",
     "?            toggle help",

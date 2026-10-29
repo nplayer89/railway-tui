@@ -2693,3 +2693,113 @@ fn a_sealed_row_missing_from_the_map_can_be_deleted() {
         Some(&crate::pending::Change::Delete)
     );
 }
+
+fn copy_cmd(text: &str) -> Vec<Command> {
+    vec![Command::Copy {
+        text: Secret::new(text.into()),
+    }]
+}
+
+#[test]
+fn y_copies_the_selected_value_raw() {
+    let now = Instant::now();
+    let mut app = app_in_variables(now);
+    select_var(&mut app, "PORT", now);
+    assert_eq!(app.update(key('y'), now), copy_cmd("has db inside"));
+    assert_eq!(app.message.as_deref(), Some("copied value of PORT"));
+}
+
+#[test]
+fn shift_y_copies_an_env_line() {
+    let now = Instant::now();
+    let mut app = app_in_variables(now);
+    select_var(&mut app, "PORT", now);
+    assert_eq!(
+        app.update(key('Y'), now),
+        copy_cmd("PORT=\"has db inside\"")
+    );
+    assert_eq!(app.message.as_deref(), Some("copied PORT"));
+}
+
+#[test]
+fn y_copies_the_pending_value_and_ignores_hiddenness() {
+    let now = Instant::now();
+    let mut app = app_in_variables(now);
+    let target = crate::pending::Target {
+        project_id: "p2",
+        env_id: "e-prod",
+        env_name: "production",
+        service_id: "svc-a",
+        service_name: "svc-a-name",
+    };
+    app.pending_mut()
+        .set(&target, "REDIS_DB", "l1\nl2".into(), Some("1"));
+    select_var(&mut app, "REDIS_DB", now);
+    assert_eq!(app.update(key('y'), now), copy_cmd("l1\nl2"));
+}
+
+#[test]
+fn y_on_a_sealed_row_copies_nothing() {
+    let now = Instant::now();
+    let mut app = app_in_services(now);
+    app.update(key('v'), now);
+    let loaded = vars(&[("A", "x"), ("PORT", "y")]);
+    data(
+        &mut app,
+        vars_event_sealed("svc-a", Ok(loaded), Ok(sealed_set(&["PORT"]))),
+        now,
+    );
+    select_var(&mut app, "PORT", now);
+    assert!(app.update(key('y'), now).is_empty());
+    assert_eq!(
+        app.message.as_deref(),
+        Some("PORT is sealed \u{2014} nothing to copy")
+    );
+}
+
+#[test]
+fn copy_rows_counts_copied_and_skipped_sealed() {
+    let now = Instant::now();
+    let mut app = app_in_services(now);
+    app.update(key('v'), now);
+    let loaded = vars(&[("A", "1"), ("B", "2"), ("C", "3")]);
+    data(
+        &mut app,
+        vars_event_sealed("svc-a", Ok(loaded), Ok(sealed_set(&["B", "C"]))),
+        now,
+    );
+    let mut out = Vec::new();
+    app.copy_rows(&["A".into(), "B".into(), "C".into()], false, &mut out);
+    assert_eq!(out, copy_cmd("1"));
+    assert_eq!(
+        app.message.as_deref(),
+        Some("copied 1 variables (2 sealed skipped)")
+    );
+    out.clear();
+    app.copy_rows(&["B".into(), "C".into()], true, &mut out);
+    assert!(out.is_empty());
+    assert_eq!(
+        app.message.as_deref(),
+        Some("copied 0 variables (2 sealed skipped)")
+    );
+}
+
+#[test]
+fn y_is_allowed_while_the_service_deploys() {
+    let now = Instant::now();
+    let mut app = app_in_variables(now);
+    select_var(&mut app, "REDIS_DB", now);
+    app.update(key('d'), now);
+    app.update(key('p'), now);
+    app.update(key('D'), now);
+    data(
+        &mut app,
+        deploy_vars_event("e-prod", "svc-a", vars(&[("REDIS_DB", "1")])),
+        now,
+    );
+    app.update(key('y'), now);
+    app.update(code(KeyCode::Esc), now);
+    assert!(matches!(app.stack.last(), Some(View::Variables(_))));
+    select_var(&mut app, "REDIS_DB", now);
+    assert_eq!(app.update(key('y'), now), copy_cmd("1"));
+}

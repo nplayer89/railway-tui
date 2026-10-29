@@ -408,6 +408,10 @@ pub enum Command {
         name: String,
         initial: Secret<String>,
     },
+    /// Handled by the main loop, not the worker: put `text` on the clipboard via OSC 52.
+    Copy {
+        text: Secret<String>,
+    },
     /// Replaces the previous watch set; empty means stop.
     WatchDeployments {
         ids: Vec<String>,

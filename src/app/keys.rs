@@ -430,6 +430,11 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char(c @ ('y' | 'Y')) => {
+                if let Some(name) = self.selected_var_name() {
+                    self.copy_rows(&[name], c == 'Y', out);
+                }
+            }
             KeyCode::Char('p') => self.open_pending(out),
             KeyCode::Char('R') => {
                 if let Some(View::Variables(v)) = self.stack.last_mut() {
@@ -439,6 +444,49 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    /// Copies the shown value (a pending `Set`, else the current one) of each name, raw
+    /// with `as_env` false, else as `NAME=VALUE` lines. Sealed rows are skipped. Pushes no
+    /// command when nothing is copyable. The message names what was sent, never a value.
+    pub(super) fn copy_rows(&mut self, names: &[String], as_env: bool, out: &mut Vec<Command>) {
+        let rows = self.variable_rows();
+        let mut lines = Vec::new();
+        let mut sealed = 0;
+        for name in names {
+            let Some(row) = rows.iter().find(|r| r.name == name) else {
+                continue;
+            };
+            if row.sealed {
+                sealed += 1;
+                continue;
+            }
+            let value = match row.pending.map(|p| &p.change) {
+                Some(Change::Set { value }) => Some(value.as_str()),
+                _ => row.current,
+            };
+            if let Some(value) = value {
+                lines.push(if as_env {
+                    crate::clipboard::env_line(name, value)
+                } else {
+                    value.to_string()
+                });
+            }
+        }
+        let copied = lines.len();
+        self.message = Some(match names {
+            [name] if sealed == 1 => format!("{name} is sealed \u{2014} nothing to copy"),
+            [name] if copied == 0 => format!("{name} has no value to copy"),
+            [name] if as_env => format!("copied {name}"),
+            [name] => format!("copied value of {name}"),
+            _ if sealed > 0 => format!("copied {copied} variables ({sealed} sealed skipped)"),
+            _ => format!("copied {copied} variables"),
+        });
+        if copied > 0 {
+            out.push(Command::Copy {
+                text: Secret::new(lines.join("\n")),
+            });
+        }
     }
 
     fn pending_key(&mut self, code: KeyCode, out: &mut Vec<Command>) -> bool {

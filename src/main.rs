@@ -229,7 +229,7 @@ async fn event_loop(
 }
 
 /// Sends commands to the worker; `Ok(false)` means the app asked to quit.
-/// `EditExternal` never reaches the worker: the editor runs here and its result is fed
+/// `Copy` also stays here. `EditExternal` never reaches the worker: the editor runs here and its result is fed
 /// back to the app, whose follow-up commands are handled in turn.
 async fn dispatch(
     worker: &mpsc::Sender<Command>,
@@ -247,6 +247,12 @@ async fn dispatch(
                         .map(Secret::new);
                 let event = AppEvent::Data(DataEvent::Edited { name, result });
                 queue.extend(app.update(event, Instant::now()));
+            }
+            Command::Copy { text } => {
+                let mut out = stdout();
+                out.write_all(railway_tui::clipboard::osc52(text.expose()).as_bytes())
+                    .and_then(|()| out.flush())
+                    .map_err(Error::Terminal)?;
             }
             other => worker.send(other).await.map_err(|_| Error::WorkerGone)?,
         }
