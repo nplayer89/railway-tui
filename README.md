@@ -98,6 +98,7 @@ While a visual selection is active (the title shows `-- VISUAL --`):
 | `d` | mark every selected variable for deletion (never unmarks) |
 | `r` | reveal every selected value, or hide them all if all are already revealed |
 | `v` / `esc` | end the selection (`esc` does not leave the view) |
+| `p` / `R` | still work: `p` opens the review and ends the selection, `R` toggles reveal-all |
 
 `a`, `e`, `E`, `enter` and `u` do nothing while a selection is active. Opening the filter (`/`) ends
 it. Sealed variables show `<Opaque>` and are never copied; empty ones show `<Empty>`.

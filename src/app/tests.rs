@@ -3053,3 +3053,31 @@ fn visual_range_ends_when_the_filter_hides_the_anchor() {
     app.table_filter = Some("REDIS".into());
     assert_eq!(app.visual_range(), None);
 }
+
+#[test]
+fn opening_the_review_ends_visual_mode() {
+    let now = Instant::now();
+    let mut app = app_in_variables(now);
+    select_all_three(&mut app, now);
+    app.update(key('p'), now);
+    assert!(matches!(app.stack.last(), Some(View::Pending(_))));
+    app.update(code(KeyCode::Esc), now);
+    assert!(matches!(app.stack.last(), Some(View::Variables(_))));
+    assert_eq!(anchor(&app), None);
+    assert_eq!(app.visual_range(), None);
+}
+
+#[test]
+fn a_command_leaving_variables_drops_the_selection_with_the_view() {
+    let now = Instant::now();
+    let mut app = app_in_variables(now);
+    select_all_three(&mut app, now);
+    // `:pending` goes through Services, so the Variables view (and its anchor) is gone.
+    app.update(key(':'), now);
+    for c in "pending".chars() {
+        app.update(key(c), now);
+    }
+    app.update(code(KeyCode::Enter), now);
+    assert!(matches!(app.stack.last(), Some(View::Pending(_))));
+    assert!(!app.stack.iter().any(|v| matches!(v, View::Variables(_))));
+}

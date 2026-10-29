@@ -1397,13 +1397,15 @@ impl App {
     }
 
     /// Only the top view subscribes: leaving Services stops its watch, leaving Logs closes the stream.
+    /// Leaving Variables (or covering it with another view) ends a visual selection.
     fn leave_top(&mut self, out: &mut Vec<Command>) {
         self.table_filter = None;
-        match self.stack.last() {
+        match self.stack.last_mut() {
             Some(View::Services) => out.push(Command::WatchDeployments { ids: Vec::new() }),
             Some(View::Logs(logs)) => out.push(Command::CloseLogs {
                 session: logs.session,
             }),
+            Some(View::Variables(v)) => v.anchor = None,
             _ => {}
         }
     }
