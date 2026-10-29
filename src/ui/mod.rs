@@ -337,7 +337,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
-const HELP_LINES: [&str; 22] = [
+const HELP_LINES: [&str; 23] = [
     "j/k, arrows  move / scroll",
     "enter        open",
     "esc          back / clear filter",
@@ -356,6 +356,7 @@ const HELP_LINES: [&str; 22] = [
     "  e/enter edit  E $EDITOR  a add  d delete  u undo",
     "  r reveal  R reveal all  p review  / name filter",
     "  y copy value  Y copy NAME=VALUE  v select rows",
+    "  selecting: y/Y copy  d delete  r reveal  v/esc end",
     "p            review pending changes (:pending)",
     "  D deploy  x discard  r/R reveal  (y confirms)",
     "?            toggle help",

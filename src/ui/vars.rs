@@ -6,7 +6,7 @@ use ratatui::text::Span;
 use ratatui::widgets::{Cell, Paragraph, Row};
 use ratatui::Frame;
 
-use super::tables::{fg, header, render_table, row_style};
+use super::tables::{fg, header, range_style, render_table, row_style};
 use super::{clean, is_production};
 use crate::app::{App, VarRow, VarsView};
 use crate::pending::Change;
@@ -47,23 +47,31 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, view: &VarsView) {
         .map_or("-", |s| s.service_name.as_str());
     let env = app.environment.as_ref().map_or("-", |e| e.name.as_str());
     let env_colour = if is_production(env) { t.bad } else { t.accent };
-    frame.render_widget(
-        Paragraph::new(ratatui::text::Line::from(vec![
-            Span::styled(
-                format!("{} · variables · ENV ", clean(service)),
-                fg(t.accent).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(clean(env), fg(env_colour).add_modifier(Modifier::BOLD)),
-        ])),
-        title,
-    );
+    let visual = app.visual_range();
+    let mut spans = vec![
+        Span::styled(
+            format!("{} · variables · ENV ", clean(service)),
+            fg(t.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(clean(env), fg(env_colour).add_modifier(Modifier::BOLD)),
+    ];
+    if visual.is_some() {
+        spans.push(Span::styled(
+            " -- VISUAL --",
+            fg(t.hint).add_modifier(Modifier::BOLD),
+        ));
+    }
+    frame.render_widget(Paragraph::new(ratatui::text::Line::from(spans)), title);
 
     let selected = app.selected_index();
     let rows: Vec<Row> = app
         .variable_rows()
         .into_iter()
         .enumerate()
-        .map(|(i, r)| row(app, view, &r, selected == Some(i)))
+        .map(|(i, r)| {
+            let in_range = visual.as_ref().is_some_and(|v| v.contains(&i));
+            row(app, view, &r, selected == Some(i), in_range)
+        })
         .collect();
     let empty = if app.variables.loading {
         "loading…"
@@ -85,7 +93,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, view: &VarsView) {
     );
 }
 
-fn row(app: &App, view: &VarsView, r: &VarRow, selected: bool) -> Row<'static> {
+/// `in_range`: inside the visual range (the cursor row keeps the selected style).
+fn row(app: &App, view: &VarsView, r: &VarRow, selected: bool, in_range: bool) -> Row<'static> {
     let t = app.theme();
     let (marker, value, deleted) = match r.pending.map(|p| (&p.change, &p.base)) {
         Some((Change::Set { value }, None)) => ("+", Some(value.as_str()), false),
@@ -111,5 +120,9 @@ fn row(app: &App, view: &VarsView, r: &VarRow, selected: bool) -> Row<'static> {
             value.map_or(String::new(), |v| shown(v, revealed))
         }),
     ])
-    .style(row_style(t, style, selected))
+    .style(if in_range && !selected {
+        range_style(t, style)
+    } else {
+        row_style(t, style, selected)
+    })
 }

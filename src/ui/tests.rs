@@ -1421,3 +1421,44 @@ fn unlisted_branches_explain_why_wrapped_and_ask_for_a_name() {
         assert!(screen.contains(want), "missing {want:?} in\n{screen}");
     }
 }
+
+#[test]
+fn visual_mode_shows_title_marker() {
+    let mut app = vars_app("staging", &[("A", "1"), ("B", "2")]);
+    let t = text(&render(&app, Instant::now()));
+    assert!(!t.contains("-- VISUAL --"), "{t}");
+    press(&mut app, 'v');
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("-- VISUAL --"), "{t}");
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    app.update(
+        crate::app::AppEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        Instant::now(),
+    );
+    let t = text(&render(&app, Instant::now()));
+    assert!(!t.contains("-- VISUAL --"), "{t}");
+    assert!(t.contains("api · variables"), "{t}");
+}
+
+#[test]
+fn visual_range_rows_are_highlighted_without_bold() {
+    let mut app = vars_app("staging", &[("AAA", "1"), ("BBB", "2"), ("CCC", "3")]);
+    app.selection.variable = Some("AAA".into());
+    press(&mut app, 'v');
+    press(&mut app, 'j');
+    let buf = render(&app, Instant::now());
+    let cell = |name: &str| {
+        let y = (0..buf.area.height)
+            .find(|&y| row_text(&buf, y).contains(name))
+            .unwrap();
+        let x = row_text(&buf, y).find(name).unwrap() as u16;
+        buf[(x, y)].clone()
+    };
+    let t = app.theme();
+    let (anchor, cursor, outside) = (cell("AAA"), cell("BBB"), cell("CCC"));
+    assert_eq!(anchor.bg, t.select_bg);
+    assert!(!anchor.modifier.contains(ratatui::style::Modifier::BOLD));
+    assert_eq!(cursor.bg, t.select_bg);
+    assert!(cursor.modifier.contains(ratatui::style::Modifier::BOLD));
+    assert_ne!(outside.bg, t.select_bg);
+}

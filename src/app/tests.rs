@@ -2803,3 +2803,253 @@ fn y_is_allowed_while_the_service_deploys() {
     select_var(&mut app, "REDIS_DB", now);
     assert_eq!(app.update(key('y'), now), copy_cmd("1"));
 }
+
+// ---- visual selection ----
+
+/// Variables view of svc-a with the usual three variables, `sealed` among them.
+fn app_in_variables_sealed(sealed: &[&str], now: Instant) -> App {
+    let mut app = app_in_services(now);
+    app.update(key('v'), now);
+    let loaded = vars(&[
+        ("DB_URL", "postgres://x"),
+        ("PORT", "has db inside"),
+        ("REDIS_DB", "1"),
+    ]);
+    data(
+        &mut app,
+        vars_event_sealed("svc-a", Ok(loaded), Ok(sealed_set(sealed))),
+        now,
+    );
+    app
+}
+
+/// Puts the cursor on `name` (`select_var` only walks down).
+fn go_to(app: &mut App, name: &str) {
+    assert!(app.variable_rows().iter().any(|r| r.name == name), "{name}");
+    app.selection.variable = Some(name.into());
+}
+
+fn anchor(app: &App) -> Option<&str> {
+    match app.stack.last() {
+        Some(View::Variables(v)) => v.anchor.as_deref(),
+        _ => None,
+    }
+}
+
+fn revealed(app: &App) -> Vec<String> {
+    match app.stack.last() {
+        Some(View::Variables(v)) => v.revealed.iter().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Selects DB_URL and extends a visual range over all three rows.
+fn select_all_three(app: &mut App, now: Instant) {
+    go_to(app, "DB_URL");
+    app.update(key('v'), now);
+    app.update(key('j'), now);
+    app.update(key('j'), now);
+    assert_eq!(app.visual_range(), Some(0..=2));
+}
+
+fn change_of(app: &App, name: &str) -> Option<crate::pending::Change> {
+    pending_of(app, name).map(|p| p.change)
+}
+
+#[test]
+fn v_then_j_selects_a_range_and_esc_cancels_without_leaving() {
+    let now = Instant::now();
+    let mut app = app_in_variables(now);
+    go_to(&mut app, "DB_URL");
+    assert_eq!(app.visual_range(), None);
+    app.update(key('v'), now);
+    assert_eq!(app.visual_range(), Some(0..=0));
+    app.update(key('j'), now);
+    assert_eq!(app.visual_range(), Some(0..=1));
+    app.update(code(KeyCode::Esc), now);
+    assert_eq!(app.visual_range(), None);
+    assert!(matches!(app.stack.last(), Some(View::Variables(_))));
+    // `v` again toggles it on and off.
+    app.update(key('v'), now);
+    assert!(app.visual_range().is_some());
+    app.update(key('v'), now);
+    assert_eq!(app.visual_range(), None);
+}
+
+#[test]
+fn visual_y_copies_values_in_table_order_and_ends() {
+    let now = Instant::now();
+    let mut app = app_in_variables(now);
+    go_to(&mut app, "REDIS_DB");
+    app.update(key('v'), now);
+    app.update(key('k'), now);
+    app.update(key('k'), now);
+    assert_eq!(app.visual_range(), Some(0..=2));
+    assert_eq!(
+        app.update(key('y'), now),
+        copy_cmd("postgres://x\nhas db inside\n1")
+    );
+    assert_eq!(app.message.as_deref(), Some("copied 3 variables"));
+    assert_eq!(app.visual_range(), None);
+}
+
+#[test]
+fn visual_shift_y_copies_env_lines_skipping_sealed() {
+    let now = Instant::now();
+    let mut app = app_in_variables_sealed(&["PORT"], now);
+    select_all_three(&mut app, now);
+    assert_eq!(
+        app.update(key('Y'), now),
+        copy_cmd("DB_URL=postgres://x\nREDIS_DB=1")
+    );
+    assert_eq!(
+        app.message.as_deref(),
+        Some("copied 2 variables (1 sealed skipped)")
+    );
+    assert_eq!(app.visual_range(), None);
+}
+
+#[test]
+fn visual_y_over_only_sealed_rows_copies_nothing() {
+    let now = Instant::now();
+    let mut app = app_in_variables_sealed(&["DB_URL", "PORT"], now);
+    go_to(&mut app, "DB_URL");
+    app.update(key('v'), now);
+    app.update(key('j'), now);
+    assert_eq!(app.visual_range(), Some(0..=1));
+    assert!(app.update(key('y'), now).is_empty());
+    assert_eq!(
+        app.message.as_deref(),
+        Some("copied 0 variables (2 sealed skipped)")
+    );
+    assert_eq!(app.visual_range(), None);
+}
+
+#[test]
+fn visual_d_marks_every_row_and_never_unmarks() {
+    let now = Instant::now();
+    let mut app = app_in_variables(now);
+    go_to(&mut app, "PORT");
+    app.update(key('d'), now);
+    assert_eq!(
+        change_of(&app, "PORT"),
+        Some(crate::pending::Change::Delete)
+    );
+    select_all_three(&mut app, now);
+    let cmds = app.update(key('d'), now);
+    assert!(
+        matches!(cmds.as_slice(), [Command::SavePending(_)]),
+        "{cmds:?}"
+    );
+    for name in ["DB_URL", "PORT", "REDIS_DB"] {
+        assert_eq!(
+            change_of(&app, name),
+            Some(crate::pending::Change::Delete),
+            "{name}"
+        );
+    }
+    assert_eq!(app.visual_range(), None);
+}
+
+#[test]
+fn visual_d_is_refused_while_deploying() {
+    let now = Instant::now();
+    let mut app = app_in_variables(now);
+    go_to(&mut app, "REDIS_DB");
+    app.update(key('d'), now);
+    app.update(key('p'), now);
+    app.update(key('D'), now);
+    data(
+        &mut app,
+        deploy_vars_event("e-prod", "svc-a", vars(&[("REDIS_DB", "1")])),
+        now,
+    );
+    app.update(key('y'), now);
+    app.update(code(KeyCode::Esc), now);
+    assert!(matches!(app.stack.last(), Some(View::Variables(_))));
+    let before = app.pending.clone();
+    select_all_three(&mut app, now);
+    assert!(app.update(key('d'), now).is_empty());
+    assert!(
+        app.message.as_deref().unwrap().contains("is deploying"),
+        "{:?}",
+        app.message
+    );
+    assert_eq!(app.pending, before);
+}
+
+#[test]
+fn visual_r_reveals_all_then_hides_all() {
+    let now = Instant::now();
+    let mut app = app_in_variables(now);
+    go_to(&mut app, "PORT");
+    app.update(key('r'), now);
+    assert_eq!(revealed(&app), ["PORT"]);
+    select_all_three(&mut app, now);
+    app.update(key('r'), now);
+    assert_eq!(revealed(&app), ["DB_URL", "PORT", "REDIS_DB"]);
+    assert_eq!(app.visual_range(), None);
+    select_all_three(&mut app, now);
+    app.update(key('r'), now);
+    assert!(revealed(&app).is_empty());
+    assert_eq!(app.visual_range(), None);
+}
+
+#[test]
+fn visual_ignores_edit_keys() {
+    let now = Instant::now();
+    let mut app = app_in_variables(now);
+    select_all_three(&mut app, now);
+    let before = app.pending.clone();
+    for k in [
+        KeyCode::Char('a'),
+        KeyCode::Char('e'),
+        KeyCode::Enter,
+        KeyCode::Char('E'),
+        KeyCode::Char('u'),
+    ] {
+        assert!(app.update(code(k), now).is_empty(), "{k:?}");
+        assert!(app.modal.is_none(), "{k:?}");
+        assert_eq!(app.pending, before, "{k:?}");
+        assert_eq!(app.visual_range(), Some(0..=2), "{k:?}");
+    }
+}
+
+#[test]
+fn stale_anchor_ends_visual_mode() {
+    let now = Instant::now();
+    let mut app = app_in_variables(now);
+    let target = crate::pending::Target {
+        project_id: "p2",
+        env_id: "e-prod",
+        env_name: "production",
+        service_id: "svc-a",
+        service_name: "svc-a-name",
+    };
+    app.pending_mut().set(&target, "NEW", "v".into(), None);
+    go_to(&mut app, "NEW");
+    app.update(key('v'), now);
+    app.update(key('j'), now);
+    assert_eq!(app.visual_range(), Some(1..=2));
+    app.pending_mut().undo("e-prod", "svc-a", "NEW");
+    assert_eq!(app.visual_range(), None);
+    app.update(key('j'), now);
+    assert_eq!(anchor(&app), None);
+    assert_eq!(app.visual_range(), None);
+
+    go_to(&mut app, "DB_URL");
+    app.update(key('v'), now);
+    assert_eq!(anchor(&app), Some("DB_URL"));
+    app.update(key('/'), now);
+    assert_eq!(anchor(&app), None);
+}
+
+#[test]
+fn visual_range_ends_when_the_filter_hides_the_anchor() {
+    let now = Instant::now();
+    let mut app = app_in_variables(now);
+    go_to(&mut app, "DB_URL");
+    app.update(key('v'), now);
+    app.table_filter = Some("REDIS".into());
+    assert_eq!(app.visual_range(), None);
+}

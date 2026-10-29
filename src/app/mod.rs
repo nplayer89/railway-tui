@@ -5,6 +5,7 @@ mod keys;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -762,6 +763,20 @@ impl App {
         rows.into_values()
             .filter(|r| self.passes_filter(&[r.name]))
             .collect()
+    }
+
+    /// Indices into `variable_rows()` from the visual anchor to the cursor, either way
+    /// round. None outside Variables, with no anchor, or when the anchor's row is gone
+    /// (or hidden by the filter).
+    pub fn visual_range(&self) -> Option<RangeInclusive<usize>> {
+        let Some(View::Variables(v)) = self.stack.last() else {
+            return None;
+        };
+        let anchor = v.anchor.as_deref()?;
+        let rows = self.variable_rows();
+        let start = rows.iter().position(|r| r.name == anchor)?;
+        let cursor = position(&rows, self.selection.variable.as_deref(), |r| r.name);
+        Some(start.min(cursor)..=start.max(cursor))
     }
 
     /// Pending changes of the open project: the current environment first, then the

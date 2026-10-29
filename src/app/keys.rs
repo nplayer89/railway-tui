@@ -53,6 +53,7 @@ impl App {
                 KeyCode::Char('q') => self.quit(out),
                 KeyCode::Char(':') => self.modal = Some(Modal::Command(String::new())),
                 KeyCode::Char('/') => {
+                    self.set_visual_anchor(None);
                     let current = match self.logs_mut() {
                         Some(logs) => logs.filter.clone(),
                         None => self.table_filter.clone(),
@@ -388,6 +389,12 @@ impl App {
     }
 
     fn variables_key(&mut self, code: KeyCode, out: &mut Vec<Command>) -> bool {
+        // An anchor whose row is gone (or filtered out) counts as none.
+        if self.visual_range().is_none() {
+            self.set_visual_anchor(None);
+        } else if let Some(handled) = self.visual_key(code, out) {
+            return handled;
+        }
         let edits = matches!(
             code,
             KeyCode::Char('a' | 'e' | 'E' | 'd' | 'u') | KeyCode::Enter
@@ -435,6 +442,10 @@ impl App {
                     self.copy_rows(&[name], c == 'Y', out);
                 }
             }
+            KeyCode::Char('v') => {
+                let name = self.selected_var_name();
+                self.set_visual_anchor(name);
+            }
             KeyCode::Char('p') => self.open_pending(out),
             KeyCode::Char('R') => {
                 if let Some(View::Variables(v)) = self.stack.last_mut() {
@@ -444,6 +455,56 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    /// Keys while a visual range is active. None leaves the key to the normal handling
+    /// (movement, `p`, `R`); the range follows the cursor.
+    fn visual_key(&mut self, code: KeyCode, out: &mut Vec<Command>) -> Option<bool> {
+        let names: Vec<String> = {
+            let range = self.visual_range()?;
+            let rows = self.variable_rows();
+            rows[range].iter().map(|r| r.name.to_string()).collect()
+        };
+        match code {
+            KeyCode::Char('v') | KeyCode::Esc => {}
+            KeyCode::Char(c @ ('y' | 'Y')) => self.copy_rows(&names, c == 'Y', out),
+            KeyCode::Char('d') => {
+                if self.refuse_while_deploying() {
+                    return Some(true);
+                }
+                let mut staged = false;
+                for name in &names {
+                    if self.var_state(name).1 != Some(Change::Delete) {
+                        staged |= self.stage_delete(name);
+                    }
+                }
+                if staged {
+                    out.push(self.save_pending());
+                }
+            }
+            KeyCode::Char('r') => {
+                if let Some(View::Variables(v)) = self.stack.last_mut() {
+                    if names.iter().all(|n| v.revealed.contains(n)) {
+                        for name in &names {
+                            v.revealed.remove(name);
+                        }
+                    } else {
+                        v.revealed.extend(names);
+                    }
+                }
+            }
+            // Single-row edits make no sense over a range.
+            KeyCode::Char('a' | 'e' | 'E' | 'u') | KeyCode::Enter => return Some(true),
+            _ => return None,
+        }
+        self.set_visual_anchor(None);
+        Some(true)
+    }
+
+    fn set_visual_anchor(&mut self, name: Option<String>) {
+        if let Some(View::Variables(v)) = self.stack.last_mut() {
+            v.anchor = name;
+        }
     }
 
     /// Copies the shown value (a pending `Set`, else the current one) of each name, raw
@@ -672,14 +733,20 @@ impl App {
     }
 
     fn toggle_delete(&mut self, name: &str, out: &mut Vec<Command>) {
-        let (current, pending) = self.var_state(name);
-        // A sealed variable the value map omits still exists on Railway.
-        let current = current.or_else(|| self.sealed_names().contains(name).then(String::new));
+        let pending = self.var_state(name).1;
         if pending == Some(Change::Delete) {
             self.undo_variable(name, out);
-        } else if self.with_target(|p, t| p.delete(t, name, current.as_deref())) {
+        } else if self.stage_delete(name) {
             out.push(self.save_pending());
         }
+    }
+
+    /// Marks `name` for deletion; the caller saves. False without a target.
+    fn stage_delete(&mut self, name: &str) -> bool {
+        let current = self.var_state(name).0;
+        // A sealed variable the value map omits still exists on Railway.
+        let current = current.or_else(|| self.sealed_names().contains(name).then(String::new));
+        self.with_target(|p, t| p.delete(t, name, current.as_deref()))
     }
 
     /// Forgets the pending change of `name`, unless Railway already holds it:
