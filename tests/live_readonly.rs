@@ -11,14 +11,14 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
 use railway_tui::api::subscribe::{connect_authed, deployment_logs_stream};
 use railway_tui::api::Api;
 use railway_tui::auth::{token_source_from_env, TokenSource};
-use railway_tui::budget::{parse_hourly_limit, RateBudget};
+use railway_tui::budget::{parse_hourly_limit, RateBudget, SharedBudget};
 use railway_tui::model::{DeploymentStatus, DeploymentSummary, LogLine};
 use railway_tui::worker::{HTTP_ENDPOINT, WS_ENDPOINT};
 use url::Url;
@@ -39,8 +39,9 @@ fn api(tokens: Arc<dyn TokenSource>) -> Api {
     Api::new(
         Url::parse(HTTP_ENDPOINT).unwrap(),
         tokens,
-        Arc::new(Mutex::new(RateBudget::new(None))),
+        SharedBudget::new(RateBudget::new(None)),
     )
+    .unwrap()
 }
 
 fn short(s: &str, n: usize) -> String {
@@ -107,7 +108,7 @@ fn tail(id: &str) -> &str {
 }
 
 fn remaining(api: &Api) -> Option<u32> {
-    api.budget().lock().unwrap().remaining()
+    api.budget().lock().remaining()
 }
 
 /// 2 requests: one raw query to see every header, one through `Api`.
@@ -145,7 +146,7 @@ async fn live_rate_limit_headers() {
     let api = api(tokens);
     api.workspaces().await.expect("workspaces");
     let budget = api.budget();
-    let b = budget.lock().unwrap();
+    let b = budget.lock();
     println!(
         "budget after workspaces(): hourly_limit={:?} remaining={:?}",
         b.hourly_limit(),
@@ -166,7 +167,7 @@ async fn live_subscription_metering() {
     let target = find_target(&api).await;
     let before = remaining(&api);
 
-    let client = connect_authed(&Url::parse(WS_ENDPOINT).unwrap(), &tokens)
+    let client = connect_authed(api.ws_http(), &Url::parse(WS_ENDPOINT).unwrap(), &tokens)
         .await
         .expect("websocket");
     let mut stream = deployment_logs_stream(&client, &target.active.id);
@@ -406,7 +407,7 @@ async fn live_build_logs() {
     println!(
         "deployment …{} status {} createdAt {}",
         tail(&dep.id),
-        dep.status.label(),
+        dep.status,
         dep.created_at.to_rfc3339()
     );
     let logs = api

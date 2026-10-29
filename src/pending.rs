@@ -212,32 +212,36 @@ pub fn pending_path(xdg_state_home: Option<&Path>, home: &Path) -> PathBuf {
     base.join("railway-tui").join("pending.toml")
 }
 
+/// Why the pending changes file could not be loaded. Never holds file
+/// contents: the parser's error, which can quote them, is dropped.
+#[derive(Debug, thiserror::Error)]
+pub enum LoadPendingError {
+    #[error("could not read pending changes file: {}", .0.kind())]
+    Read(#[source] io::Error),
+    #[error("pending changes file was unreadable; moved to {}", .0.display())]
+    MovedAside(PathBuf),
+    #[error("pending changes file was unreadable and could not be moved aside: {}", .0.kind())]
+    NotMovedAside(#[source] io::Error),
+}
+
 /// A missing file gives the default. A corrupt file is moved to
 /// `pending.toml.corrupt-<unix seconds>` (never over an earlier one) and reported,
-/// never silently dropped. Error text never includes file contents.
-pub fn load_pending(path: &Path) -> Result<Pending, String> {
+/// never silently dropped.
+pub fn load_pending(path: &Path) -> Result<Pending, LoadPendingError> {
     let parsed = match std::fs::read_to_string(path) {
         Ok(text) => toml::from_str::<Pending>(&text).ok(),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Pending::default()),
         // Not valid UTF-8: corrupt.
         Err(e) if e.kind() == io::ErrorKind::InvalidData => None,
-        Err(e) => {
-            return Err(format!("could not read pending changes file: {}", e.kind()));
-        }
+        Err(e) => return Err(LoadPendingError::Read(e)),
     };
     if let Some(p) = parsed {
         return Ok(p);
     }
     let aside = corrupt_aside_path(path);
     match std::fs::rename(path, &aside) {
-        Ok(()) => Err(format!(
-            "pending changes file was unreadable; moved to {}",
-            aside.display()
-        )),
-        Err(e) => Err(format!(
-            "pending changes file was unreadable and could not be moved aside: {}",
-            e.kind()
-        )),
+        Ok(()) => Err(LoadPendingError::MovedAside(aside)),
+        Err(e) => Err(LoadPendingError::NotMovedAside(e)),
     }
 }
 
@@ -524,10 +528,13 @@ mod tests {
     }
 
     /// The path `load_pending` reported moving the corrupt file to.
-    fn moved_to(err: &str) -> PathBuf {
+    fn moved_to(err: &LoadPendingError) -> PathBuf {
+        let LoadPendingError::MovedAside(aside) = err else {
+            panic!("{err:?}");
+        };
         let prefix = "pending changes file was unreadable; moved to ";
-        assert!(err.starts_with(prefix), "{err}");
-        PathBuf::from(&err[prefix.len()..])
+        assert_eq!(err.to_string(), format!("{prefix}{}", aside.display()));
+        aside.clone()
     }
 
     #[test]
@@ -541,7 +548,8 @@ mod tests {
         let name = aside.file_name().unwrap().to_str().unwrap();
         let stamp = name.strip_prefix("pending.toml.corrupt-").unwrap();
         assert!(stamp.parse::<u64>().is_ok(), "{name}");
-        assert!(!err.contains("SECRET"));
+        assert!(!err.to_string().contains("SECRET"));
+        assert!(!format!("{err:?}").contains("SECRET"));
         assert!(!path.exists());
         assert_eq!(
             std::fs::read_to_string(&aside).unwrap(),

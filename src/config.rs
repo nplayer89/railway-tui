@@ -18,10 +18,19 @@ pub struct Config {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("{path}: {message}")]
-pub struct ConfigError {
-    path: String,
-    message: String,
+pub enum ConfigError {
+    #[error("{}: {source}", path.display())]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{}: {source}", path.display())]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
 }
 
 /// `<xdg or home/.config>/railway-tui/railway-tui.conf`. An empty XDG value counts as unset.
@@ -35,16 +44,20 @@ pub fn config_path(xdg_config_home: Option<&Path>, home: &Path) -> PathBuf {
 
 /// A missing file gives the default config.
 pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
-    let err = |message: String| ConfigError {
-        path: path.display().to_string(),
-        message,
-    };
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
-        Err(e) => return Err(err(e.to_string())),
+        Err(source) => {
+            return Err(ConfigError::Read {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
     };
-    toml::from_str(&text).map_err(|e| err(e.to_string()))
+    toml::from_str(&text).map_err(|source| ConfigError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]

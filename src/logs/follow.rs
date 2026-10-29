@@ -127,7 +127,7 @@ impl LogSource for RailwayLogSource {
     ) -> Result<BoxStream<'static, Result<Vec<LogLine>, ApiError>>, ApiError> {
         match self.kind {
             LogKind::Runtime => {
-                let client = connect_authed(&self.ws, &self.tokens).await?;
+                let client = connect_authed(self.api.ws_http(), &self.ws, &self.tokens).await?;
                 Ok(deployment_logs_stream(&client, &self.deployment_id))
             }
             LogKind::Build => {
@@ -142,7 +142,7 @@ impl LogSource for RailwayLogSource {
                         .chain(futures::stream::pending())
                         .boxed());
                 };
-                let client = connect_authed(&self.ws, &self.tokens).await?;
+                let client = connect_authed(self.api.ws_http(), &self.ws, &self.tokens).await?;
                 Ok(build_logs_stream(
                     &client,
                     &self.env_id,
@@ -838,22 +838,20 @@ mod tests {
     // ---- RailwayLogSource, against a wiremock server (never the live API) ----
 
     mod railway {
-        use std::sync::Mutex;
-
         use serde_json::json;
         use wiremock::matchers::{body_string_contains, method};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         use super::*;
         use crate::auth::EnvTokenSource;
-        use crate::budget::RateBudget;
+        use crate::budget::{RateBudget, SharedBudget};
 
         fn build_source(server: &MockServer) -> RailwayLogSource {
             let tokens: Arc<dyn TokenSource> = Arc::new(EnvTokenSource("t".into()));
             let http = Url::parse(&format!("{}/graphql/v2", server.uri())).unwrap();
             let ws = Url::parse(&server.uri().replace("http", "ws")).unwrap();
-            let budget = Arc::new(Mutex::new(RateBudget::new(None)));
-            let api = Arc::new(Api::new(http, tokens.clone(), budget));
+            let budget = SharedBudget::new(RateBudget::new(None));
+            let api = Arc::new(Api::new(http, tokens.clone(), budget).unwrap());
             RailwayLogSource::new(
                 api,
                 ws,

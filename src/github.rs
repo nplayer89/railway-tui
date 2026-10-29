@@ -10,11 +10,27 @@ use std::time::Duration;
 pub const GH: &str = "gh";
 const GH_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Why `gh` could not list a repo's branches. Short, and never holds more
+/// than the first line `gh` printed.
+#[derive(Debug, thiserror::Error)]
+pub enum GhError {
+    #[error("not an owner/name repo: {0}")]
+    InvalidRepo(String),
+    #[error("gh is not installed")]
+    Missing,
+    #[error("gh timed out")]
+    Timeout,
+    #[error("could not run gh: {}", .0.kind())]
+    Spawn(#[source] io::Error),
+    /// `gh` ran and failed; holds the first line it printed.
+    #[error("gh: {0}")]
+    Failed(String),
+}
+
 /// Every branch name of `repo` (`owner/name`), following GitHub's pagination.
-/// Errors are short and never hold more than the first line `gh` printed.
-pub async fn branches(gh: &Path, repo: &str) -> Result<Vec<String>, String> {
+pub async fn branches(gh: &Path, repo: &str) -> Result<Vec<String>, GhError> {
     if !valid_repo(repo) {
-        return Err(format!("not an owner/name repo: {repo}"));
+        return Err(GhError::InvalidRepo(repo.to_string()));
     }
     let mut cmd = tokio::process::Command::new(gh);
     cmd.args(["api", &format!("repos/{repo}/branches"), "--paginate"])
@@ -25,17 +41,15 @@ pub async fn branches(gh: &Path, repo: &str) -> Result<Vec<String>, String> {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     let output = match tokio::time::timeout(GH_TIMEOUT, cmd.output()).await {
-        Err(_) => return Err("gh timed out".into()),
-        Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => {
-            return Err("gh is not installed".into())
-        }
-        Ok(Err(e)) => return Err(format!("could not run gh: {}", e.kind())),
+        Err(_) => return Err(GhError::Timeout),
+        Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => return Err(GhError::Missing),
+        Ok(Err(e)) => return Err(GhError::Spawn(e)),
         Ok(Ok(output)) => output,
     };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let first = stderr.lines().map(str::trim).find(|l| !l.is_empty());
-        return Err(format!("gh: {}", first.unwrap_or("failed")));
+        return Err(GhError::Failed(first.unwrap_or("failed").to_string()));
     }
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -91,7 +105,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let gh = fake_gh(dir.path(), "", "\nHTTP 404: Not Found\nmore", 1);
         assert_eq!(
-            branches(&gh, "acme/api").await.unwrap_err(),
+            branches(&gh, "acme/api").await.unwrap_err().to_string(),
             "gh: HTTP 404: Not Found"
         );
     }
@@ -99,10 +113,9 @@ mod tests {
     #[tokio::test]
     async fn a_missing_gh_says_so() {
         let missing = Path::new("/nonexistent/gh");
-        assert_eq!(
-            branches(missing, "acme/api").await.unwrap_err(),
-            "gh is not installed"
-        );
+        let err = branches(missing, "acme/api").await.unwrap_err();
+        assert!(matches!(err, GhError::Missing), "{err:?}");
+        assert_eq!(err.to_string(), "gh is not installed");
     }
 
     #[test]

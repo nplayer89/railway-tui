@@ -12,8 +12,8 @@ use crate::theme::{Theme, THEMES};
 /// The default theme, which the fixtures render with.
 const T: &Theme = &THEMES[0];
 use crate::app::{
-    App, BranchChoices, BranchPicker, BranchSwitch, Confirm, LatestConfirm, LogsView, StartPrefs,
-    View,
+    App, BranchChoices, BranchPicker, BranchSwitch, Confirm, LatestConfirm, LogsView, Modal,
+    StartPrefs, View,
 };
 use crate::logs::buffer::{LogBuffer, LOG_CAP};
 use crate::logs::follow::StreamState;
@@ -399,7 +399,7 @@ fn overlays_message_and_command_line() {
     app.help = true;
     assert!(text(&render(&app, Instant::now())).contains("Help"));
     app.help = false;
-    app.command_line = Some("dep".into());
+    app.modal = Some(Modal::Command("dep".into()));
     let buf = render(&app, Instant::now());
     assert!(row_text(&buf, 29).starts_with(":dep"));
 }
@@ -503,7 +503,7 @@ fn envs(n: usize) -> Vec<crate::model::Environment> {
 fn env_picker_lists_and_highlights_selected() {
     let mut app = services_app(vec![]);
     app.environments.value = Some(envs(3));
-    app.env_picker = Some(1);
+    app.modal = Some(Modal::EnvPicker(1));
     let buf = render(&app, Instant::now());
     let t = text(&buf);
     assert!(
@@ -522,7 +522,7 @@ fn env_picker_lists_and_highlights_selected() {
 fn env_picker_with_more_environments_than_fit_does_not_panic() {
     let mut app = services_app(vec![]);
     app.environments.value = Some(envs(80));
-    app.env_picker = Some(79);
+    app.modal = Some(Modal::EnvPicker(79));
     render(&app, Instant::now());
     render_sized(&app, Instant::now(), 20, 5);
 }
@@ -651,7 +651,7 @@ fn theme_paints_background_and_status_colours() {
 #[test]
 fn theme_picker_lists_every_theme() {
     let mut app = services_app(vec![]);
-    app.theme_picker = Some(0);
+    app.modal = Some(Modal::ThemePicker { restore: 0 });
     let t = text(&render_sized(&app, Instant::now(), 100, 40));
     for theme in THEMES {
         assert!(t.contains(theme.name), "missing {}\n{t}", theme.name);
@@ -714,8 +714,7 @@ fn press(app: &mut App, c: char) {
 }
 
 fn add_pending(app: &mut App, name: &str, change: crate::pending::Change, base: Option<&str>) {
-    let sp = app
-        .pending
+    let sp = std::sync::Arc::make_mut(&mut app.pending)
         .envs
         .entry("e1".into())
         .or_default()
@@ -835,8 +834,7 @@ fn pending_values_app() -> App {
     };
     add_pending(&mut app, "ADD", set("addsecret"), None);
     add_pending(&mut app, "CHG", set("chgsecret"), Some("oldsecret"));
-    let sp = app
-        .pending
+    let sp = std::sync::Arc::make_mut(&mut app.pending)
         .envs
         .get_mut("e1")
         .unwrap()
@@ -899,15 +897,15 @@ fn header_shows_pending_count() {
 #[test]
 fn footer_shows_variable_input() {
     let mut app = vars_app("staging", &[("A", "1")]);
-    app.var_input = Some(crate::app::VarInput {
+    app.modal = Some(Modal::VarInput(crate::app::VarInput {
         name: None,
-        text: "NEW".into(),
-    });
+        text: crate::app::Secret::new("NEW".into()),
+    }));
     assert!(row_text(&render(&app, Instant::now()), 29).contains("name: NEW▏"));
-    app.var_input = Some(crate::app::VarInput {
+    app.modal = Some(Modal::VarInput(crate::app::VarInput {
         name: Some("A".into()),
-        text: "val".into(),
-    });
+        text: crate::app::Secret::new("val".into()),
+    }));
     assert!(row_text(&render(&app, Instant::now()), 29).contains("A = val▏"));
 }
 
@@ -928,8 +926,7 @@ fn review_app() -> App {
         crate::pending::Change::Delete,
         Some("oldsecret"),
     );
-    let sp = app
-        .pending
+    let sp = std::sync::Arc::make_mut(&mut app.pending)
         .envs
         .get_mut("e1")
         .unwrap()
@@ -978,8 +975,7 @@ fn review_orphan_label_and_discard_prompt() {
 #[test]
 fn written_not_deployed_only_when_every_entry_is_written() {
     let mut app = review_app();
-    let sp = app
-        .pending
+    let sp = std::sync::Arc::make_mut(&mut app.pending)
         .envs
         .get_mut("e1")
         .unwrap()
@@ -991,8 +987,7 @@ fn written_not_deployed_only_when_every_entry_is_written() {
     assert!(t.contains("partly written"), "{t}");
     assert!(!t.contains("written, not deployed"), "{t}");
     // An edit re-based on a written value: nothing applied, but the flag is set.
-    let sp = app
-        .pending
+    let sp = std::sync::Arc::make_mut(&mut app.pending)
         .envs
         .get_mut("e1")
         .unwrap()
@@ -1001,8 +996,7 @@ fn written_not_deployed_only_when_every_entry_is_written() {
     sp.vars.values_mut().for_each(|v| v.applied = false);
     let t = text(&render(&app, Instant::now()));
     assert!(t.contains("partly written"), "{t}");
-    let sp = app
-        .pending
+    let sp = std::sync::Arc::make_mut(&mut app.pending)
         .envs
         .get_mut("e1")
         .unwrap()
@@ -1012,8 +1006,7 @@ fn written_not_deployed_only_when_every_entry_is_written() {
     let t = text(&render(&app, Instant::now()));
     assert!(t.contains("written, not deployed"), "{t}");
     assert!(!t.contains("partly written"), "{t}");
-    let sp = app
-        .pending
+    let sp = std::sync::Arc::make_mut(&mut app.pending)
         .envs
         .get_mut("e1")
         .unwrap()
@@ -1035,11 +1028,13 @@ fn review_labels_a_group_whose_service_is_gone() {
 }
 
 fn deploy_confirm(app: &mut App, drift: &[&str]) {
-    app.confirm = Some(crate::app::Confirm::Deploy(crate::app::DeployConfirm {
-        env_id: "e1".into(),
-        service_id: "svc-1".into(),
-        drift: drift.iter().map(|d| d.to_string()).collect(),
-    }));
+    app.modal = Some(Modal::Confirm(crate::app::Confirm::Deploy(
+        crate::app::DeployConfirm {
+            env_id: "e1".into(),
+            service_id: "svc-1".into(),
+            drift: drift.iter().map(|d| d.to_string()).collect(),
+        },
+    )));
 }
 
 /// The column of `needle` in `row`, counted in cells.
@@ -1083,7 +1078,7 @@ fn production_confirm_shows_env_in_bad_colour() {
     assert_eq!(buf[(x, y)].fg, T.bad);
 
     let mut app = review_app();
-    app.pending
+    std::sync::Arc::make_mut(&mut app.pending)
         .envs
         .get_mut("e1")
         .unwrap()
@@ -1257,18 +1252,20 @@ fn latest_commit_confirm_shows_target_source_and_what_runs_now() {
         deploy("d1", DeploymentStatus::Success, &[InstanceStatus::Running]),
         vec![],
     )]);
-    app.confirm = Some(Confirm::DeployLatest(Box::new(LatestConfirm {
-        project_id: "p".into(),
-        env_id: "e-prod".into(),
-        env_name: "production".into(),
-        service_id: "api-id".into(),
-        service_name: "api".into(),
-        repo: Some("acme/api".into()),
-        branch: Some("main".into()),
-        current: Some(deploy("d1", DeploymentStatus::Success, &[])),
-        written: 2,
-        switch: None,
-    })));
+    app.modal = Some(Modal::Confirm(Confirm::DeployLatest(Box::new(
+        LatestConfirm {
+            project_id: "p".into(),
+            env_id: "e-prod".into(),
+            env_name: "production".into(),
+            service_id: "api-id".into(),
+            service_name: "api".into(),
+            repo: Some("acme/api".into()),
+            branch: Some("main".into()),
+            current: Some(deploy("d1", DeploymentStatus::Success, &[])),
+            written: 2,
+            switch: None,
+        },
+    ))));
     let screen = text(&render(&app, Instant::now()));
     for want in [
         "Deploy latest commit to production",
@@ -1302,13 +1299,13 @@ fn latest_confirm(switch: Option<BranchSwitch>) -> LatestConfirm {
 #[test]
 fn branch_confirm_shows_the_switch_and_that_it_stays() {
     let mut app = services_app(vec![]);
-    app.confirm = Some(Confirm::DeployLatest(Box::new(latest_confirm(Some(
-        BranchSwitch {
+    app.modal = Some(Modal::Confirm(Confirm::DeployLatest(Box::new(
+        latest_confirm(Some(BranchSwitch {
             trigger_id: "t1".into(),
             from: "main".into(),
             to: "feat/x".into(),
-        },
-    )))));
+        })),
+    ))));
     let screen = text(&render(&app, Instant::now()));
     for want in [
         "Deploy branch feat/x to production",
@@ -1329,7 +1326,7 @@ fn branch_picker_shows_loading_then_the_filtered_list() {
         query: "fe".into(),
         index: 1,
     };
-    app.branch_picker = Some(picker.clone());
+    app.modal = Some(Modal::BranchPicker(Box::new(picker.clone())));
     let screen = text(&render(&app, Instant::now()));
     assert!(screen.contains("Deploy branch: api"), "{screen}");
     assert!(screen.contains("> fe▏"), "{screen}");
@@ -1341,7 +1338,7 @@ fn branch_picker_shows_loading_then_the_filtered_list() {
         names: vec!["feat/a".into(), "feat/b".into(), "main".into()],
         unlisted: None,
     }));
-    app.branch_picker = Some(picker);
+    app.modal = Some(Modal::BranchPicker(Box::new(picker)));
     let buf = render(&app, Instant::now());
     let screen = text(&buf);
     assert!(screen.contains("feat/a  (connected)"), "{screen}");
@@ -1361,7 +1358,7 @@ fn branch_picker_shows_loading_then_the_filtered_list() {
 fn unlisted_branches_explain_why_wrapped_and_ask_for_a_name() {
     let mut app = services_app(vec![]);
     let why = "gh: HTTP 404: Not Found; Railway: Railway API error: Not Authorized (this is long)";
-    app.branch_picker = Some(BranchPicker {
+    app.modal = Some(Modal::BranchPicker(Box::new(BranchPicker {
         target: latest_confirm(None),
         choices: Some(Ok(BranchChoices {
             trigger_id: "t1".into(),
@@ -1371,7 +1368,7 @@ fn unlisted_branches_explain_why_wrapped_and_ask_for_a_name() {
         })),
         query: "feat/x".into(),
         index: 0,
-    });
+    })));
     let screen = text(&render(&app, Instant::now()));
     for want in [
         "│ could not list branches: gh: HTTP 404: Not Found;        │",

@@ -10,9 +10,10 @@ use std::time::Instant;
 
 use super::{
     App, BranchChoices, BranchPicker, BranchReply, BranchSwitch, Command, Confirm, DeployConfirm,
-    DeployStep, Kind, LatestConfirm, LatestOutcome, Phase, VarsPurpose, View,
+    DeployStep, GroupKey, Kind, LatestConfirm, LatestOutcome, Modal, Phase, Secret, VarsPurpose,
+    View,
 };
-use crate::model::Variables;
+use crate::model::{Variables, WriteFailure};
 use crate::pending::Change;
 
 /// A deploy in flight: exactly what was sent, and the names to report it by.
@@ -45,7 +46,7 @@ impl App {
     /// commit, showing what is deployed now and where the new one goes.
     pub(super) fn request_deploy_latest(&mut self, service_id: String) {
         if let Some(target) = self.latest_target(&service_id) {
-            self.confirm = Some(Confirm::DeployLatest(Box::new(target)));
+            self.modal = Some(Modal::Confirm(Confirm::DeployLatest(Box::new(target))));
         }
     }
 
@@ -68,12 +69,12 @@ impl App {
             service_id: target.service_id.clone(),
             repo,
         });
-        self.branch_picker = Some(BranchPicker {
+        self.modal = Some(Modal::BranchPicker(Box::new(BranchPicker {
             target,
             choices: None,
             query: String::new(),
             index: 0,
-        });
+        })));
     }
 
     /// The service's triggers and branches arrived: fill the open picker.
@@ -83,14 +84,14 @@ impl App {
         service_id: &str,
         result: Result<BranchReply, String>,
     ) {
-        let Some(picker) = self.branch_picker.as_mut() else {
+        let Some(Modal::BranchPicker(picker)) = &mut self.modal else {
             return;
         };
         if picker.target.env_id != env_id || picker.target.service_id != service_id {
             return;
         }
         let repo = picker.target.repo.as_deref().unwrap_or_default();
-        picker.choices = Some(result.and_then(|(triggers, names)| {
+        picker.choices = Some(result.and_then(|BranchReply { triggers, names }| {
             let trigger = triggers
                 .iter()
                 .find(|t| t.repository == repo)
@@ -113,7 +114,7 @@ impl App {
 
     /// Enter in the picker: confirm deploying the highlighted branch.
     pub(super) fn pick_branch(&mut self) {
-        let Some(picker) = self.branch_picker.as_ref() else {
+        let Some(Modal::BranchPicker(picker)) = &self.modal else {
             return;
         };
         let Some(Ok(choices)) = &picker.choices else {
@@ -133,14 +134,16 @@ impl App {
             to: name.clone(),
         });
         let service_id = picker.target.service_id.clone();
-        self.branch_picker = None;
+        self.modal = None;
         // Checked again: a deploy may have started while the picker was open.
         if let Some(target) = self.latest_target(&service_id) {
-            self.confirm = Some(Confirm::DeployLatest(Box::new(LatestConfirm {
-                branch: Some(name),
-                switch,
-                ..target
-            })));
+            self.modal = Some(Modal::Confirm(Confirm::DeployLatest(Box::new(
+                LatestConfirm {
+                    branch: Some(name),
+                    switch,
+                    ..target
+                },
+            ))));
         }
     }
 
@@ -155,8 +158,7 @@ impl App {
             self.message = Some("cannot deploy: the service is not loaded yet".into());
             return None;
         };
-        let key = (env.id.clone(), service_id.to_string());
-        if self.deploys.contains_key(&key) || self.latest_deploys.contains_key(&key) {
+        if self.is_deploying(&env.id, service_id) || self.is_deploying_latest(&env.id, service_id) {
             self.message = Some(format!("already deploying {}", svc.service_name));
             return None;
         }
@@ -189,7 +191,7 @@ impl App {
 
     /// `y` on the latest-commit confirm: send the deploy.
     pub(super) fn start_deploy_latest(&mut self, c: LatestConfirm, out: &mut Vec<Command>) {
-        let key = (c.env_id, c.service_id);
+        let key = GroupKey::new(c.env_id, c.service_id);
         if self.deploys.contains_key(&key) || self.latest_deploys.contains_key(&key) {
             self.message = Some(format!("already deploying {}", c.service_name));
             return;
@@ -214,8 +216,8 @@ impl App {
             },
         );
         out.push(Command::DeployLatest {
-            env_id: key.0,
-            service_id: key.1,
+            env_id: key.env_id,
+            service_id: key.service_id,
             switch: c.switch,
         });
     }
@@ -228,7 +230,7 @@ impl App {
         now: Instant,
         out: &mut Vec<Command>,
     ) {
-        let key = (env_id, service_id);
+        let key = GroupKey::new(env_id, service_id);
         let Some(sent) = self.latest_deploys.remove(&key) else {
             return;
         };
@@ -241,11 +243,15 @@ impl App {
         match outcome {
             LatestOutcome::Started => {
                 // Written variables went out with this deploy.
-                if self.pending.service(&key.0, &key.1).is_some_and(|sp| {
-                    sp.vars.values().any(|v| v.applied) || sp.written_not_deployed
-                }) {
+                if self
+                    .pending
+                    .service(&key.env_id, &key.service_id)
+                    .is_some_and(|sp| {
+                        sp.vars.values().any(|v| v.applied) || sp.written_not_deployed
+                    })
+                {
                     self.finish_deploy(&key);
-                    out.push(Command::SavePending(self.pending.clone()));
+                    out.push(self.save_pending());
                 }
                 self.message = Some(format!(
                     "{switched}deploying the latest commit of {name} to {}: Railway accepted it",
@@ -253,28 +259,35 @@ impl App {
                 ));
                 self.reload_after_deploy(&key, &sent.project_id, now, out);
                 if self.project_id() == Some(sent.project_id.as_str())
-                    && self.env_id() == Some(key.0.as_str())
-                    && self.view_service_id(Kind::Deployments) == Some(key.1.as_str())
+                    && self.env_id() == Some(key.env_id.as_str())
+                    && self.view_service_id(Kind::Deployments) == Some(key.service_id.as_str())
                 {
-                    self.load_deployments(key.1.clone(), now, out);
+                    self.load_deployments(key.service_id.clone(), now, out);
                 }
             }
-            LatestOutcome::Refused(error) => {
+            LatestOutcome::Failed {
+                error,
+                failure: WriteFailure::Refused,
+            } => {
                 self.message = Some(format!("{switched}deploy of {name} failed: {error}"));
             }
-            LatestOutcome::Unknown(_) => {
+            LatestOutcome::Failed {
+                failure: WriteFailure::Unknown,
+                ..
+            } => {
                 self.message = Some(format!(
                     "{switched}deploy of {name} outcome unknown — check the deployments view"
                 ));
             }
-            LatestOutcome::SwitchFailed { error, unknown } => {
+            LatestOutcome::SwitchFailed { error, failure } => {
                 let branch = sent.switched_to.as_deref().unwrap_or_default();
-                self.message = Some(if unknown {
-                    format!(
+                self.message = Some(match failure {
+                    WriteFailure::Unknown => format!(
                         "switching {name} to {branch}: outcome unknown — check its branch on Railway; nothing was deployed"
-                    )
-                } else {
-                    format!("could not switch {name} to {branch}: {error}; nothing was deployed")
+                    ),
+                    WriteFailure::Refused => format!(
+                        "could not switch {name} to {branch}: {error}; nothing was deployed"
+                    ),
                 });
             }
         }
@@ -290,10 +303,7 @@ impl App {
         let Some(sp) = self.pending.service(&env_id, &service_id) else {
             return Vec::new();
         };
-        if self
-            .deploys
-            .contains_key(&(env_id.clone(), service_id.clone()))
-        {
+        if self.is_deploying(&env_id, &service_id) {
             self.message = Some(format!("already deploying {}", sp.service_name));
             return Vec::new();
         }
@@ -308,8 +318,12 @@ impl App {
 
     /// Whether a deploy of this group is in flight (including its reconcile read).
     pub(super) fn is_deploying(&self, env_id: &str, service_id: &str) -> bool {
-        self.deploys
-            .contains_key(&(env_id.to_string(), service_id.to_string()))
+        self.deploys.keys().any(|k| k.is(env_id, service_id))
+    }
+
+    /// Whether a latest-commit deploy of this service is waiting for Railway's answer.
+    fn is_deploying_latest(&self, env_id: &str, service_id: &str) -> bool {
+        self.latest_deploys.keys().any(|k| k.is(env_id, service_id))
     }
 
     /// Railway's variables for a deploy check arrived: open the confirm.
@@ -332,24 +346,13 @@ impl App {
                 return;
             }
         };
-        if self
-            .deploys
-            .contains_key(&(env_id.clone(), service_id.clone()))
-        {
+        if self.is_deploying(&env_id, &service_id) {
             self.message = Some(format!("already deploying {}", sp.service_name));
             return;
         }
         // The confirm takes the next key, so it may only appear where Neil is
         // waiting for it: on the review, with nothing being typed or picked.
-        let busy = self.confirm.is_some()
-            || self.var_input.is_some()
-            || self.filter_input.is_some()
-            || self.command_line.is_some()
-            || self.env_picker.is_some()
-            || self.branch_picker.is_some()
-            || self.theme_picker.is_some()
-            || self.help
-            || self.kind() != Kind::Pending;
+        let busy = self.modal.is_some() || self.help || self.kind() != Kind::Pending;
         if busy {
             self.message = Some(format!(
                 "deploy check of {} done; press D again to deploy",
@@ -367,17 +370,17 @@ impl App {
             })
             .map(|(name, _)| name.clone())
             .collect();
-        self.confirm = Some(Confirm::Deploy(DeployConfirm {
+        self.modal = Some(Modal::Confirm(Confirm::Deploy(DeployConfirm {
             env_id,
             service_id,
             drift,
-        }));
+        })));
     }
 
     /// `y` on the deploy confirm: send the group's unapplied changes.
     pub(super) fn start_deploy(&mut self, d: DeployConfirm, out: &mut Vec<Command>) {
-        let key = (d.env_id, d.service_id);
-        let Some(sp) = self.pending.service(&key.0, &key.1) else {
+        let key = GroupKey::new(d.env_id, d.service_id);
+        let Some(sp) = self.pending.service(&key.env_id, &key.service_id) else {
             self.message = Some("nothing to deploy".into());
             return;
         };
@@ -409,9 +412,9 @@ impl App {
         ));
         out.push(Command::DeployService {
             project_id: sent.project_id.clone(),
-            env_id: key.0.clone(),
-            service_id: key.1.clone(),
-            upserts,
+            env_id: key.env_id.clone(),
+            service_id: key.service_id.clone(),
+            upserts: Secret::new(upserts),
             deletes,
             redeploy_only,
         });
@@ -426,7 +429,7 @@ impl App {
         now: Instant,
         out: &mut Vec<Command>,
     ) {
-        let key = (env_id, service_id);
+        let key = GroupKey::new(env_id, service_id);
         let Some(sent) = self.deploys.get(&key).cloned() else {
             return;
         };
@@ -437,7 +440,7 @@ impl App {
                         .get(name)
                         .is_some_and(|v| *change == Change::Set { value: v.clone() })
                 });
-                out.push(Command::SavePending(self.pending.clone()));
+                out.push(self.save_pending());
                 self.message = Some(format!(
                     "deploying {} to {}: variables written…",
                     sent.service_name, sent.env_name
@@ -447,7 +450,7 @@ impl App {
                 self.mark_applied(&key, |name, change| {
                     name == deleted && sent.deletes.contains(&deleted) && *change == Change::Delete
                 });
-                out.push(Command::SavePending(self.pending.clone()));
+                out.push(self.save_pending());
                 self.message = Some(format!(
                     "deploying {} to {}: {deleted} deleted…",
                     sent.service_name, sent.env_name
@@ -456,7 +459,7 @@ impl App {
             DeployStep::Redeployed => {
                 self.deploys.remove(&key);
                 self.finish_deploy(&key);
-                out.push(Command::SavePending(self.pending.clone()));
+                out.push(self.save_pending());
                 self.message = Some(format!(
                     "deployed {} to {}",
                     sent.service_name, sent.env_name
@@ -465,7 +468,7 @@ impl App {
             }
             DeployStep::Failed {
                 during: Phase::Redeploy,
-                unknown: true,
+                failure: WriteFailure::Unknown,
                 ..
             } => {
                 self.deploys.remove(&key);
@@ -473,7 +476,7 @@ impl App {
             }
             DeployStep::Failed {
                 during,
-                unknown: true,
+                failure: WriteFailure::Unknown,
                 ..
             } => {
                 // Kept in flight until Railway says what landed.
@@ -483,8 +486,8 @@ impl App {
                 ));
                 out.push(Command::LoadVariables {
                     project_id: sent.project_id,
-                    env_id: key.0,
-                    service_id: key.1,
+                    env_id: key.env_id,
+                    service_id: key.service_id,
                     purpose: VarsPurpose::Reconcile,
                 });
             }
@@ -504,7 +507,7 @@ impl App {
         result: Result<Variables, String>,
         out: &mut Vec<Command>,
     ) {
-        let key = (env_id, service_id);
+        let key = GroupKey::new(env_id, service_id);
         let Some(sent) = self.deploys.remove(&key) else {
             return;
         };
@@ -522,8 +525,8 @@ impl App {
             Change::Set { value } => current.get(name) == Some(value),
             Change::Delete => !current.contains_key(name),
         });
-        out.push(Command::SavePending(self.pending.clone()));
-        if let Some(sp) = self.pending.service(&key.0, &key.1) {
+        out.push(self.save_pending());
+        if let Some(sp) = self.pending.service(&key.env_id, &key.service_id) {
             let applied = sp.vars.values().filter(|v| v.applied).count();
             self.message = Some(format!(
                 "deploy of {} interrupted: {applied} of {} changes are on Railway; D retries",
@@ -535,12 +538,12 @@ impl App {
 
     /// Marks unapplied entries for which `matches(name, change)` holds; once
     /// every entry is applied the group is written but not deployed.
-    fn mark_applied(&mut self, key: &(String, String), matches: impl Fn(&str, &Change) -> bool) {
+    fn mark_applied(&mut self, key: &GroupKey, matches: impl Fn(&str, &Change) -> bool) {
         let Some(sp) = self
-            .pending
+            .pending_mut()
             .envs
-            .get_mut(&key.0)
-            .and_then(|s| s.get_mut(&key.1))
+            .get_mut(&key.env_id)
+            .and_then(|s| s.get_mut(&key.service_id))
         else {
             return;
         };
@@ -556,10 +559,10 @@ impl App {
 
     /// The redeploy succeeded: drop the applied entries. An entry edited while
     /// the deploy ran was not sent, so it stays pending.
-    fn finish_deploy(&mut self, key: &(String, String)) {
+    fn finish_deploy(&mut self, key: &GroupKey) {
         let applied: Vec<String> = self
             .pending
-            .service(&key.0, &key.1)
+            .service(&key.env_id, &key.service_id)
             .map(|sp| {
                 sp.vars
                     .iter()
@@ -569,13 +572,13 @@ impl App {
             })
             .unwrap_or_default();
         for name in applied {
-            self.pending.undo(&key.0, &key.1, &name);
+            self.pending_mut().undo(&key.env_id, &key.service_id, &name);
         }
         if let Some(sp) = self
-            .pending
+            .pending_mut()
             .envs
-            .get_mut(&key.0)
-            .and_then(|s| s.get_mut(&key.1))
+            .get_mut(&key.env_id)
+            .and_then(|s| s.get_mut(&key.service_id))
         {
             sp.written_not_deployed = false;
         }
@@ -584,19 +587,19 @@ impl App {
     /// Reloads Services and the service's variables when they show what was deployed.
     fn reload_after_deploy(
         &mut self,
-        key: &(String, String),
+        key: &GroupKey,
         project_id: &str,
         now: Instant,
         out: &mut Vec<Command>,
     ) {
-        if self.project_id() != Some(project_id) || self.env_id() != Some(key.0.as_str()) {
+        if self.project_id() != Some(project_id) || self.env_id() != Some(key.env_id.as_str()) {
             return;
         }
         if self.stack.iter().any(|v| matches!(v, View::Services)) {
             self.load_services(now, out);
         }
-        if self.view_service_id(Kind::Variables) == Some(key.1.as_str()) {
-            self.load_variables(key.1.clone(), now, out);
+        if self.view_service_id(Kind::Variables) == Some(key.service_id.as_str()) {
+            self.load_variables(key.service_id.clone(), now, out);
         }
     }
 }

@@ -11,7 +11,7 @@ use ratatui::Frame;
 
 use super::{box_style, clean};
 use crate::app::App;
-use crate::model::{DeploymentStatus, DeploymentSummary, InstanceStatus, ServiceInstance};
+use crate::model::{DeploymentStatus, DeploymentSummary, ServiceInstance};
 use crate::status::{box_colour, derive_row, Health, RowTag};
 use crate::theme::Theme;
 
@@ -53,7 +53,7 @@ fn deployment_colour(t: &Theme, s: &DeploymentStatus) -> Color {
         | D::Waiting
         | D::Initializing
         | D::NeedsApproval => t.busy,
-        _ => t.idle,
+        D::Removed | D::Removing | D::Skipped | D::Sleeping | D::Unknown(_) => t.idle,
     }
 }
 
@@ -103,7 +103,8 @@ pub(super) fn marquee(text: &str, width: usize, elapsed: Duration) -> String {
     chars[offset..offset + width].iter().collect()
 }
 
-fn short_sha(d: &DeploymentSummary) -> String {
+/// The first 7 characters of the commit, or `-` without one.
+pub(super) fn short_sha(d: &DeploymentSummary) -> String {
     d.commit_sha
         .as_deref()
         .filter(|s| !s.is_empty())
@@ -213,7 +214,7 @@ pub fn services(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>, ti
             if i > 0 {
                 boxes.push(Span::raw(" "));
             }
-            boxes.push(Span::styled("■", box_style(t, &box_colour(b))));
+            boxes.push(Span::styled("■", box_style(t, box_colour(b))));
         }
         box_width = box_width.max((row.boxes.len() * 2).saturating_sub(1) as u16);
         let mut status: Vec<Span> = Vec::new();
@@ -292,14 +293,14 @@ pub fn deployments(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>)
         .into_iter()
         .enumerate()
         .map(|(i, r)| {
-            let d = &r.deployment;
+            let d = r.deployment;
             let tag = match r.tag {
                 Some(RowTag::Latest) => "LATEST",
                 Some(RowTag::Active) => "ACTIVE",
                 None => "",
             };
             let mut status = vec![Span::styled(
-                clean(&d.status.label()),
+                clean(&d.status.to_string()),
                 Style::new().fg(deployment_colour(t, &d.status)),
             )];
             if let Some(e) = build_elapsed(d, now) {
@@ -345,13 +346,11 @@ pub fn instances(frame: &mut Frame, area: Rect, app: &App) {
         .into_iter()
         .enumerate()
         .map(|(n, (d, i))| {
-            let status = match &i.status {
-                InstanceStatus::Unknown(raw) => format!("UNKNOWN({})", clean(raw)),
-                other => format!("{other:?}").to_uppercase(),
-            };
+            // `clean` strips control characters from an unknown raw value.
+            let status = clean(&i.status.to_string());
             Row::new([
                 Cell::from(clean(&i.id)),
-                Cell::from(status).style(box_style(t, &box_colour(&i.status))),
+                Cell::from(status).style(box_style(t, box_colour(&i.status))),
                 Cell::from(clean(&d.id)).style(fg(t.muted)),
             ])
             .style(row_style(t, fg(t.text), selected == Some(n)))

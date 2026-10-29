@@ -6,24 +6,28 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Instant;
 
 use futures::{FutureExt, StreamExt};
 use graphql_ws_client::Client;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use url::Url;
 
 use crate::api::subscribe::{connect_authed, deployment_status_stream};
 use crate::api::write::WriteError;
 use crate::api::{Api, ApiError};
-use crate::app::{AppEvent, BranchSwitch, Command, DataEvent, DeployStep, LatestOutcome, Phase};
+use crate::app::{
+    AppEvent, BranchReply, BranchSwitch, Command, DataEvent, DeployStep, LatestOutcome, Phase,
+    Secret,
+};
 use crate::auth::TokenSource;
-use crate::budget::{backstop_interval, RateBudget};
+use crate::budget::{backstop_interval, SharedBudget};
+use crate::github::GhError;
 use crate::logs::follow::{follow_logs, FollowEvent, LogSource, RailwayLogSource, StreamState};
 use crate::pending::{save_pending, Pending};
-use crate::remember::save_remembered;
+use crate::remember::{save_remembered, Remembered};
 
 /// Railway's public GraphQL API over HTTP.
 pub const HTTP_ENDPOINT: &str = "https://backboard.railway.com/graphql/v2";
@@ -35,24 +39,49 @@ const DEPLOYMENT_HISTORY: i64 = 50;
 /// Buffer between one log follower and its forwarding loop.
 const FOLLOW_BUFFER: usize = 64;
 
-#[allow(clippy::too_many_arguments)]
+/// What the worker talks to and where it keeps its state.
+pub struct WorkerConfig {
+    pub api: Arc<Api>,
+    /// The `graphql-transport-ws` endpoint, for subscriptions.
+    pub ws: Url,
+    pub tokens: Arc<dyn TokenSource>,
+    /// Where the remembered selection is saved.
+    pub remembered_path: PathBuf,
+    /// Where pending changes are saved.
+    pub pending_path: PathBuf,
+    /// The configured polling backstop, in seconds.
+    pub configured_interval: Option<u64>,
+    /// The `gh` program used to list a repo's branches.
+    pub gh: PathBuf,
+}
+
 pub async fn run_worker(
-    api: Arc<Api>,
-    ws: Url,
-    tokens: Arc<dyn TokenSource>,
-    remembered_path: PathBuf,
-    pending_path: PathBuf,
-    configured_interval: Option<u64>,
-    gh: PathBuf,
+    config: WorkerConfig,
     mut cmds: mpsc::Receiver<Command>,
     events: mpsc::Sender<AppEvent>,
 ) {
-    let save_pending = spawn_pending_saver(pending_path, events.clone());
-    let mut worker = Worker {
+    let WorkerConfig {
         api,
         ws,
         tokens,
         remembered_path,
+        pending_path,
+        configured_interval,
+        gh,
+    } = config;
+    let pending_failed = (events.clone(), "could not save pending changes");
+    let save_pending = spawn_saver(
+        pending_path,
+        |path, pending: &Arc<Pending>| save_pending(path, pending),
+        Some(pending_failed),
+    );
+    // Best effort: a lost write only means a default selection next start.
+    let save_remembered = spawn_saver(remembered_path, save_remembered, None);
+    let mut worker = Worker {
+        api,
+        ws,
+        tokens,
+        save_remembered,
         save_pending,
         configured_interval,
         gh,
@@ -102,28 +131,44 @@ pub fn spawn_follower<S: LogSource + 'static>(
     })
 }
 
-/// Saves pending snapshots one at a time, in the order sent, skipping any that a
-/// newer one has already replaced. A failure comes back as `SaveFailed`, with a
-/// message that names the error, never a value.
-fn spawn_pending_saver(
+/// Saves each value sent on the returned channel to `path`, one at a time and in
+/// order, skipping any that a newer one replaced before its turn: two saves at
+/// once would race on the same temp file. Once the sender is dropped, a value
+/// not yet saved is still saved, then the loop ends.
+///
+/// The loop runs on the blocking pool, not as an async task, so the runtime's
+/// shutdown grace covers it: at exit the worker (and with it the sender) is
+/// dropped, and the last value is written before the runtime finishes.
+///
+/// With `report`, a failure comes back as `SaveFailed`, its message starting
+/// with the given text and naming the error, never a value; without it saving
+/// is best effort.
+fn spawn_saver<T>(
     path: PathBuf,
-    events: mpsc::Sender<AppEvent>,
-) -> mpsc::UnboundedSender<Pending> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Pending>();
-    tokio::spawn(async move {
-        while let Some(mut latest) = rx.recv().await {
-            while let Ok(newer) = rx.try_recv() {
-                latest = newer;
-            }
-            let target = path.clone();
-            let saved = tokio::task::spawn_blocking(move || save_pending(&target, &latest)).await;
+    save: fn(&Path, &T) -> std::io::Result<()>,
+    report: Option<(mpsc::Sender<AppEvent>, &'static str)>,
+) -> watch::Sender<Option<T>>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    let (tx, mut rx) = watch::channel(None);
+    tokio::task::spawn_blocking(move || {
+        // `changed` needs no runtime driver, so this keeps working during shutdown.
+        while futures::executor::block_on(rx.changed()).is_ok() {
+            let Some(latest) = rx.borrow_and_update().clone() else {
+                continue;
+            };
+            let saved = std::panic::catch_unwind(AssertUnwindSafe(|| save(&path, &latest)));
+            let Some((events, what)) = &report else {
+                continue;
+            };
             let failure = match saved {
                 Ok(Ok(())) => continue,
-                Ok(Err(e)) => format!("could not save pending changes: {e}"),
-                Err(_) => "could not save pending changes".to_string(),
+                Ok(Err(e)) => format!("{what}: {e}"),
+                Err(_) => what.to_string(),
             };
             let event = AppEvent::Data(DataEvent::SaveFailed(failure));
-            if events.send(event).await.is_err() {
+            if events.blocking_send(event).is_err() {
                 return;
             }
         }
@@ -135,8 +180,8 @@ struct Worker {
     api: Arc<Api>,
     ws: Url,
     tokens: Arc<dyn TokenSource>,
-    remembered_path: PathBuf,
-    save_pending: mpsc::UnboundedSender<Pending>,
+    save_remembered: watch::Sender<Option<Remembered>>,
+    save_pending: watch::Sender<Option<Arc<Pending>>>,
     configured_interval: Option<u64>,
     /// The `gh` program used to list a repo's branches.
     gh: PathBuf,
@@ -206,7 +251,10 @@ impl Worker {
                         api.triggers(&project_id, &e, &s),
                         list_branches(&api, &gh, &repo)
                     );
-                    Ok((triggers?, names))
+                    Ok(BranchReply {
+                        triggers: triggers?,
+                        names: names.map_err(|e| e.to_string()),
+                    })
                 };
                 self.load(request, |result| DataEvent::Branches {
                     env_id,
@@ -227,7 +275,7 @@ impl Worker {
                         env_id,
                         service_id,
                         purpose,
-                        result,
+                        result: result.map(Secret::new),
                     },
                 )
             }
@@ -247,8 +295,8 @@ impl Worker {
                 let (budget, interval) = (api.budget(), self.configured_interval);
                 let events = self.events.clone();
                 tokio::spawn(async move {
-                    let writes = (!redeploy_only).then_some((upserts, deletes));
-                    if run_deploy(&api, &target, writes, &events).await {
+                    let writes = (!redeploy_only).then_some((upserts.into_inner(), deletes));
+                    if run_deploy(&api, &target, writes, &events).await.is_ok() {
                         let budget = budget_event(&budget, interval);
                         let _ = events.send(AppEvent::Data(budget)).await;
                     }
@@ -276,7 +324,7 @@ impl Worker {
             }
             // One task saves in order, so snapshots never race on the temp file.
             Command::SavePending(pending) => {
-                let _ = self.save_pending.send(pending);
+                self.save_pending.send_replace(Some(pending));
             }
             Command::WatchDeployments { ids } => self.watch(ids),
             Command::OpenLogs {
@@ -304,12 +352,9 @@ impl Worker {
                     handle.abort();
                 }
             }
+            // Like pending snapshots: one task, so selections never race on the temp file.
             Command::SaveRemembered(remembered) => {
-                let path = self.remembered_path.clone();
-                // Best effort: a lost write only means a default selection next start.
-                tokio::task::spawn_blocking(move || {
-                    let _ = save_remembered(&path, &remembered);
-                });
+                self.save_remembered.send_replace(Some(remembered));
             }
             // The main loop exits on Quit; it never reaches the worker.
             // Both are handled by the main loop before commands reach the worker.
@@ -349,6 +394,7 @@ impl Worker {
         let task = watch_statuses(
             ids,
             self.watch.client.clone(),
+            self.api.ws_http().clone(),
             self.ws.clone(),
             self.tokens.clone(),
             self.events.clone(),
@@ -370,7 +416,7 @@ impl Worker {
 /// error if it failed or panicked, or a refusal while the rate budget is
 /// blocked. A `DataEvent::Budget` follows the reply.
 fn spawn_load<T, F, W>(
-    budget: Arc<Mutex<RateBudget>>,
+    budget: SharedBudget,
     configured_interval: Option<u64>,
     events: mpsc::Sender<AppEvent>,
     request: F,
@@ -380,7 +426,7 @@ fn spawn_load<T, F, W>(
     F: Future<Output = Result<T, ApiError>> + Send + 'static,
     W: FnOnce(Result<T, String>) -> DataEvent + Send + 'static,
 {
-    let blocked = blocked_for(&budget, Instant::now());
+    let blocked = budget.blocked_for(Instant::now());
     tokio::spawn(async move {
         let result = match blocked {
             Some(retry_after) => Err(ApiError::RateLimited { retry_after }.to_string()),
@@ -402,35 +448,27 @@ struct DeployTarget {
     service_id: String,
 }
 
+/// The app has gone, so nobody hears about the rest.
+struct Closed;
+
 /// Runs one deploy in order — the upsert (skipped when empty), each delete,
 /// then the redeploy — sending a `Deploy` event after each step and stopping
 /// at the first failure, so the redeploy never follows a failed write. Nothing
-/// is resent. False when the app has gone.
+/// is resent.
 async fn run_deploy(
     api: &Api,
     t: &DeployTarget,
     writes: Option<(crate::model::Variables, Vec<String>)>,
     events: &mpsc::Sender<AppEvent>,
-) -> bool {
-    let send = |step: DeployStep| {
-        let data = DataEvent::Deploy {
-            env_id: t.env_id.clone(),
-            service_id: t.service_id.clone(),
-            step,
-        };
-        events.send(AppEvent::Data(data))
-    };
+) -> Result<(), Closed> {
     // Railway's error text may quote what was sent; it is shown unrevealed.
     let sent = writes.as_ref().map(|(u, _)| u.clone()).unwrap_or_default();
     let failed = |during: Phase, e: WriteError| {
-        let (error, unknown) = match e {
-            WriteError::Refused(e) => (e.to_string(), false),
-            WriteError::Unknown(e) => (e.to_string(), true),
-        };
+        let (error, failure) = e.into_parts();
         DeployStep::Failed {
             during,
-            error: mask_sent(error, &sent),
-            unknown,
+            error: mask_sent(error.to_string(), &sent),
+            failure,
         }
     };
     let (project, env, service) = (&t.project_id, &t.env_id, &t.service_id);
@@ -440,12 +478,8 @@ async fn run_deploy(
                 Ok(()) => DeployStep::Upserted,
                 Err(e) => failed(Phase::Upsert, e),
             };
-            let stop = matches!(step, DeployStep::Failed { .. });
-            if send(step).await.is_err() {
-                return false;
-            }
-            if stop {
-                return true;
+            if !emit(events, t, step).await? {
+                return Ok(());
             }
         }
         for name in deletes {
@@ -453,12 +487,8 @@ async fn run_deploy(
                 Ok(()) => DeployStep::Deleted(name),
                 Err(e) => failed(Phase::Delete(name), e),
             };
-            let stop = matches!(step, DeployStep::Failed { .. });
-            if send(step).await.is_err() {
-                return false;
-            }
-            if stop {
-                return true;
+            if !emit(events, t, step).await? {
+                return Ok(());
             }
         }
     }
@@ -466,19 +496,48 @@ async fn run_deploy(
         Ok(()) => DeployStep::Redeployed,
         Err(e) => failed(Phase::Redeploy, e),
     };
-    send(step).await.is_ok()
+    emit(events, t, step).await?;
+    Ok(())
+}
+
+/// Sends one deploy step; false when it was a failure, which ends the deploy.
+async fn emit(
+    events: &mpsc::Sender<AppEvent>,
+    t: &DeployTarget,
+    step: DeployStep,
+) -> Result<bool, Closed> {
+    let carry_on = !matches!(step, DeployStep::Failed { .. });
+    let data = DataEvent::Deploy {
+        env_id: t.env_id.clone(),
+        service_id: t.service_id.clone(),
+        step,
+    };
+    events
+        .send(AppEvent::Data(data))
+        .await
+        .map_err(|_| Closed)?;
+    Ok(carry_on)
+}
+
+/// Why neither `gh` nor Railway could list a repo's branches.
+#[derive(Debug, thiserror::Error)]
+#[error("{gh}; Railway: {railway}")]
+struct BranchesError {
+    gh: GhError,
+    railway: ApiError,
 }
 
 /// A repo's branches from `gh` (the user's GitHub login), else from Railway,
 /// which refuses `railway login` tokens; the error says why both failed.
-async fn list_branches(api: &Api, gh: &Path, repo: &str) -> Result<Vec<String>, String> {
+async fn list_branches(api: &Api, gh: &Path, repo: &str) -> Result<Vec<String>, BranchesError> {
     let gh_error = match crate::github::branches(gh, repo).await {
         Ok(names) => return Ok(names),
         Err(e) => e,
     };
-    api.branches(repo)
-        .await
-        .map_err(|e| format!("{gh_error}; Railway: {e}"))
+    api.branches(repo).await.map_err(|railway| BranchesError {
+        gh: gh_error,
+        railway,
+    })
 }
 
 /// Switches the service's branch when asked, then deploys the latest commit;
@@ -490,26 +549,23 @@ async fn deploy_latest(
     switch: Option<BranchSwitch>,
 ) -> LatestOutcome {
     if let Some(sw) = switch {
-        match api.switch_branch(&sw.trigger_id, &sw.to).await {
-            Ok(()) => {}
-            Err(WriteError::Refused(e)) => {
-                return LatestOutcome::SwitchFailed {
-                    error: e.to_string(),
-                    unknown: false,
-                }
-            }
-            Err(WriteError::Unknown(e)) => {
-                return LatestOutcome::SwitchFailed {
-                    error: e.to_string(),
-                    unknown: true,
-                }
-            }
+        if let Err(e) = api.switch_branch(&sw.trigger_id, &sw.to).await {
+            let (error, failure) = e.into_parts();
+            return LatestOutcome::SwitchFailed {
+                error: error.to_string(),
+                failure,
+            };
         }
     }
     match api.deploy_latest_commit(env_id, service_id).await {
         Ok(()) => LatestOutcome::Started,
-        Err(WriteError::Refused(e)) => LatestOutcome::Refused(e.to_string()),
-        Err(WriteError::Unknown(e)) => LatestOutcome::Unknown(e.to_string()),
+        Err(e) => {
+            let (error, failure) = e.into_parts();
+            LatestOutcome::Failed {
+                error: error.to_string(),
+                failure,
+            }
+        }
     }
 }
 
@@ -528,26 +584,13 @@ fn mask_sent(mut error: String, sent: &crate::model::Variables) -> String {
     error
 }
 
-/// Time left on a rate-limit block, rounded up to whole seconds.
-fn blocked_for(budget: &Mutex<RateBudget>, now: Instant) -> Option<Duration> {
-    let until = lock(budget).blocked_until()?;
-    let left = until.checked_duration_since(now).filter(|d| !d.is_zero())?;
-    Some(Duration::from_secs(
-        left.as_secs() + u64::from(left.subsec_nanos() > 0),
-    ))
-}
-
-fn budget_event(budget: &Mutex<RateBudget>, configured_interval: Option<u64>) -> DataEvent {
-    let budget = lock(budget);
+fn budget_event(budget: &SharedBudget, configured_interval: Option<u64>) -> DataEvent {
+    let budget = budget.lock();
     let (limit, _) = budget.hourly_limit();
     DataEvent::Budget {
         interval: backstop_interval(limit, configured_interval),
         blocked_until: budget.blocked_until(),
     }
-}
-
-fn lock(budget: &Mutex<RateBudget>) -> MutexGuard<'_, RateBudget> {
-    budget.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Runs the status watch on its own task. If it panics, live updates are
@@ -571,6 +614,7 @@ where
 async fn watch_statuses(
     ids: Vec<String>,
     slot: Arc<tokio::sync::Mutex<Option<Client>>>,
+    http: reqwest::Client,
     ws: Url,
     tokens: Arc<dyn TokenSource>,
     events: mpsc::Sender<AppEvent>,
@@ -580,7 +624,7 @@ async fn watch_statuses(
         let mut slot = slot.lock().await;
         match slot.as_ref() {
             Some(client) => client.clone(),
-            None => match connect_authed(&ws, &tokens).await {
+            None => match connect_authed(&http, &ws, &tokens).await {
                 Ok(client) => slot.insert(client).clone(),
                 Err(_) => {
                     drop(slot);
@@ -615,7 +659,6 @@ async fn watch_statuses(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     use chrono::{DateTime, Utc};
@@ -632,7 +675,7 @@ mod tests {
     use crate::auth::EnvTokenSource;
     use crate::budget::RateBudget;
     use crate::logs::follow::FollowEvent;
-    use crate::model::LogLine;
+    use crate::model::{LogLine, WriteFailure};
     use crate::remember::{load_remembered, Remembered};
 
     /// No history; the live stream sends one line every 100ms, forever.
@@ -738,7 +781,7 @@ mod tests {
 
     struct Harness {
         server: MockServer,
-        budget: Arc<Mutex<RateBudget>>,
+        budget: SharedBudget,
         cmds: mpsc::Sender<Command>,
         events: mpsc::Receiver<AppEvent>,
         state_dir: tempfile::TempDir,
@@ -751,7 +794,7 @@ mod tests {
 
         async fn start_with_gh(configured_interval: Option<u64>, gh: PathBuf) -> Self {
             let server = MockServer::start().await;
-            let budget = Arc::new(Mutex::new(RateBudget::new(None)));
+            let budget = SharedBudget::new(RateBudget::new(None));
             let tokens: Arc<dyn TokenSource> = Arc::new(EnvTokenSource("t".into()));
             let http = Url::parse(&format!("{}/graphql/v2", server.uri())).unwrap();
             let ws = Url::parse(&format!(
@@ -759,18 +802,20 @@ mod tests {
                 server.uri().replace("http", "ws")
             ))
             .unwrap();
-            let api = Arc::new(Api::new(http, tokens.clone(), budget.clone()));
+            let api = Arc::new(Api::new(http, tokens.clone(), budget.clone()).unwrap());
             let state_dir = tempfile::tempdir().unwrap();
             let (cmd_tx, cmd_rx) = mpsc::channel(16);
             let (ev_tx, ev_rx) = mpsc::channel(64);
             tokio::spawn(run_worker(
-                api,
-                ws,
-                tokens,
-                state_dir.path().join("state.toml"),
-                state_dir.path().join("pending.toml"),
-                configured_interval,
-                gh,
+                WorkerConfig {
+                    api,
+                    ws,
+                    tokens,
+                    remembered_path: state_dir.path().join("state.toml"),
+                    pending_path: state_dir.path().join("pending.toml"),
+                    configured_interval,
+                    gh,
+                },
                 cmd_rx,
                 ev_tx,
             ));
@@ -802,23 +847,22 @@ mod tests {
     async fn announces_the_configured_backstop_at_start() {
         let server = MockServer::start().await;
         let tokens: Arc<dyn TokenSource> = Arc::new(EnvTokenSource("t".into()));
-        let budget = Arc::new(Mutex::new(RateBudget::new(None)));
-        let api = Arc::new(Api::new(
-            Url::parse(&server.uri()).unwrap(),
-            tokens.clone(),
-            budget,
-        ));
+        let budget = SharedBudget::new(RateBudget::new(None));
+        let api =
+            Arc::new(Api::new(Url::parse(&server.uri()).unwrap(), tokens.clone(), budget).unwrap());
         let (_cmd_tx, cmd_rx) = mpsc::channel(1);
         let (ev_tx, mut ev_rx) = mpsc::channel(4);
         let ws = Url::parse("ws://127.0.0.1:1/").unwrap();
         tokio::spawn(run_worker(
-            api,
-            ws,
-            tokens,
-            PathBuf::from("unused"),
-            PathBuf::from("unused"),
-            Some(42),
-            PathBuf::from("unused"),
+            WorkerConfig {
+                api,
+                ws,
+                tokens,
+                remembered_path: PathBuf::from("unused"),
+                pending_path: PathBuf::from("unused"),
+                configured_interval: Some(42),
+                gh: PathBuf::from("unused"),
+            },
             cmd_rx,
             ev_tx,
         ));
@@ -882,7 +926,7 @@ mod tests {
             .mount(&h.server)
             .await;
         let until = {
-            let mut b = h.budget.lock().unwrap();
+            let mut b = h.budget.lock();
             b.on_rate_limited(Some(Duration::from_secs(30)), Instant::now());
             b.blocked_until()
         };
@@ -907,7 +951,7 @@ mod tests {
     #[tokio::test]
     async fn panicking_request_still_replies() {
         let (tx, mut rx) = mpsc::channel(4);
-        let budget = Arc::new(Mutex::new(RateBudget::new(None)));
+        let budget = SharedBudget::new(RateBudget::new(None));
         spawn_load(
             budget,
             None,
@@ -953,28 +997,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_remembered_keeps_the_last_selection() {
+        let h = Harness::start(None).await;
+        let path = h.state_dir.path().join("state.toml");
+        let remembered = |n: usize| Remembered {
+            last_project_id: Some(format!("p{n}")),
+            last_environment_id: Some(format!("e{n}")),
+            theme: None,
+        };
+        for n in 0..100 {
+            h.send(Command::SaveRemembered(remembered(n))).await;
+        }
+        let last = remembered(99);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while load_remembered(&path) != last {
+            assert!(Instant::now() < deadline, "last selection never written");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Let any trailing save finish; the file must still be the last one.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(load_remembered(&path), last);
+    }
+
+    #[tokio::test]
+    async fn saver_still_saves_the_last_value_after_its_sender_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let save = spawn_saver(path.clone(), save_remembered, None);
+        let r = Remembered {
+            last_project_id: Some("p1".into()),
+            ..Remembered::default()
+        };
+        save.send_replace(Some(r.clone()));
+        drop(save);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while load_remembered(&path) != r {
+            assert!(Instant::now() < deadline, "last value never saved");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Quit drops the command sender and waits for the worker: a save still
+    /// queued at that moment must be handled, and the worker must then return.
+    #[tokio::test]
+    async fn worker_handles_queued_commands_after_its_sender_is_dropped() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let path = state_dir.path().join("state.toml");
+        let tokens: Arc<dyn TokenSource> = Arc::new(EnvTokenSource("t".into()));
+        let http = Url::parse("http://127.0.0.1:9/graphql/v2").unwrap();
+        let budget = SharedBudget::new(RateBudget::new(None));
+        let api = Arc::new(Api::new(http, tokens.clone(), budget).unwrap());
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (ev_tx, _ev_rx) = mpsc::channel(64);
+        let r = Remembered {
+            last_project_id: Some("p1".into()),
+            ..Remembered::default()
+        };
+        cmd_tx
+            .send(Command::SaveRemembered(r.clone()))
+            .await
+            .unwrap();
+        drop(cmd_tx);
+        let config = WorkerConfig {
+            api,
+            ws: Url::parse("ws://127.0.0.1:9/graphql/v2").unwrap(),
+            tokens,
+            remembered_path: path.clone(),
+            pending_path: state_dir.path().join("pending.toml"),
+            configured_interval: None,
+            gh: PathBuf::from("/nonexistent/gh"),
+        };
+        tokio::time::timeout(Duration::from_secs(5), run_worker(config, cmd_rx, ev_tx))
+            .await
+            .expect("worker returns once its queue is drained");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while load_remembered(&path) != r {
+            assert!(Instant::now() < deadline, "queued save never written");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Like `save_remembered`, but slow enough to still be writing when a
+    /// newer value arrives.
+    fn slow_save(path: &Path, r: &Remembered) -> std::io::Result<()> {
+        std::thread::sleep(Duration::from_millis(100));
+        save_remembered(path, r)
+    }
+
+    /// As at exit in `main`: the sender goes, then the runtime shuts down with
+    /// a grace period. The last value must land, without using up the grace.
+    #[test]
+    fn runtime_shutdown_waits_for_the_last_save_but_not_longer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let save = runtime.block_on(async { spawn_saver(path.clone(), slow_save, None) });
+        let remembered = |id: &str| Remembered {
+            last_project_id: Some(id.into()),
+            ..Remembered::default()
+        };
+        save.send_replace(Some(remembered("first")));
+        // Let the first save start, so the last one queues behind it.
+        std::thread::sleep(Duration::from_millis(30));
+        save.send_replace(Some(remembered("last")));
+        drop(save);
+        let start = Instant::now();
+        runtime.shutdown_timeout(Duration::from_secs(5));
+        assert_eq!(load_remembered(&path), remembered("last"));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
     async fn failed_pending_save_reports_without_values() {
         let (tx, mut rx) = mpsc::channel(4);
         let tokens: Arc<dyn TokenSource> = Arc::new(EnvTokenSource("t".into()));
-        let budget = Arc::new(Mutex::new(RateBudget::new(None)));
-        let api = Arc::new(Api::new(
-            Url::parse("http://127.0.0.1:1/").unwrap(),
-            tokens.clone(),
-            budget,
-        ));
+        let budget = SharedBudget::new(RateBudget::new(None));
+        let api = Arc::new(
+            Api::new(
+                Url::parse("http://127.0.0.1:1/").unwrap(),
+                tokens.clone(),
+                budget,
+            )
+            .unwrap(),
+        );
         let (cmd_tx, cmd_rx) = mpsc::channel(4);
         let dir = tempfile::tempdir().unwrap();
         // A file where the directory should be makes the save fail.
         let blocker = dir.path().join("blocker");
         std::fs::write(&blocker, "x").unwrap();
         tokio::spawn(run_worker(
-            api,
-            Url::parse("ws://127.0.0.1:1/").unwrap(),
-            tokens,
-            PathBuf::from("unused"),
-            blocker.join("pending.toml"),
-            None,
-            PathBuf::from("unused"),
+            WorkerConfig {
+                api,
+                ws: Url::parse("ws://127.0.0.1:1/").unwrap(),
+                tokens,
+                remembered_path: PathBuf::from("unused"),
+                pending_path: blocker.join("pending.toml"),
+                configured_interval: None,
+                gh: PathBuf::from("unused"),
+            },
             cmd_rx,
             tx,
         ));
@@ -991,7 +1155,10 @@ mod tests {
         };
         let mut pending = crate::pending::Pending::default();
         pending.set(&target, "KEY", "s3cret-value".into(), None);
-        cmd_tx.send(Command::SavePending(pending)).await.unwrap();
+        cmd_tx
+            .send(Command::SavePending(Arc::new(pending)))
+            .await
+            .unwrap();
         match rx.recv().await {
             Some(AppEvent::Data(DataEvent::SaveFailed(m))) => {
                 assert!(m.starts_with("could not save pending changes"), "{m}");
@@ -1015,7 +1182,8 @@ mod tests {
         let mut pending = Pending::default();
         for n in 0..20 {
             pending.set(&target, "KEY", format!("v{n}"), None);
-            h.send(Command::SavePending(pending.clone())).await;
+            h.send(Command::SavePending(Arc::new(pending.clone())))
+                .await;
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -1033,8 +1201,7 @@ mod tests {
 
     // ---- deploy: the app and the worker together, against wiremock ----
 
-    use crate::app::{App, Confirm, DeployConfirm, DeployStep, Phase, StartPrefs};
-    use crate::model::Trigger;
+    use crate::app::{App, Confirm, DeployConfirm, DeployStep, Modal, Phase, StartPrefs};
     use crate::pending::{Change, Target};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use wiremock::matchers::body_string_contains;
@@ -1063,11 +1230,11 @@ mod tests {
 
     /// Answers `y` to the deploy confirm of (e1, s1).
     fn confirm_deploy(app: &mut App) -> Vec<Command> {
-        app.confirm = Some(Confirm::Deploy(DeployConfirm {
+        app.modal = Some(Modal::Confirm(Confirm::Deploy(DeployConfirm {
             env_id: "e1".into(),
             service_id: "s1".into(),
             drift: Vec::new(),
-        }));
+        })));
         let y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
         app.update(AppEvent::Key(y), Instant::now())
     }
@@ -1171,7 +1338,10 @@ mod tests {
             matches!(
                 &event,
                 DataEvent::DeployedLatest {
-                    outcome: LatestOutcome::Refused(_),
+                    outcome: LatestOutcome::Failed {
+                        failure: WriteFailure::Refused,
+                        ..
+                    },
                     ..
                 }
             ),
@@ -1252,7 +1422,10 @@ mod tests {
         .await;
         assert!(matches!(
             deployed_latest(&mut h).await,
-            LatestOutcome::SwitchFailed { unknown: false, .. }
+            LatestOutcome::SwitchFailed {
+                failure: WriteFailure::Refused,
+                ..
+            }
         ));
     }
 
@@ -1269,7 +1442,10 @@ mod tests {
         .await;
         assert!(matches!(
             deployed_latest(&mut h).await,
-            LatestOutcome::SwitchFailed { unknown: true, .. }
+            LatestOutcome::SwitchFailed {
+                failure: WriteFailure::Unknown,
+                ..
+            }
         ));
         assert_eq!(h.server.received_requests().await.unwrap().len(), 1);
     }
@@ -1298,7 +1474,7 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             }
         };
-        let (triggers, names) = result.unwrap();
+        let BranchReply { triggers, names } = result.unwrap();
         assert_eq!(triggers[0].id, "t1");
         assert_eq!(names.unwrap(), ["main", "feat/x"]);
         let requests = h.server.received_requests().await.unwrap();
@@ -1329,7 +1505,7 @@ mod tests {
         }
     }
 
-    async fn branches_reply(h: &mut Harness) -> (Vec<Trigger>, Result<Vec<String>, String>) {
+    async fn branches_reply(h: &mut Harness) -> BranchReply {
         loop {
             match h.next().await {
                 DataEvent::Branches { result, .. } => return result.unwrap(),
@@ -1355,7 +1531,7 @@ mod tests {
             .mount(&h.server)
             .await;
         h.send(load_branches()).await;
-        let (triggers, names) = branches_reply(&mut h).await;
+        let BranchReply { triggers, names } = branches_reply(&mut h).await;
         assert_eq!(triggers[0].branch, "main");
         assert_eq!(names.unwrap(), ["main", "feat/from-gh"]);
     }
@@ -1367,7 +1543,7 @@ mod tests {
         let refused = json!({"data": null, "errors": [{"message": "Not Authorized"}]});
         mount(&h.server, "githubRepoBranches", 200, refused).await;
         h.send(load_branches()).await;
-        let (triggers, names) = branches_reply(&mut h).await;
+        let BranchReply { triggers, names } = branches_reply(&mut h).await;
         assert_eq!(triggers.len(), 1, "the trigger still loads");
         assert_eq!(
             names.unwrap_err(),
@@ -1510,7 +1686,7 @@ mod tests {
         assert_eq!(steps[0], DeployStep::Upserted);
         assert!(matches!(
             &steps[1],
-            DeployStep::Failed { during: Phase::Delete(n), unknown: false, .. } if n == "X"
+            DeployStep::Failed { during: Phase::Delete(n), failure: WriteFailure::Refused, .. } if n == "X"
         ));
         assert_eq!(applied(&app), ["A", "B"]);
         let msg = app.message.clone().unwrap();
@@ -1533,7 +1709,7 @@ mod tests {
         let [DeployStep::Failed {
             during: Phase::Upsert,
             error,
-            unknown: false,
+            failure: WriteFailure::Refused,
         }] = steps.as_slice()
         else {
             panic!("{steps:?}");
@@ -1631,7 +1807,7 @@ mod tests {
             steps.last(),
             Some(DeployStep::Failed {
                 during: Phase::Redeploy,
-                unknown: false,
+                failure: WriteFailure::Refused,
                 ..
             })
         ));
@@ -1687,7 +1863,7 @@ mod tests {
             steps.as_slice(),
             [DeployStep::Failed {
                 during: Phase::Upsert,
-                unknown: true,
+                failure: WriteFailure::Unknown,
                 ..
             }]
         ));
@@ -1710,7 +1886,6 @@ mod tests {
             .await;
         h.budget
             .lock()
-            .unwrap()
             .on_rate_limited(Some(Duration::from_secs(30)), Instant::now());
         let mut app = deploy_app();
         let cmds = confirm_deploy(&mut app);
@@ -1719,7 +1894,7 @@ mod tests {
             steps.as_slice(),
             [DeployStep::Failed {
                 during: Phase::Upsert,
-                unknown: false,
+                failure: WriteFailure::Refused,
                 ..
             }]
         ));
