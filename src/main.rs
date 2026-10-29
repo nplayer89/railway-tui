@@ -1,6 +1,7 @@
 //! Entry point: setup, the terminal event loop, teardown.
 
-use std::io::{stdout, Stdout};
+use std::collections::VecDeque;
+use std::io::{stdout, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -19,10 +20,11 @@ use tokio::sync::mpsc;
 use url::Url;
 
 use railway_tui::api::Api;
-use railway_tui::app::{App, AppEvent, Command, StartPrefs};
+use railway_tui::app::{App, AppEvent, Command, DataEvent, StartPrefs};
 use railway_tui::auth::{token_source_from_env, TokenSource};
 use railway_tui::budget::RateBudget;
 use railway_tui::config::{config_path, load_config, Config};
+use railway_tui::pending::{load_pending, pending_path, Pending};
 use railway_tui::remember::{load_remembered, remembered_path};
 use railway_tui::ui;
 use railway_tui::worker::{run_worker, HTTP_ENDPOINT, WS_ENDPOINT};
@@ -53,21 +55,28 @@ fn run() -> Result<(), String> {
     let tokens = token_source_from_env().map_err(|e| e.to_string())?;
     tokens.token().map_err(|e| e.to_string())?;
     let state_path = remembered_path(xdg("XDG_STATE_HOME").as_deref(), &home);
-    let prefs = start_prefs(&config, &state_path);
+    let pending_file = pending_path(xdg("XDG_STATE_HOME").as_deref(), &home);
+    let prefs = start_prefs(&config, &state_path, &pending_file);
 
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-    let result = runtime.block_on(tui(config, tokens, state_path, prefs));
+    let result = runtime.block_on(tui(config, tokens, state_path, pending_file, prefs));
     runtime.shutdown_timeout(SHUTDOWN_GRACE);
     result
 }
 
-fn start_prefs(config: &Config, state_path: &Path) -> StartPrefs {
+fn start_prefs(config: &Config, state_path: &Path, pending_file: &Path) -> StartPrefs {
+    let (pending, pending_error) = match load_pending(pending_file) {
+        Ok(pending) => (pending, None),
+        Err(e) => (Pending::default(), Some(e)),
+    };
     StartPrefs {
         workspace: config.default_workspace.clone(),
         project: config.default_project.clone(),
         environment: config.default_environment.clone(),
         theme: config.theme.clone(),
         remembered: load_remembered(state_path),
+        pending,
+        pending_error,
     }
 }
 
@@ -75,6 +84,7 @@ async fn tui(
     config: Config,
     tokens: Arc<dyn TokenSource>,
     state_path: PathBuf,
+    pending_file: PathBuf,
     prefs: StartPrefs,
 ) -> Result<(), String> {
     let http = Url::parse(HTTP_ENDPOINT).expect("valid endpoint");
@@ -88,6 +98,7 @@ async fn tui(
         ws,
         tokens,
         state_path,
+        pending_file,
         config.refresh_interval_secs,
         cmd_rx,
         event_tx,
@@ -135,7 +146,7 @@ async fn event_loop(
     mut data: mpsc::Receiver<AppEvent>,
 ) -> Result<(), String> {
     let (mut app, initial) = App::new(prefs);
-    if !dispatch(&commands, initial).await? {
+    if !dispatch(&commands, terminal, &mut app, initial).await? {
         return Ok(());
     }
     let mut input = EventStream::new();
@@ -156,12 +167,14 @@ async fn event_loop(
             _ = tick.tick() => AppEvent::Tick(Instant::now()),
             ev = data.recv() => ev.ok_or(WORKER_GONE)?,
         };
-        if !dispatch(&commands, app.update(event, Instant::now())).await? {
+        let produced = app.update(event, Instant::now());
+        if !dispatch(&commands, terminal, &mut app, produced).await? {
             return Ok(());
         }
         // Apply whatever else has already arrived before drawing again.
         while let Ok(event) = data.try_recv() {
-            if !dispatch(&commands, app.update(event, Instant::now())).await? {
+            let produced = app.update(event, Instant::now());
+            if !dispatch(&commands, terminal, &mut app, produced).await? {
                 return Ok(());
             }
         }
@@ -169,12 +182,72 @@ async fn event_loop(
 }
 
 /// Sends commands to the worker; `Ok(false)` means the app asked to quit.
-async fn dispatch(worker: &mpsc::Sender<Command>, commands: Vec<Command>) -> Result<bool, String> {
-    for command in commands {
-        if command == Command::Quit {
-            return Ok(false);
+/// `EditExternal` never reaches the worker: the editor runs here and its result is fed
+/// back to the app, whose follow-up commands are handled in turn.
+async fn dispatch(
+    worker: &mpsc::Sender<Command>,
+    terminal: &mut Tui,
+    app: &mut App,
+    commands: Vec<Command>,
+) -> Result<bool, String> {
+    let mut queue = VecDeque::from(commands);
+    while let Some(command) = queue.pop_front() {
+        match command {
+            Command::Quit => return Ok(false),
+            Command::EditExternal { name, initial } => {
+                let result = tokio::task::block_in_place(|| edit_external(terminal, &initial));
+                let event = AppEvent::Data(DataEvent::Edited { name, result });
+                queue.extend(app.update(event, Instant::now()));
+            }
+            other => worker.send(other).await.map_err(|_| WORKER_GONE)?,
         }
-        worker.send(command).await.map_err(|_| WORKER_GONE)?;
     }
     Ok(true)
+}
+
+/// Suspends the TUI, edits `initial` in `$VISUAL`, else `$EDITOR`, else `vi`, and resumes.
+/// The value only ever touches a 0600 temp file, which is deleted on return. Error text
+/// never includes the value.
+fn edit_external(terminal: &mut Tui, initial: &str) -> Result<String, String> {
+    restore_terminal();
+    let result = run_editor(initial);
+    let resumed = enable_raw_mode()
+        .and_then(|()| execute!(stdout(), EnterAlternateScreen))
+        .and_then(|()| terminal.clear());
+    match (result, resumed) {
+        (_, Err(e)) => Err(format!("could not return to the terminal: {e}")),
+        (result, Ok(())) => result,
+    }
+}
+
+fn run_editor(initial: &str) -> Result<String, String> {
+    let mut file = tempfile::Builder::new()
+        .prefix("railway-tui-")
+        .tempfile()
+        .map_err(|e| format!("could not create a temporary file: {e}"))?;
+    file.write_all(initial.as_bytes())
+        .and_then(|()| file.flush())
+        .map_err(|e| format!("could not write the temporary file: {e}"))?;
+    let editor = ["VISUAL", "EDITOR"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "vi".into());
+    // The variable may carry arguments, e.g. "code --wait".
+    let mut words = editor.split_whitespace();
+    let program = words.next().unwrap_or("vi");
+    let status = std::process::Command::new(program)
+        .args(words)
+        .arg(file.path())
+        .status()
+        .map_err(|e| format!("could not run {program}: {e}"))?;
+    if !status.success() {
+        return Err(format!("{program} exited with {status}; no change made"));
+    }
+    let mut text = std::fs::read_to_string(file.path())
+        .map_err(|e| format!("could not read the edited file: {e}"))?;
+    if text.ends_with('\n') {
+        text.pop();
+    }
+    Ok(text)
 }

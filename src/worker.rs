@@ -16,11 +16,13 @@ use tokio::task::JoinHandle;
 use url::Url;
 
 use crate::api::subscribe::{connect_authed, deployment_status_stream};
+use crate::api::write::WriteError;
 use crate::api::{Api, ApiError};
-use crate::app::{AppEvent, Command, DataEvent};
+use crate::app::{AppEvent, Command, DataEvent, DeployStep, Phase};
 use crate::auth::TokenSource;
 use crate::budget::{backstop_interval, RateBudget};
 use crate::logs::follow::{follow_logs, FollowEvent, LogSource, RailwayLogSource, StreamState};
+use crate::pending::{save_pending, Pending};
 use crate::remember::save_remembered;
 
 /// Railway's public GraphQL API over HTTP.
@@ -33,20 +35,24 @@ const DEPLOYMENT_HISTORY: i64 = 50;
 /// Buffer between one log follower and its forwarding loop.
 const FOLLOW_BUFFER: usize = 64;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_worker(
     api: Arc<Api>,
     ws: Url,
     tokens: Arc<dyn TokenSource>,
     remembered_path: PathBuf,
+    pending_path: PathBuf,
     configured_interval: Option<u64>,
     mut cmds: mpsc::Receiver<Command>,
     events: mpsc::Sender<AppEvent>,
 ) {
+    let save_pending = spawn_pending_saver(pending_path, events.clone());
     let mut worker = Worker {
         api,
         ws,
         tokens,
         remembered_path,
+        save_pending,
         configured_interval,
         events,
         followers: HashMap::new(),
@@ -94,11 +100,41 @@ pub fn spawn_follower<S: LogSource + 'static>(
     })
 }
 
+/// Saves pending snapshots one at a time, in the order sent, skipping any that a
+/// newer one has already replaced. A failure comes back as `SaveFailed`, with a
+/// message that names the error, never a value.
+fn spawn_pending_saver(
+    path: PathBuf,
+    events: mpsc::Sender<AppEvent>,
+) -> mpsc::UnboundedSender<Pending> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Pending>();
+    tokio::spawn(async move {
+        while let Some(mut latest) = rx.recv().await {
+            while let Ok(newer) = rx.try_recv() {
+                latest = newer;
+            }
+            let target = path.clone();
+            let saved = tokio::task::spawn_blocking(move || save_pending(&target, &latest)).await;
+            let failure = match saved {
+                Ok(Ok(())) => continue,
+                Ok(Err(e)) => format!("could not save pending changes: {e}"),
+                Err(_) => "could not save pending changes".to_string(),
+            };
+            let event = AppEvent::Data(DataEvent::SaveFailed(failure));
+            if events.send(event).await.is_err() {
+                return;
+            }
+        }
+    });
+    tx
+}
+
 struct Worker {
     api: Arc<Api>,
     ws: Url,
     tokens: Arc<dyn TokenSource>,
     remembered_path: PathBuf,
+    save_pending: mpsc::UnboundedSender<Pending>,
     configured_interval: Option<u64>,
     events: mpsc::Sender<AppEvent>,
     followers: HashMap<u64, JoinHandle<()>>,
@@ -153,6 +189,50 @@ impl Worker {
                     result,
                 })
             }
+            Command::LoadVariables {
+                project_id,
+                env_id,
+                service_id,
+                purpose,
+            } => {
+                let (e, s) = (env_id.clone(), service_id.clone());
+                self.load(
+                    async move { api.variables(&project_id, &e, &s).await },
+                    move |result| DataEvent::Variables {
+                        env_id,
+                        service_id,
+                        purpose,
+                        result,
+                    },
+                )
+            }
+            Command::DeployService {
+                project_id,
+                env_id,
+                service_id,
+                upserts,
+                deletes,
+                redeploy_only,
+            } => {
+                let target = DeployTarget {
+                    project_id,
+                    env_id,
+                    service_id,
+                };
+                let (budget, interval) = (api.budget(), self.configured_interval);
+                let events = self.events.clone();
+                tokio::spawn(async move {
+                    let writes = (!redeploy_only).then_some((upserts, deletes));
+                    if run_deploy(&api, &target, writes, &events).await {
+                        let budget = budget_event(&budget, interval);
+                        let _ = events.send(AppEvent::Data(budget)).await;
+                    }
+                });
+            }
+            // One task saves in order, so snapshots never race on the temp file.
+            Command::SavePending(pending) => {
+                let _ = self.save_pending.send(pending);
+            }
             Command::WatchDeployments { ids } => self.watch(ids),
             Command::OpenLogs {
                 session,
@@ -187,7 +267,8 @@ impl Worker {
                 });
             }
             // The main loop exits on Quit; it never reaches the worker.
-            Command::Quit => {}
+            // Both are handled by the main loop before commands reach the worker.
+            Command::EditExternal { .. } | Command::Quit => {}
         }
     }
 
@@ -268,6 +349,94 @@ fn spawn_load<T, F, W>(
             let _ = events.send(AppEvent::Data(budget)).await;
         }
     });
+}
+
+struct DeployTarget {
+    project_id: String,
+    env_id: String,
+    service_id: String,
+}
+
+/// Runs one deploy in order — the upsert (skipped when empty), each delete,
+/// then the redeploy — sending a `Deploy` event after each step and stopping
+/// at the first failure, so the redeploy never follows a failed write. Nothing
+/// is resent. False when the app has gone.
+async fn run_deploy(
+    api: &Api,
+    t: &DeployTarget,
+    writes: Option<(crate::model::Variables, Vec<String>)>,
+    events: &mpsc::Sender<AppEvent>,
+) -> bool {
+    let send = |step: DeployStep| {
+        let data = DataEvent::Deploy {
+            env_id: t.env_id.clone(),
+            service_id: t.service_id.clone(),
+            step,
+        };
+        events.send(AppEvent::Data(data))
+    };
+    // Railway's error text may quote what was sent; it is shown unrevealed.
+    let sent = writes.as_ref().map(|(u, _)| u.clone()).unwrap_or_default();
+    let failed = |during: Phase, e: WriteError| {
+        let (error, unknown) = match e {
+            WriteError::Refused(e) => (e.to_string(), false),
+            WriteError::Unknown(e) => (e.to_string(), true),
+        };
+        DeployStep::Failed {
+            during,
+            error: mask_sent(error, &sent),
+            unknown,
+        }
+    };
+    let (project, env, service) = (&t.project_id, &t.env_id, &t.service_id);
+    if let Some((upserts, deletes)) = writes {
+        if !upserts.is_empty() {
+            let step = match api.upsert_variables(project, env, service, &upserts).await {
+                Ok(()) => DeployStep::Upserted,
+                Err(e) => failed(Phase::Upsert, e),
+            };
+            let stop = matches!(step, DeployStep::Failed { .. });
+            if send(step).await.is_err() {
+                return false;
+            }
+            if stop {
+                return true;
+            }
+        }
+        for name in deletes {
+            let step = match api.delete_variable(project, env, service, &name).await {
+                Ok(()) => DeployStep::Deleted(name),
+                Err(e) => failed(Phase::Delete(name), e),
+            };
+            let stop = matches!(step, DeployStep::Failed { .. });
+            if send(step).await.is_err() {
+                return false;
+            }
+            if stop {
+                return true;
+            }
+        }
+    }
+    let step = match api.redeploy_service(env, service).await {
+        Ok(()) => DeployStep::Redeployed,
+        Err(e) => failed(Phase::Redeploy, e),
+    };
+    send(step).await.is_ok()
+}
+
+/// Replaces every non-empty sent value in `error` with the hidden marker, the
+/// longest first so a value containing another is masked whole.
+fn mask_sent(mut error: String, sent: &crate::model::Variables) -> String {
+    let mut values: Vec<&str> = sent
+        .values()
+        .map(String::as_str)
+        .filter(|v| !v.is_empty())
+        .collect();
+    values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    for value in values {
+        error = error.replace(value, "••••••");
+    }
+    error
 }
 
 /// Time left on a rate-limit block, rounded up to whole seconds.
@@ -506,6 +675,7 @@ mod tests {
                 ws,
                 tokens,
                 state_dir.path().join("state.toml"),
+                state_dir.path().join("pending.toml"),
                 configured_interval,
                 cmd_rx,
                 ev_tx,
@@ -551,6 +721,7 @@ mod tests {
             api,
             ws,
             tokens,
+            PathBuf::from("unused"),
             PathBuf::from("unused"),
             Some(42),
             cmd_rx,
@@ -684,5 +855,504 @@ mod tests {
             assert!(Instant::now() < deadline, "state file never written");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn failed_pending_save_reports_without_values() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let tokens: Arc<dyn TokenSource> = Arc::new(EnvTokenSource("t".into()));
+        let budget = Arc::new(Mutex::new(RateBudget::new(None)));
+        let api = Arc::new(Api::new(
+            Url::parse("http://127.0.0.1:1/").unwrap(),
+            tokens.clone(),
+            budget,
+        ));
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let dir = tempfile::tempdir().unwrap();
+        // A file where the directory should be makes the save fail.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        tokio::spawn(run_worker(
+            api,
+            Url::parse("ws://127.0.0.1:1/").unwrap(),
+            tokens,
+            PathBuf::from("unused"),
+            blocker.join("pending.toml"),
+            None,
+            cmd_rx,
+            tx,
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(AppEvent::Data(DataEvent::Budget { .. }))
+        ));
+        let target = crate::pending::Target {
+            project_id: "p",
+            env_id: "e",
+            env_name: "prod",
+            service_id: "s",
+            service_name: "svc",
+        };
+        let mut pending = crate::pending::Pending::default();
+        pending.set(&target, "KEY", "s3cret-value".into(), None);
+        cmd_tx.send(Command::SavePending(pending)).await.unwrap();
+        match rx.recv().await {
+            Some(AppEvent::Data(DataEvent::SaveFailed(m))) => {
+                assert!(m.starts_with("could not save pending changes"), "{m}");
+                assert!(!m.contains("s3cret-value"));
+            }
+            other => panic!("expected SaveFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn save_pending_keeps_the_last_snapshot() {
+        let h = Harness::start(None).await;
+        let path = h.state_dir.path().join("pending.toml");
+        let target = crate::pending::Target {
+            project_id: "p",
+            env_id: "e",
+            env_name: "prod",
+            service_id: "s",
+            service_name: "svc",
+        };
+        let mut pending = Pending::default();
+        for n in 0..20 {
+            pending.set(&target, "KEY", format!("v{n}"), None);
+            h.send(Command::SavePending(pending.clone())).await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let loaded = crate::pending::load_pending(&path);
+            if loaded.as_ref().is_ok_and(|p| *p == pending) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "last snapshot never written");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Let any trailing save finish; the file must still be the last one.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(crate::pending::load_pending(&path).unwrap(), pending);
+    }
+
+    // ---- deploy: the app and the worker together, against wiremock ----
+
+    use crate::app::{App, Confirm, DeployConfirm, DeployStep, Phase, StartPrefs};
+    use crate::pending::{Change, Target};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use wiremock::matchers::body_string_contains;
+
+    const TARGET: Target<'static> = Target {
+        project_id: "p1",
+        env_id: "e1",
+        env_name: "production",
+        service_id: "s1",
+        service_name: "api",
+    };
+
+    /// Pending edits on (e1, s1): A and B set, X and Y deleted.
+    fn deploy_app() -> App {
+        let mut pending = Pending::default();
+        pending.set(&TARGET, "A", "new-a".into(), Some("old-a"));
+        pending.set(&TARGET, "B", "new-b".into(), None);
+        pending.delete(&TARGET, "X", Some("x"));
+        pending.delete(&TARGET, "Y", Some("y"));
+        let (app, _) = App::new(StartPrefs {
+            pending,
+            ..StartPrefs::default()
+        });
+        app
+    }
+
+    /// Answers `y` to the deploy confirm of (e1, s1).
+    fn confirm_deploy(app: &mut App) -> Vec<Command> {
+        app.confirm = Some(Confirm::Deploy(DeployConfirm {
+            env_id: "e1".into(),
+            service_id: "s1".into(),
+            drift: Vec::new(),
+        }));
+        let y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        app.update(AppEvent::Key(y), Instant::now())
+    }
+
+    /// Forwards the app's commands to the worker and its replies to the app
+    /// until every deploy and variables load has finished; returns the steps.
+    async fn drive(h: &mut Harness, app: &mut App, mut cmds: Vec<Command>) -> Vec<DeployStep> {
+        let mut steps = Vec::new();
+        let mut outstanding = 0;
+        loop {
+            for cmd in cmds.drain(..) {
+                match cmd {
+                    Command::DeployService { .. } | Command::LoadVariables { .. } => {
+                        outstanding += 1;
+                        h.send(cmd).await;
+                    }
+                    Command::SavePending(_) => h.send(cmd).await,
+                    _ => {}
+                }
+            }
+            if outstanding == 0 {
+                return steps;
+            }
+            let event = h.next().await;
+            match &event {
+                DataEvent::Budget { .. } => continue,
+                DataEvent::Deploy { step, .. } => {
+                    if matches!(step, DeployStep::Redeployed | DeployStep::Failed { .. }) {
+                        outstanding -= 1;
+                    }
+                    steps.push(step.clone());
+                }
+                DataEvent::Variables { .. } => outstanding -= 1,
+                _ => {}
+            }
+            cmds = app.update(AppEvent::Data(event), Instant::now());
+        }
+    }
+
+    async fn mount(server: &MockServer, op: &str, status: u16, body: serde_json::Value) {
+        Mock::given(method("POST"))
+            .and(body_string_contains(op))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_once(server: &MockServer, op: &str, status: u16) {
+        Mock::given(method("POST"))
+            .and(body_string_contains(op))
+            .respond_with(ResponseTemplate::new(status))
+            .up_to_n_times(1)
+            .mount(server)
+            .await;
+    }
+
+    fn ok(field: &str) -> serde_json::Value {
+        json!({ "data": { field: true } })
+    }
+
+    /// Every request so far as (operation, deleted name if any), in order.
+    async fn sent(h: &Harness) -> Vec<(String, Option<String>)> {
+        h.server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                let op = body["operationName"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                let name = body["variables"]["input"]["name"]
+                    .as_str()
+                    .map(String::from);
+                (op, name)
+            })
+            .collect()
+    }
+
+    fn op(name: &str, deleted: Option<&str>) -> (String, Option<String>) {
+        (name.to_string(), deleted.map(String::from))
+    }
+
+    fn applied(app: &App) -> Vec<String> {
+        app.pending
+            .service("e1", "s1")
+            .map(|sp| {
+                sp.vars
+                    .iter()
+                    .filter(|(_, v)| v.applied)
+                    .map(|(n, _)| n.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn upsert_then_deletes_then_redeploy_order() {
+        let mut h = Harness::start(None).await;
+        mount(
+            &h.server,
+            "variableCollectionUpsert",
+            200,
+            ok("variableCollectionUpsert"),
+        )
+        .await;
+        mount(&h.server, "variableDelete", 200, ok("variableDelete")).await;
+        mount(
+            &h.server,
+            "serviceInstanceRedeploy",
+            200,
+            ok("serviceInstanceRedeploy"),
+        )
+        .await;
+        let mut app = deploy_app();
+        let cmds = confirm_deploy(&mut app);
+        let steps = drive(&mut h, &mut app, cmds).await;
+        assert_eq!(
+            steps,
+            [
+                DeployStep::Upserted,
+                DeployStep::Deleted("X".into()),
+                DeployStep::Deleted("Y".into()),
+                DeployStep::Redeployed,
+            ]
+        );
+        assert_eq!(
+            sent(&h).await,
+            [
+                op("VariableCollectionUpsert", None),
+                op("VariableDelete", Some("X")),
+                op("VariableDelete", Some("Y")),
+                op("ServiceInstanceRedeploy", None),
+            ]
+        );
+        assert!(app.pending.service("e1", "s1").is_none());
+        assert_eq!(app.message.as_deref(), Some("deployed api to production"));
+    }
+
+    #[tokio::test]
+    async fn failed_delete_stops_before_redeploy() {
+        let mut h = Harness::start(None).await;
+        mount(
+            &h.server,
+            "variableCollectionUpsert",
+            200,
+            ok("variableCollectionUpsert"),
+        )
+        .await;
+        mount(&h.server, "variableDelete", 400, json!({})).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("serviceInstanceRedeploy"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok("serviceInstanceRedeploy")))
+            .expect(0)
+            .mount(&h.server)
+            .await;
+        let mut app = deploy_app();
+        let cmds = confirm_deploy(&mut app);
+        let steps = drive(&mut h, &mut app, cmds).await;
+        assert_eq!(steps.len(), 2, "{steps:?}");
+        assert_eq!(steps[0], DeployStep::Upserted);
+        assert!(matches!(
+            &steps[1],
+            DeployStep::Failed { during: Phase::Delete(n), unknown: false, .. } if n == "X"
+        ));
+        assert_eq!(applied(&app), ["A", "B"]);
+        let msg = app.message.clone().unwrap();
+        assert!(msg.starts_with("deploy failed during delete X: "), "{msg}");
+        assert!(!msg.contains("new-a") && !msg.contains("new-b"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn railway_error_echoing_a_sent_value_is_masked() {
+        let mut h = Harness::start(None).await;
+        // Railway's own message quotes what was submitted.
+        let reply = json!({
+            "data": null,
+            "errors": [{ "message": "invalid value \"new-a\" for A; new-b too" }]
+        });
+        mount(&h.server, "variableCollectionUpsert", 200, reply).await;
+        let mut app = deploy_app();
+        let cmds = confirm_deploy(&mut app);
+        let steps = drive(&mut h, &mut app, cmds).await;
+        let [DeployStep::Failed {
+            during: Phase::Upsert,
+            error,
+            unknown: false,
+        }] = steps.as_slice()
+        else {
+            panic!("{steps:?}");
+        };
+        for shown in [error.clone(), app.message.clone().unwrap()] {
+            assert!(
+                !shown.contains("new-a") && !shown.contains("new-b"),
+                "{shown}"
+            );
+            assert!(shown.contains("invalid value \"••••••\" for A"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn mask_sent_values_longest_first_and_skips_empty() {
+        let sent: crate::model::Variables = [("A", "abc"), ("B", "abcdef"), ("C", "")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(
+            mask_sent("got abcdef and abc".into(), &sent),
+            "got •••••• and ••••••"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_sends_only_unapplied_then_redeploys() {
+        let mut h = Harness::start(None).await;
+        mount(
+            &h.server,
+            "variableCollectionUpsert",
+            200,
+            ok("variableCollectionUpsert"),
+        )
+        .await;
+        mount_once(&h.server, "variableDelete", 400).await;
+        mount(&h.server, "variableDelete", 200, ok("variableDelete")).await;
+        mount(
+            &h.server,
+            "serviceInstanceRedeploy",
+            200,
+            ok("serviceInstanceRedeploy"),
+        )
+        .await;
+        let mut app = deploy_app();
+        let cmds = confirm_deploy(&mut app);
+        drive(&mut h, &mut app, cmds).await;
+        assert_eq!(applied(&app), ["A", "B"]);
+        let first = sent(&h).await.len();
+
+        let cmds = confirm_deploy(&mut app);
+        let steps = drive(&mut h, &mut app, cmds).await;
+        assert_eq!(
+            steps,
+            [
+                DeployStep::Deleted("X".into()),
+                DeployStep::Deleted("Y".into()),
+                DeployStep::Redeployed,
+            ]
+        );
+        assert_eq!(
+            sent(&h).await[first..],
+            [
+                op("VariableDelete", Some("X")),
+                op("VariableDelete", Some("Y")),
+                op("ServiceInstanceRedeploy", None),
+            ]
+        );
+        assert!(app.pending.service("e1", "s1").is_none());
+    }
+
+    #[tokio::test]
+    async fn redeploy_failure_retry_is_redeploy_only() {
+        let mut h = Harness::start(None).await;
+        mount(
+            &h.server,
+            "variableCollectionUpsert",
+            200,
+            ok("variableCollectionUpsert"),
+        )
+        .await;
+        mount(&h.server, "variableDelete", 200, ok("variableDelete")).await;
+        mount_once(&h.server, "serviceInstanceRedeploy", 400).await;
+        mount(
+            &h.server,
+            "serviceInstanceRedeploy",
+            200,
+            ok("serviceInstanceRedeploy"),
+        )
+        .await;
+        let mut app = deploy_app();
+        let cmds = confirm_deploy(&mut app);
+        let steps = drive(&mut h, &mut app, cmds).await;
+        assert!(matches!(
+            steps.last(),
+            Some(DeployStep::Failed {
+                during: Phase::Redeploy,
+                unknown: false,
+                ..
+            })
+        ));
+        let sp = app.pending.service("e1", "s1").unwrap();
+        assert!(sp.written_not_deployed);
+        assert_eq!(applied(&app), ["A", "B", "X", "Y"]);
+        let first = sent(&h).await.len();
+
+        let cmds = confirm_deploy(&mut app);
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::DeployService {
+                    redeploy_only: true,
+                    ..
+                }]
+            ),
+            "{cmds:?}"
+        );
+        let steps = drive(&mut h, &mut app, cmds).await;
+        assert_eq!(steps, [DeployStep::Redeployed]);
+        assert_eq!(
+            sent(&h).await[first..],
+            [op("ServiceInstanceRedeploy", None)]
+        );
+        assert!(app.pending.service("e1", "s1").is_none());
+    }
+
+    #[tokio::test]
+    async fn unknown_write_reconciles_from_railway() {
+        let mut h = Harness::start(None).await;
+        // Sent, but the reply is a 500: Railway may or may not have applied it.
+        mount(&h.server, "variableCollectionUpsert", 500, json!({})).await;
+        // Railway holds A's new value, but not B; X is gone, Y is still there.
+        let current = json!({ "data": { "variables": { "A": "new-a", "Y": "y" } } });
+        mount(&h.server, "query Variables", 200, current).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("variableDelete"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&h.server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("serviceInstanceRedeploy"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&h.server)
+            .await;
+        let mut app = deploy_app();
+        let cmds = confirm_deploy(&mut app);
+        let steps = drive(&mut h, &mut app, cmds).await;
+        assert!(matches!(
+            steps.as_slice(),
+            [DeployStep::Failed {
+                during: Phase::Upsert,
+                unknown: true,
+                ..
+            }]
+        ));
+        assert_eq!(applied(&app), ["A", "X"]);
+        let ops: Vec<String> = sent(&h).await.into_iter().map(|(o, _)| o).collect();
+        assert_eq!(
+            ops,
+            ["VariableCollectionUpsert", "Variables"],
+            "never resent"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_deploy_sends_nothing() {
+        let mut h = Harness::start(None).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&h.server)
+            .await;
+        h.budget
+            .lock()
+            .unwrap()
+            .on_rate_limited(Some(Duration::from_secs(30)), Instant::now());
+        let mut app = deploy_app();
+        let cmds = confirm_deploy(&mut app);
+        let steps = drive(&mut h, &mut app, cmds).await;
+        assert!(matches!(
+            steps.as_slice(),
+            [DeployStep::Failed {
+                during: Phase::Upsert,
+                unknown: false,
+                ..
+            }]
+        ));
+        assert!(applied(&app).is_empty());
+        let sp = app.pending.service("e1", "s1").unwrap();
+        assert!(!sp.written_not_deployed);
+        assert_eq!(sp.vars.len(), 4);
+        assert!(matches!(sp.vars["X"].change, Change::Delete));
     }
 }

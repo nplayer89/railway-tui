@@ -666,3 +666,465 @@ fn selected_rows_are_readable_in_every_theme() {
         assert_readable(&buf, y);
     }
 }
+
+fn vars_app(env: &str, vars: &[(&str, &str)]) -> App {
+    let mut app = services_app(vec![service(
+        "api",
+        deploy("d", DeploymentStatus::Success, &[InstanceStatus::Running]),
+        vec![],
+    )]);
+    app.services.value.as_mut().unwrap()[0].service_id = "svc-1".into();
+    app.project = Some(crate::model::ProjectRef {
+        id: "p1".into(),
+        name: "proj".into(),
+    });
+    app.environment = Some(crate::model::Environment {
+        id: "e1".into(),
+        name: env.into(),
+    });
+    app.stack = vec![
+        View::Projects,
+        View::Services,
+        View::Variables(crate::app::VarsView {
+            service_id: "svc-1".into(),
+            revealed: Default::default(),
+            reveal_all: false,
+        }),
+    ];
+    app.variables.value = Some(
+        vars.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    );
+    app.variables.fetched_at = Some(Instant::now());
+    app
+}
+
+fn press(app: &mut App, c: char) {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    app.update(
+        crate::app::AppEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+        Instant::now(),
+    );
+}
+
+fn add_pending(app: &mut App, name: &str, change: crate::pending::Change, base: Option<&str>) {
+    let sp = app
+        .pending
+        .envs
+        .entry("e1".into())
+        .or_default()
+        .entry("svc-1".into())
+        .or_default();
+    sp.project_id = "p1".into();
+    sp.vars.insert(
+        name.into(),
+        crate::pending::PendingVar {
+            change,
+            base: base.map(Into::into),
+            applied: false,
+        },
+    );
+}
+
+#[test]
+fn values_hidden_until_revealed() {
+    let mut app = vars_app("staging", &[("KEY", "s3cret")]);
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("••••••"), "{t}");
+    assert!(!t.contains("s3cret"), "{t}");
+    assert!(t.contains("api · variables · ENV staging"), "{t}");
+    press(&mut app, 'r');
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("s3cret"), "{t}");
+}
+
+#[test]
+fn revealed_value_strips_escapes() {
+    let mut app = vars_app("staging", &[("KEY", "a\x1b[31mb")]);
+    press(&mut app, 'R');
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("a[31mb"), "{t}");
+    assert!(!t.contains('\x1b'));
+}
+
+#[test]
+fn multiline_value_shows_first_line_and_ellipsis() {
+    let mut app = vars_app("staging", &[("KEY", "line1\nline2")]);
+    press(&mut app, 'R');
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("line1…"), "{t}");
+    assert!(!t.contains("line2"), "{t}");
+}
+
+#[test]
+fn production_env_title_is_bad_colour() {
+    let app = vars_app("production", &[("KEY", "v")]);
+    let buf = render(&app, Instant::now());
+    let y = (0..30)
+        .find(|y| row_text(&buf, *y).contains("· variables ·"))
+        .unwrap();
+    let x = row_text(&buf, y).find("production").unwrap() as u16;
+    assert_eq!(buf[(x, y)].fg, T.bad);
+    let app = vars_app("staging", &[("KEY", "v")]);
+    let buf = render(&app, Instant::now());
+    let x = row_text(&buf, y).find("staging").unwrap() as u16;
+    assert_eq!(buf[(x, y)].fg, T.accent);
+}
+
+#[test]
+fn is_production_matches_prod_names() {
+    assert!(super::is_production("production"));
+    assert!(super::is_production("Prod-eu"));
+    assert!(!super::is_production("staging"));
+}
+
+#[test]
+fn markers_and_strikethrough() {
+    use crate::pending::Change;
+    let mut app = vars_app("staging", &[("CHG", "old"), ("DEL", "gone"), ("SAME", "x")]);
+    add_pending(&mut app, "ADD", Change::Set { value: "n".into() }, None);
+    add_pending(
+        &mut app,
+        "CHG",
+        Change::Set {
+            value: "new".into(),
+        },
+        Some("old"),
+    );
+    add_pending(&mut app, "DEL", Change::Delete, Some("gone"));
+    if let Some(View::Variables(v)) = app.stack.last_mut() {
+        v.reveal_all = true;
+    }
+    let buf = render(&app, Instant::now());
+    let find_row = |name: &str| {
+        (0..30)
+            .find(|y| row_text(&buf, *y).contains(name))
+            .unwrap_or_else(|| panic!("no row {name}\n{}", text(&buf)))
+    };
+    let marker = |name: &str| row_text(&buf, find_row(name)).chars().next().unwrap();
+    assert_eq!(marker("ADD"), '+');
+    assert_eq!(marker("CHG"), '~');
+    assert_eq!(marker("DEL"), '-');
+    assert_eq!(marker("SAME"), ' ');
+    let chg = row_text(&buf, find_row("CHG"));
+    assert!(chg.contains("new") && !chg.contains("old"), "{chg}");
+    let y = find_row("DEL");
+    let x = row_text(&buf, y).find("DEL").unwrap() as u16;
+    assert!(buf[(x, y)]
+        .modifier
+        .contains(ratatui::style::Modifier::CROSSED_OUT));
+    let y = find_row("SAME");
+    let x = row_text(&buf, y).find("SAME").unwrap() as u16;
+    assert!(!buf[(x, y)]
+        .modifier
+        .contains(ratatui::style::Modifier::CROSSED_OUT));
+}
+
+/// A Variables view with an added and a changed pending value.
+fn pending_values_app() -> App {
+    use crate::pending::Change;
+    let mut app = vars_app("staging", &[("CHG", "oldsecret")]);
+    let set = |value: &str| Change::Set {
+        value: value.into(),
+    };
+    add_pending(&mut app, "ADD", set("addsecret"), None);
+    add_pending(&mut app, "CHG", set("chgsecret"), Some("oldsecret"));
+    let sp = app
+        .pending
+        .envs
+        .get_mut("e1")
+        .unwrap()
+        .get_mut("svc-1")
+        .unwrap();
+    sp.env_name = "staging".into();
+    sp.service_name = "api".into();
+    app
+}
+
+#[test]
+fn pending_new_values_hidden_until_revealed() {
+    let mut app = pending_values_app();
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("ADD") && t.contains("CHG"), "{t}");
+    for secret in ["addsecret", "chgsecret", "oldsecret"] {
+        assert!(!t.contains(secret), "{t}");
+    }
+    app.environments.value = Some(vec![crate::model::Environment {
+        id: "e1".into(),
+        name: "staging".into(),
+    }]);
+    app.stack.push(View::Pending(Default::default()));
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("+ ADD") && t.contains("~ CHG"), "{t}");
+    for secret in ["addsecret", "chgsecret", "oldsecret"] {
+        assert!(!t.contains(secret), "{t}");
+    }
+}
+
+#[test]
+fn r_on_a_pending_row_reveals_only_that_row() {
+    let mut app = pending_values_app();
+    app.selection.variable = Some("ADD".into());
+    press(&mut app, 'r');
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("addsecret"), "{t}");
+    assert!(!t.contains("chgsecret") && !t.contains("oldsecret"), "{t}");
+    app.selection.variable = Some("CHG".into());
+    press(&mut app, 'r');
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("addsecret") && t.contains("chgsecret"), "{t}");
+    assert!(!t.contains("oldsecret"), "{t}");
+}
+
+#[test]
+fn header_shows_pending_count() {
+    use crate::pending::Change;
+    let mut app = vars_app("staging", &[("A", "1")]);
+    assert!(!text(&render(&app, Instant::now())).contains("pending"));
+    add_pending(&mut app, "A", Change::Delete, Some("1"));
+    add_pending(&mut app, "B", Change::Set { value: "2".into() }, None);
+    let buf = render(&app, Instant::now());
+    let line = row_text(&buf, 1);
+    assert!(line.contains("2 pending"), "{line}");
+    let x = line.find("2 pending").unwrap() as u16;
+    assert_eq!(buf[(x, 1)].fg, T.busy);
+}
+
+#[test]
+fn footer_shows_variable_input() {
+    let mut app = vars_app("staging", &[("A", "1")]);
+    app.var_input = Some(crate::app::VarInput {
+        name: None,
+        text: "NEW".into(),
+    });
+    assert!(row_text(&render(&app, Instant::now()), 29).contains("name: NEW▏"));
+    app.var_input = Some(crate::app::VarInput {
+        name: Some("A".into()),
+        text: "val".into(),
+    });
+    assert!(row_text(&render(&app, Instant::now()), 29).contains("A = val▏"));
+}
+
+fn review_app() -> App {
+    let mut app = vars_app("production", &[]);
+    app.environments.value = Some(vec![crate::model::Environment {
+        id: "e1".into(),
+        name: "production".into(),
+    }]);
+    let set = |value: &str| crate::pending::Change::Set {
+        value: value.into(),
+    };
+    add_pending(&mut app, "NEW", set("newsecret"), None);
+    add_pending(&mut app, "CHG", set("after"), Some("before"));
+    add_pending(
+        &mut app,
+        "GONE",
+        crate::pending::Change::Delete,
+        Some("oldsecret"),
+    );
+    let sp = app
+        .pending
+        .envs
+        .get_mut("e1")
+        .unwrap()
+        .get_mut("svc-1")
+        .unwrap();
+    sp.env_name = "production".into();
+    sp.service_name = "api".into();
+    sp.vars.get_mut("CHG").unwrap().applied = true;
+    app.stack.push(View::Pending(Default::default()));
+    app
+}
+
+#[test]
+fn review_values_hidden_until_revealed() {
+    let mut app = review_app();
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("ENV production"), "{t}");
+    assert!(t.contains("partly written"), "{t}");
+    assert!(t.contains("+ NEW"), "{t}");
+    assert!(t.contains("~ CHG"), "{t}");
+    assert!(t.contains("- GONE"), "{t}");
+    assert!(t.contains('✓'), "{t}");
+    for secret in ["newsecret", "after", "before", "oldsecret"] {
+        assert!(!t.contains(secret), "{t}");
+    }
+    press(&mut app, 'r');
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("before → after"), "{t}");
+    assert!(t.contains("newsecret") && t.contains("oldsecret"), "{t}");
+}
+
+#[test]
+fn review_orphan_label_and_discard_prompt() {
+    let mut app = review_app();
+    app.environments.value = Some(vec![]);
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("(environment no longer exists)"), "{t}");
+    press(&mut app, 'x');
+    let t = text(&render(&app, Instant::now()));
+    assert!(
+        t.contains("Discard pending changes for api in production? (y/n)"),
+        "{t}"
+    );
+}
+
+#[test]
+fn written_not_deployed_only_when_every_entry_is_written() {
+    let mut app = review_app();
+    let sp = app
+        .pending
+        .envs
+        .get_mut("e1")
+        .unwrap()
+        .get_mut("svc-1")
+        .unwrap();
+    // Written earlier, then more edits: some entries are not on Railway yet.
+    sp.written_not_deployed = true;
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("partly written"), "{t}");
+    assert!(!t.contains("written, not deployed"), "{t}");
+    // An edit re-based on a written value: nothing applied, but the flag is set.
+    let sp = app
+        .pending
+        .envs
+        .get_mut("e1")
+        .unwrap()
+        .get_mut("svc-1")
+        .unwrap();
+    sp.vars.values_mut().for_each(|v| v.applied = false);
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("partly written"), "{t}");
+    let sp = app
+        .pending
+        .envs
+        .get_mut("e1")
+        .unwrap()
+        .get_mut("svc-1")
+        .unwrap();
+    sp.vars.values_mut().for_each(|v| v.applied = true);
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("written, not deployed"), "{t}");
+    assert!(!t.contains("partly written"), "{t}");
+    let sp = app
+        .pending
+        .envs
+        .get_mut("e1")
+        .unwrap()
+        .get_mut("svc-1")
+        .unwrap();
+    sp.vars.values_mut().for_each(|v| v.applied = false);
+    sp.written_not_deployed = false;
+    let t = text(&render(&app, Instant::now()));
+    assert!(!t.contains("written"), "{t}");
+}
+
+#[test]
+fn review_labels_a_group_whose_service_is_gone() {
+    let mut app = review_app();
+    app.services.value.as_mut().unwrap()[0].service_id = "svc-other".into();
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("(service no longer exists)"), "{t}");
+    assert!(!t.contains("(environment no longer exists)"), "{t}");
+}
+
+fn deploy_confirm(app: &mut App, drift: &[&str]) {
+    app.confirm = Some(crate::app::Confirm::Deploy(crate::app::DeployConfirm {
+        env_id: "e1".into(),
+        service_id: "svc-1".into(),
+        drift: drift.iter().map(|d| d.to_string()).collect(),
+    }));
+}
+
+/// The column of `needle` in `row`, counted in cells.
+fn col(row: &str, needle: &str) -> u16 {
+    row[..row.find(needle).unwrap()].chars().count() as u16
+}
+
+#[test]
+fn production_confirm_shows_env_in_bad_colour() {
+    let mut app = review_app();
+    deploy_confirm(&mut app, &["NEW"]);
+    let buf = render(&app, Instant::now());
+    let t = text(&buf);
+    assert!(
+        t.contains("Deploy? y to confirm, any other key cancels"),
+        "{t}"
+    );
+    assert!(t.contains("service: api"), "{t}");
+    // Unapplied changes only (the review behind shows CHG), values hidden.
+    let top = (0..30)
+        .find(|y| row_text(&buf, *y).contains("┌ Deploy"))
+        .unwrap_or_else(|| panic!("no overlay\n{t}"));
+    let overlay: String = (top..30).map(|y| row_text(&buf, y)).collect();
+    assert!(
+        overlay.contains("+ NEW") && overlay.contains("- GONE"),
+        "{t}"
+    );
+    assert!(!overlay.contains("CHG"), "{t}");
+    for secret in ["newsecret", "oldsecret"] {
+        assert!(!t.contains(secret), "{t}");
+    }
+    let drift = (0..30)
+        .map(|y| row_text(&buf, y))
+        .find(|r| r.contains("changed on Railway since your edit"))
+        .unwrap_or_else(|| panic!("no drift line\n{t}"));
+    assert!(drift.contains("NEW"), "{drift}");
+    let y = (0..30)
+        .find(|y| row_text(&buf, *y).contains("Deploy to production"))
+        .unwrap_or_else(|| panic!("no title\n{t}"));
+    let x = col(&row_text(&buf, y), "production");
+    assert_eq!(buf[(x, y)].fg, T.bad);
+
+    let mut app = review_app();
+    app.pending
+        .envs
+        .get_mut("e1")
+        .unwrap()
+        .get_mut("svc-1")
+        .unwrap()
+        .env_name = "staging".into();
+    deploy_confirm(&mut app, &[]);
+    let buf = render(&app, Instant::now());
+    let t = text(&buf);
+    assert!(!t.contains("changed on Railway"), "{t}");
+    let y = (0..30)
+        .find(|y| row_text(&buf, *y).contains("Deploy to staging"))
+        .unwrap_or_else(|| panic!("no title\n{t}"));
+    let x = col(&row_text(&buf, y), "staging");
+    assert_eq!(buf[(x, y)].fg, T.accent);
+}
+
+#[test]
+fn long_deploy_confirm_keeps_the_prompt() {
+    let mut app = review_app();
+    for i in 0..60 {
+        add_pending(
+            &mut app,
+            &format!("V{i:02}"),
+            crate::pending::Change::Delete,
+            Some("x"),
+        );
+    }
+    deploy_confirm(&mut app, &[]);
+    let t = text(&render(&app, Instant::now()));
+    assert!(
+        t.contains("Deploy? y to confirm, any other key cancels"),
+        "{t}"
+    );
+    assert!(t.contains("more changes"), "{t}");
+}
+
+#[test]
+fn help_overlay_shows_every_line_in_full() {
+    let mut app = services_app(vec![]);
+    app.help = true;
+    let out = text(&render_sized(&app, Instant::now(), 100, 40));
+    for line in super::HELP_LINES {
+        assert!(
+            out.contains(line.trim_end()),
+            "help line truncated: {line:?}"
+        );
+    }
+}

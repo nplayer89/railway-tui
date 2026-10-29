@@ -4,12 +4,14 @@ A k9s-style terminal UI for looking at [Railway](https://railway.com) from the k
 service's deployment health at a glance, and get from a failed or crashed deployment to the log
 line that explains it in a couple of keystrokes.
 
-It is **read-only**. It never restarts, redeploys, scales or changes anything on Railway. It uses
-only Railway's public GraphQL API (queries and subscriptions, no mutations).
+Everything is read-only except environment variables: you can edit, add and delete a service's
+variables and deploy those changes (see [Variables](#variables)). It never restarts, scales or
+otherwise changes anything else. It uses only Railway's public GraphQL API.
 
 Views: Projects, Services (one row per service with a coloured box per replica), Deployments
 (history of one service), Instances (the replicas of a deployment) and Logs (live build or
-runtime logs with a filter).
+runtime logs with a filter), Variables (one service's variables) and Pending (review and deploy
+your unsent variable changes).
 
 ## Install
 
@@ -51,17 +53,67 @@ On launch it reopens the last-used project and environment.
 | `enter` | open the selected item |
 | `esc` | back, or clear the filter |
 | `/` | filter the current table or log |
-| `:` | command line: `:projects`, `:services`, `:deploys`, `:logs`, `:q` |
+| `:` | command line: `:projects`, `:services`, `:deploys`, `:logs`, `:vars`, `:pending`, `:q` |
 | `e` | environment picker (Services) |
 | `l` | logs of the service's latest deployment (Services) |
 | `i` | instances of the service's deployment (Services) |
+| `v` | variables of the selected service (Services; also `:vars`) |
+| `p` | review pending variable changes (Services and Variables; also `:pending`) |
 | `b` | switch between build and runtime logs (Logs) |
 | `f`, `G` | resume following the log (Logs) |
 | `PageUp` / `PageDown` | scroll the log by a page (Logs) |
 | `ctrl-r` | reload (in the log view: reconnect the stream) |
 | `t` | theme picker (also `:theme`): moving previews, `enter` keeps and remembers, `esc` reverts |
 | `?` | toggle the help overlay |
-| `q`, `ctrl-c` | quit |
+| `q`, `ctrl-c` | quit (refused while a deploy is in flight; `ctrl-c` twice forces it) |
+
+## Variables
+
+From Services press `v` (or `:vars`) to open the selected service's variables in the current
+environment. Values are hidden until revealed and are hidden again when you leave the view.
+
+| key | action |
+| --- | --- |
+| `/` | live search by variable name only (never values) |
+| `e` / `enter` | edit the selected value inline |
+| `E` | edit in `$VISUAL`, then `$EDITOR`, then `vi` |
+| `a` | add a variable |
+| `d` | mark the selected variable for deletion (toggle) |
+| `u` | undo the pending change to the selected variable |
+| `r` / `R` | reveal the selected value / all values |
+| `p` | open the review |
+
+Edits are not sent to Railway immediately. They are kept as pending changes and shown in the view.
+
+### Review and deploy
+
+`p` (or `:pending`) lists the pending changes in the open project, grouped by environment, then service, with the
+current environment first. `D` deploys the selected group: a confirmation shows the diff, and any variable
+that "changed on Railway since your edit". `y` deploys; any other key cancels. `x` discards a group
+(also confirmed), and `r` / `R` both toggle reveal-all. A group cannot be discarded while it is deploying.
+
+Deploy order for one service: upsert the changed variables without triggering a deploy, then the
+deletes, then a redeploy of that service only. If something fails, the group stays pending and a
+retry re-sends only the changes not yet applied. If the variables were written but the redeploy
+failed ("written, not deployed"), a retry only redeploys. If the outcome of a call is unknown, the
+variables are re-read from Railway first. Nothing is ever resent automatically.
+
+### Pending storage
+
+Pending changes are saved to `$XDG_STATE_HOME/railway-tui/pending.toml` (default
+`~/.local/state/railway-tui/pending.toml`) with mode 0600, so they survive a restart. **The file
+holds secret values in plain text.** A corrupt file is moved to `pending.toml.corrupt-<unix seconds>`
+(never over an earlier one; the message names the path) and you start empty.
+
+### First live run checklist
+
+Do the first run on a non-production environment. Things not yet confirmed against the real API:
+
+- Does deleting a variable trigger a deploy by itself? (`variableDelete` has no `skipDeploys`; the
+  worst case is an extra deploy that already carries the new values.)
+- How do "sealed" variables (which cannot be read back) and `RAILWAY_*` variables appear in the view?
+- What is Railway's exact "not found" wording when deleting a variable that is already gone?
+- Does `$EDITOR` (`E`) receive every keystroke cleanly, with no characters lost to the TUI?
 
 ## Config
 

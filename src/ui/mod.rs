@@ -1,9 +1,11 @@
 //! Rendering: a pure function of `App`.
 
 mod logs;
+mod pending;
 mod tables;
 #[cfg(test)]
 mod tests;
+mod vars;
 
 use std::time::Instant;
 
@@ -14,7 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Loaded, View};
+use crate::app::{App, Confirm, Loaded, View};
 use crate::status::BoxColour;
 use crate::theme::{Theme, THEMES};
 
@@ -38,6 +40,11 @@ fn clean(s: &str) -> String {
         .collect()
 }
 
+/// Whether an environment name looks like production (case-insensitive `prod` anywhere).
+pub fn is_production(env_name: &str) -> bool {
+    env_name.to_lowercase().contains("prod")
+}
+
 pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
     let t = app.theme();
     frame.render_widget(Block::new().style(base(t)), frame.area());
@@ -55,6 +62,8 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
         Some(View::Deployments { .. }) => tables::deployments(frame, body, app, wall),
         Some(View::Instances { .. }) => tables::instances(frame, body, app),
         Some(View::Logs(l)) => logs::draw(frame, body, l, t),
+        Some(View::Pending(v)) => pending::draw(frame, body, app, v),
+        Some(View::Variables(v)) => vars::draw(frame, body, app, v),
         Some(View::Projects) | None => tables::projects(frame, body, app),
     }
     draw_footer(frame, foot, app);
@@ -68,16 +77,23 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
     if app.theme_picker.is_some() {
         draw_theme_picker(frame, body, app);
     }
+    if let Some(Confirm::Deploy(d)) = &app.confirm {
+        pending::draw_deploy_confirm(frame, body, app, d);
+    }
 }
 
 fn hints(app: &App) -> &'static str {
     match app.stack.last() {
         Some(View::Services) => {
-            "<e> env  <l> logs  <i> instances  <enter> deploys  </> filter  <?> help"
+            "<e> env  <l> logs  <i> inst  <v> vars  <p> pending  </> filter  <?> help"
         }
         Some(View::Deployments { .. }) | Some(View::Instances { .. }) => {
             "<enter> logs  </> filter  <esc> back  <?> help"
         }
+        Some(View::Variables(_)) => {
+            "<e> edit  <a> add  <d> del  <u> undo  <r> reveal  <p> review  <?> help"
+        }
+        Some(View::Pending(_)) => "<D> deploy  <x> discard  <r> reveal  <esc> back  <?> help",
         Some(View::Logs(_)) => "<b> build/runtime  <f> follow  </> filter  <esc> back  <?> help",
         _ => "<enter> open  </> filter  <:> command  <t> theme  <?> help",
     }
@@ -98,7 +114,8 @@ fn freshness_source(app: &App) -> Option<Freshness<'_>> {
             of(&app.environments)
         }
         Some(View::Services) | Some(View::Instances { .. }) => of(&app.services),
-        Some(View::Logs(_)) => None,
+        Some(View::Variables(_)) => of(&app.variables),
+        Some(View::Pending(_)) | Some(View::Logs(_)) => None,
     }
 }
 
@@ -149,6 +166,16 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
             (None, None, false) => spans.push(Span::styled("not loaded", dim)),
         }
     }
+    let pending = app
+        .project
+        .as_ref()
+        .map_or(0, |p| app.pending.count_for_project(&p.id));
+    if pending > 0 {
+        spans.push(Span::styled(
+            format!("  {pending} pending"),
+            Style::new().fg(t.busy),
+        ));
+    }
     if !app.live_updates {
         spans.push(Span::styled("  live updates off", Style::new().fg(t.busy)));
     }
@@ -164,6 +191,26 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let t = app.theme();
+    if let Some(Confirm::Discard { env_id, service_id }) = &app.confirm {
+        let sp = app.pending.service(env_id, service_id);
+        let service = sp.map_or(service_id.as_str(), |s| s.service_name.as_str());
+        let env = sp.map_or(env_id.as_str(), |s| s.env_name.as_str());
+        let line = format!(
+            "Discard pending changes for {} in {}? (y/n)",
+            clean(service),
+            clean(env)
+        );
+        frame.render_widget(Paragraph::new(line).style(Style::new().fg(t.busy)), area);
+        return;
+    }
+    if let Some(input) = &app.var_input {
+        let line = match &input.name {
+            None => format!("name: {}▏", clean(&input.text)),
+            Some(name) => format!("{} = {}▏", clean(name), clean(&input.text)),
+        };
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
     if let Some(text) = &app.command_line {
         frame.render_widget(Paragraph::new(format!(":{}▏", clean(text))), area);
         return;
@@ -182,6 +229,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 .map_or("services".into(), |p| clean(&p.name)),
             View::Deployments { .. } => "deployments".into(),
             View::Instances { .. } => "instances".into(),
+            View::Variables(_) => "variables".into(),
+            View::Pending(_) => "pending".into(),
             View::Logs(_) => "logs".into(),
         });
     }
@@ -255,22 +304,30 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
+const HELP_LINES: [&str; 19] = [
+    "j/k, arrows  move / scroll",
+    "enter        open",
+    "esc          back / clear filter",
+    "/            filter",
+    ":            command (projects services deploys logs)",
+    "             also :vars :pending :theme :q",
+    "e            environment picker (services)",
+    "l            latest logs   i  instances",
+    "b            build/runtime logs",
+    "f, G         follow logs",
+    "ctrl-r       reload (in logs: reconnect)",
+    "t            theme picker (:theme)",
+    "v            service variables (:vars)",
+    "  e/enter edit  E $EDITOR  a add  d delete  u undo",
+    "  r reveal  R reveal all  p review  / name filter",
+    "p            review pending changes (:pending)",
+    "  D deploy  x discard  r/R reveal  (y confirms)",
+    "?            toggle help",
+    "q            quit",
+];
+
 fn draw_help(frame: &mut Frame, area: Rect, t: &Theme) {
-    let text = [
-        "j/k, arrows  move / scroll",
-        "enter        open",
-        "esc          back / clear filter",
-        "/            filter",
-        ":            command (projects services deploys logs q)",
-        "e            environment picker (services)",
-        "l            latest logs   i  instances",
-        "b            build/runtime logs",
-        "f, G         follow logs",
-        "ctrl-r       reload (in logs: reconnect)",
-        "t            theme picker (:theme)",
-        "?            toggle help",
-        "q            quit",
-    ];
+    let text = HELP_LINES;
     let rect = centered(area, 64, text.len() as u16 + 2);
     frame.render_widget(Clear, rect);
     let lines: Vec<Line> = text.iter().map(|t| Line::from(*t)).collect();

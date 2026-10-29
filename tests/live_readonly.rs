@@ -289,6 +289,22 @@ async fn live_deployments_order() {
     }
 }
 
+/// Discovery + 1 request. Prints only the count, never names or values.
+#[tokio::test]
+#[ignore]
+async fn live_variables_read() {
+    if !live() {
+        return;
+    }
+    let api = api(tokens());
+    let t = find_target(&api).await;
+    let vars = api
+        .variables(&t.project_id, &t.env_id, &t.service_id)
+        .await
+        .expect("variables");
+    println!("variables: {} defined", vars.len());
+}
+
 /// Discovery + 4 requests.
 #[tokio::test]
 #[ignore]

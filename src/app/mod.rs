@@ -1,7 +1,10 @@
 //! App state machine: `update(event, now) -> commands`. No IO, no rendering.
 
+mod deploy;
 mod keys;
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::KeyEvent;
@@ -11,8 +14,9 @@ use crate::logs::buffer::{LogBuffer, LOG_CAP};
 use crate::logs::follow::{FollowEvent, StreamState};
 use crate::model::{
     DeploymentStatus, DeploymentSummary, Environment, Instance, LogKind, ProjectRef,
-    ServiceInstance, Workspace,
+    ServiceInstance, Variables, Workspace,
 };
+use crate::pending::{Pending, PendingVar};
 use crate::remember::Remembered;
 use crate::status::{default_log_kind, deployment_rows, DeploymentRow};
 use crate::theme::{self, Theme, THEMES};
@@ -46,6 +50,106 @@ pub enum View {
     Deployments { service_id: String },
     Instances { service_id: String },
     Logs(LogsView),
+    Variables(VarsView),
+    Pending(PendingView),
+}
+
+/// The Variables view of one service. Dropping it re-hides every value.
+#[derive(Debug)]
+pub struct VarsView {
+    pub service_id: String,
+    /// Names whose value is shown.
+    pub revealed: BTreeSet<String>,
+    pub reveal_all: bool,
+}
+
+/// The review of every pending change in the open project.
+#[derive(Debug, Default)]
+pub struct PendingView {
+    pub reveal_all: bool,
+}
+
+/// One service's pending changes in one environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingGroup {
+    pub env_id: String,
+    pub service_id: String,
+    /// What no longer exists, so nothing can be written to it.
+    pub orphaned: Option<Orphan>,
+}
+
+/// Why a pending group can only be discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Orphan {
+    /// The environment is not in the loaded list.
+    Environment,
+    /// The environment is the current one and its loaded services lack this one.
+    Service,
+}
+
+impl PendingGroup {
+    /// The selection key of this group.
+    pub fn id(&self) -> String {
+        format!("{}/{}", self.env_id, self.service_id)
+    }
+}
+
+/// A question waiting for `y`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Confirm {
+    Discard { env_id: String, service_id: String },
+    Deploy(DeployConfirm),
+}
+
+/// Deploying one pending group. The ids come from the group, never from the
+/// open project or environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployConfirm {
+    pub env_id: String,
+    pub service_id: String,
+    /// Names changed on Railway since they were edited.
+    pub drift: Vec<String>,
+}
+
+/// Why variables were loaded: for the Variables view, to check a deploy
+/// before confirming it, or to find out what an interrupted write applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VarsPurpose {
+    View,
+    Deploy,
+    Reconcile,
+}
+
+/// One finished step of a deploy, reported by the worker as it goes.
+/// Error texts are Railway's messages with every sent value masked by the worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeployStep {
+    Upserted,
+    Deleted(String),
+    Redeployed,
+    Failed {
+        during: Phase,
+        error: String,
+        /// Sent, but Railway may or may not have applied it.
+        unknown: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Phase {
+    Upsert,
+    Delete(String),
+    Redeploy,
+}
+
+impl fmt::Display for Phase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Phase::Upsert => f.write_str("upsert"),
+            Phase::Delete(name) => write!(f, "delete {name}"),
+            Phase::Redeploy => f.write_str("redeploy"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -70,7 +174,6 @@ pub enum AppEvent {
     Data(DataEvent),
 }
 
-#[derive(Debug)]
 pub enum DataEvent {
     Workspaces(Result<Vec<Workspace>, String>),
     Environments {
@@ -86,6 +189,24 @@ pub enum DataEvent {
         service_id: String,
         env_id: String,
         result: Result<Vec<DeploymentSummary>, String>,
+    },
+    Variables {
+        env_id: String,
+        service_id: String,
+        purpose: VarsPurpose,
+        result: Result<Variables, String>,
+    },
+    Deploy {
+        env_id: String,
+        service_id: String,
+        step: DeployStep,
+    },
+    /// Saving the pending file failed; the text never holds a value.
+    SaveFailed(String),
+    /// The external editor finished: the new value, or why it could not run.
+    Edited {
+        name: String,
+        result: Result<String, String>,
     },
     StatusChanged {
         deployment_id: String,
@@ -104,7 +225,7 @@ pub enum DataEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Command {
     LoadWorkspaces,
     LoadEnvironments {
@@ -118,6 +239,29 @@ pub enum Command {
         project_id: String,
         env_id: String,
         service_id: String,
+    },
+    LoadVariables {
+        project_id: String,
+        env_id: String,
+        service_id: String,
+        purpose: VarsPurpose,
+    },
+    SavePending(Pending),
+    /// Writes one group's unapplied changes, then redeploys: upsert (skipped
+    /// when `upserts` is empty), each delete, then the redeploy, stopping at
+    /// the first failure. `redeploy_only` skips the writes.
+    DeployService {
+        project_id: String,
+        env_id: String,
+        service_id: String,
+        upserts: Variables,
+        deletes: Vec<String>,
+        redeploy_only: bool,
+    },
+    /// Handled by the main loop, not the worker: edit `initial` in `$VISUAL`/`$EDITOR`.
+    EditExternal {
+        name: String,
+        initial: String,
     },
     /// Replaces the previous watch set; empty means stop.
     WatchDeployments {
@@ -136,6 +280,14 @@ pub enum Command {
     Quit,
 }
 
+/// A one-line variable input. `name: None` means the name of a new variable is being typed;
+/// otherwise `text` is the value of `name`.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct VarInput {
+    pub name: Option<String>,
+    pub text: String,
+}
+
 /// Start-up preferences: config defaults (id or case-insensitive name) and remembered ids.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StartPrefs {
@@ -145,6 +297,9 @@ pub struct StartPrefs {
     /// Configured theme id or name.
     pub theme: Option<String>,
     pub remembered: Remembered,
+    pub pending: Pending,
+    /// Why the pending file could not be read, shown at start.
+    pub pending_error: Option<String>,
 }
 
 /// Selected row per table view, by id, so it survives reloads and filtering.
@@ -154,9 +309,10 @@ pub struct Selection {
     pub service: Option<String>,
     pub deployment: Option<String>,
     pub instance: Option<String>,
+    pub variable: Option<String>,
+    pub pending: Option<String>,
 }
 
-#[derive(Debug)]
 pub struct App {
     pub prefs: StartPrefs,
     /// Never empty; the root is always `View::Projects`.
@@ -169,7 +325,20 @@ pub struct App {
     pub services: Loaded<Vec<ServiceInstance>>,
     /// History for the service of the `Deployments` view in the stack.
     pub deployments: Loaded<Vec<DeploymentSummary>>,
+    /// Railway's variables for the service of the open `Variables` view.
+    pub variables: Loaded<Variables>,
+    /// Edits not deployed yet, for every service.
+    pub pending: Pending,
     pub selection: Selection,
+    /// The variable name or value being typed in the Variables view.
+    pub var_input: Option<VarInput>,
+    /// The question being asked, answered with `y` or any other key.
+    pub confirm: Option<Confirm>,
+    /// Deploys sent to the worker and not finished, by (env id, service id).
+    deploys: BTreeMap<(String, String), deploy::Sent>,
+    /// Ctrl-C was pressed once while deploys are in flight; a second one quits.
+    /// Cleared once no deploy is in flight.
+    force_quit_armed: bool,
     /// Applied name filter for the current table view (cleared on view change).
     pub table_filter: Option<String>,
     /// Filter text being typed after `/` (table or logs, by the top view).
@@ -200,11 +369,14 @@ struct Requested {
     environments: Option<Instant>,
     services: Option<Instant>,
     deployments: Option<Instant>,
+    variables: Option<Instant>,
 }
 
 impl App {
     pub fn new(prefs: StartPrefs) -> (App, Vec<Command>) {
-        let (theme, message) = start_theme(&prefs);
+        let (theme, theme_message) = start_theme(&prefs);
+        let message = prefs.pending_error.clone().or(theme_message);
+        let pending = prefs.pending.clone();
         let mut app = App {
             prefs,
             stack: vec![View::Projects],
@@ -215,7 +387,13 @@ impl App {
             environments: Loaded::default(),
             services: Loaded::default(),
             deployments: Loaded::default(),
+            variables: Loaded::default(),
+            pending,
             selection: Selection::default(),
+            var_input: None,
+            confirm: None,
+            deploys: BTreeMap::new(),
+            force_quit_armed: false,
             table_filter: None,
             filter_input: None,
             command_line: None,
@@ -241,6 +419,9 @@ impl App {
             AppEvent::Key(key) => self.on_key(key, now, &mut out),
             AppEvent::Tick(_) => self.on_tick(now, &mut out),
             AppEvent::Data(data) => self.on_data(data, now, &mut out),
+        }
+        if self.deploys.is_empty() {
+            self.force_quit_armed = false;
         }
         out
     }
@@ -315,6 +496,96 @@ impl App {
             .collect()
     }
 
+    /// Railway's variables for the open service merged with its pending edits,
+    /// by name, narrowed by the name filter (never the values).
+    pub fn variable_rows(&self) -> Vec<VarRow<'_>> {
+        let Some(service_id) = self.view_service_id(Kind::Variables) else {
+            return Vec::new();
+        };
+        let mut rows: BTreeMap<&str, VarRow> = BTreeMap::new();
+        for (name, value) in self.variables.value.iter().flatten() {
+            let row = VarRow {
+                name,
+                current: Some(value),
+                pending: None,
+            };
+            rows.insert(name, row);
+        }
+        let pending = self
+            .env_id()
+            .and_then(|env| self.pending.service(env, service_id));
+        for (name, change) in pending.iter().flat_map(|p| &p.vars) {
+            rows.entry(name)
+                .or_insert(VarRow {
+                    name,
+                    current: None,
+                    pending: None,
+                })
+                .pending = Some(change);
+        }
+        rows.into_values()
+            .filter(|r| self.passes_filter(&[r.name]))
+            .collect()
+    }
+
+    /// Pending changes of the open project: the current environment first, then the
+    /// others by name, and by service name within each.
+    pub fn pending_groups(&self) -> Vec<PendingGroup> {
+        let Some(project_id) = self.project_id() else {
+            return Vec::new();
+        };
+        let current = self.env_id();
+        let loaded = self.environments.value.as_deref();
+        let services = self.services.value.as_deref();
+        let mut found: Vec<(bool, &str, &str, &str, &str)> = Vec::new();
+        for (env_id, services) in &self.pending.envs {
+            for (service_id, sp) in services {
+                if sp.project_id == project_id {
+                    // The env id after its name keeps same-named environments apart.
+                    found.push((
+                        current != Some(env_id.as_str()),
+                        &sp.env_name,
+                        env_id,
+                        &sp.service_name,
+                        service_id,
+                    ));
+                }
+            }
+        }
+        found.sort();
+        found
+            .into_iter()
+            .map(|(_, _, env_id, _, service_id)| {
+                let env_gone = loaded.is_some_and(|l| !l.iter().any(|e| e.id == env_id));
+                let service_gone = current == Some(env_id)
+                    && services.is_some_and(|l| !l.iter().any(|s| s.service_id == service_id));
+                PendingGroup {
+                    env_id: env_id.to_string(),
+                    service_id: service_id.to_string(),
+                    orphaned: if env_gone {
+                        Some(Orphan::Environment)
+                    } else if service_gone {
+                        Some(Orphan::Service)
+                    } else {
+                        None
+                    },
+                }
+            })
+            .collect()
+    }
+
+    fn selected_group(&self) -> Option<PendingGroup> {
+        let groups = self.pending_groups();
+        let ids: Vec<String> = groups.iter().map(|g| g.id()).collect();
+        let i = position(&ids, self.selection.pending.as_deref());
+        groups.into_iter().nth(i)
+    }
+
+    fn open_pending(&mut self, out: &mut Vec<Command>) {
+        self.selection.pending = None;
+        self.push(View::Pending(PendingView::default()), out);
+    }
+
     /// The active theme (the previewed one while the picker is open).
     pub fn theme(&self) -> &'static Theme {
         &THEMES[self.theme]
@@ -378,6 +649,33 @@ impl App {
                 }
                 self.deployments.finish(result, now);
             }
+            DataEvent::Variables {
+                env_id,
+                service_id,
+                purpose,
+                result,
+            } => match purpose {
+                VarsPurpose::View => {
+                    if self.env_id() != Some(env_id.as_str())
+                        || self.view_service_id(Kind::Variables) != Some(service_id.as_str())
+                    {
+                        return;
+                    }
+                    self.variables.finish(result, now);
+                }
+                VarsPurpose::Deploy => self.on_deploy_check(env_id, service_id, result),
+                VarsPurpose::Reconcile => self.on_reconcile(env_id, service_id, result, out),
+            },
+            DataEvent::Deploy {
+                env_id,
+                service_id,
+                step,
+            } => self.on_deploy_step(env_id, service_id, step, now, out),
+            DataEvent::SaveFailed(message) => self.message = Some(message),
+            DataEvent::Edited { name, result } => match result {
+                Ok(value) => self.set_variable(&name, value, out),
+                Err(message) => self.message = Some(message),
+            },
             DataEvent::StatusChanged {
                 deployment_id,
                 status,
@@ -551,7 +849,12 @@ impl App {
                 self.requested.deployments,
                 self.deployments.loading,
             ),
-            Kind::Logs => return,
+            Kind::Variables => (
+                self.variables.fetched_at,
+                self.requested.variables,
+                self.variables.loading,
+            ),
+            Kind::Pending | Kind::Logs => return,
         };
         let last = fetched_at.max(requested);
         if !loading && last.is_some_and(|t| t + self.backstop <= now) {
@@ -573,6 +876,12 @@ impl App {
                     self.load_deployments(id, now, out);
                 }
             }
+            Kind::Variables => {
+                if let Some(id) = self.view_service_id(Kind::Variables).map(String::from) {
+                    self.load_variables(id, now, out);
+                }
+            }
+            Kind::Pending => {}
             Kind::Logs => self.reopen_logs(None, out),
         }
     }
@@ -617,6 +926,20 @@ impl App {
         self.requested.deployments = Some(now);
     }
 
+    fn load_variables(&mut self, service_id: String, now: Instant, out: &mut Vec<Command>) {
+        let (Some(project_id), Some(env_id)) = (self.project_id(), self.env_id()) else {
+            return;
+        };
+        out.push(Command::LoadVariables {
+            project_id: project_id.to_string(),
+            env_id: env_id.to_string(),
+            service_id,
+            purpose: VarsPurpose::View,
+        });
+        self.variables.loading = true;
+        self.requested.variables = Some(now);
+    }
+
     // ---- navigation ----
 
     fn open_project(
@@ -653,6 +976,20 @@ impl App {
             out,
         );
         self.load_deployments(service_id, now, out);
+    }
+
+    fn open_variables(&mut self, service_id: String, now: Instant, out: &mut Vec<Command>) {
+        self.variables = Loaded::default();
+        self.selection.variable = None;
+        self.push(
+            View::Variables(VarsView {
+                service_id: service_id.clone(),
+                revealed: BTreeSet::new(),
+                reveal_all: false,
+            }),
+            out,
+        );
+        self.load_variables(service_id, now, out);
     }
 
     /// Logs of the selected service's latest deployment (the failed one, if it failed).
@@ -850,6 +1187,12 @@ impl App {
                 .iter()
                 .map(|(_, i)| i.id.clone())
                 .collect(),
+            Kind::Variables => self
+                .variable_rows()
+                .iter()
+                .map(|r| r.name.to_string())
+                .collect(),
+            Kind::Pending => self.pending_groups().iter().map(|g| g.id()).collect(),
             Kind::Logs => Vec::new(),
         }
     }
@@ -860,6 +1203,8 @@ impl App {
             Kind::Services => Some(&self.selection.service),
             Kind::Deployments => Some(&self.selection.deployment),
             Kind::Instances => Some(&self.selection.instance),
+            Kind::Variables => Some(&self.selection.variable),
+            Kind::Pending => Some(&self.selection.pending),
             Kind::Logs => None,
         }
     }
@@ -870,6 +1215,8 @@ impl App {
             Kind::Services => Some(&mut self.selection.service),
             Kind::Deployments => Some(&mut self.selection.deployment),
             Kind::Instances => Some(&mut self.selection.instance),
+            Kind::Variables => Some(&mut self.selection.variable),
+            Kind::Pending => Some(&mut self.selection.pending),
             Kind::Logs => None,
         }
     }
@@ -912,6 +1259,8 @@ impl App {
             Some(View::Deployments { .. }) => Kind::Deployments,
             Some(View::Instances { .. }) => Kind::Instances,
             Some(View::Logs(_)) => Kind::Logs,
+            Some(View::Variables(_)) => Kind::Variables,
+            Some(View::Pending(_)) => Kind::Pending,
         }
     }
 
@@ -927,6 +1276,7 @@ impl App {
         self.stack.iter().rev().find_map(|v| match (v, kind) {
             (View::Deployments { service_id }, Kind::Deployments)
             | (View::Instances { service_id }, Kind::Instances) => Some(service_id.as_str()),
+            (View::Variables(v), Kind::Variables) => Some(v.service_id.as_str()),
             _ => None,
         })
     }
@@ -1003,7 +1353,211 @@ enum Kind {
     Services,
     Deployments,
     Instances,
+    Variables,
+    Pending,
     Logs,
+}
+
+/// One line of the Variables view.
+pub struct VarRow<'a> {
+    pub name: &'a str,
+    /// The value on Railway, if the variable exists there.
+    pub current: Option<&'a str>,
+    pub pending: Option<&'a PendingVar>,
+}
+
+/// Values must never reach a log or panic message, so `Variables` is left out.
+impl fmt::Debug for App {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("App")
+            .field("stack", &self.stack)
+            .field("project", &self.project)
+            .field("environment", &self.environment)
+            .field("selection", &self.selection)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Written by hand so a loaded `Variables` prints as a count, not its values.
+impl fmt::Debug for DataEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DataEvent::Workspaces(r) => f.debug_tuple("Workspaces").field(r).finish(),
+            DataEvent::Environments { project_id, result } => f
+                .debug_struct("Environments")
+                .field("project_id", project_id)
+                .field("result", result)
+                .finish(),
+            DataEvent::Services {
+                project_id,
+                env_id,
+                result,
+            } => f
+                .debug_struct("Services")
+                .field("project_id", project_id)
+                .field("env_id", env_id)
+                .field("result", result)
+                .finish(),
+            DataEvent::Deployments {
+                service_id,
+                env_id,
+                result,
+            } => f
+                .debug_struct("Deployments")
+                .field("service_id", service_id)
+                .field("env_id", env_id)
+                .field("result", result)
+                .finish(),
+            DataEvent::Variables {
+                env_id,
+                service_id,
+                purpose,
+                result,
+            } => {
+                let shown = match result {
+                    Ok(vars) => format!("Ok({} variables)", vars.len()),
+                    Err(e) => format!("Err({e:?})"),
+                };
+                f.debug_struct("Variables")
+                    .field("env_id", env_id)
+                    .field("service_id", service_id)
+                    .field("purpose", purpose)
+                    .field("result", &format_args!("{shown}"))
+                    .finish()
+            }
+            DataEvent::Deploy {
+                env_id,
+                service_id,
+                step,
+            } => f
+                .debug_struct("Deploy")
+                .field("env_id", env_id)
+                .field("service_id", service_id)
+                .field("step", step)
+                .finish(),
+            DataEvent::SaveFailed(m) => f.debug_tuple("SaveFailed").field(m).finish(),
+            DataEvent::Edited { name, result } => f
+                .debug_struct("Edited")
+                .field("name", name)
+                .field("result", &result.as_ref().map(|_| "<redacted>"))
+                .finish(),
+            DataEvent::StatusChanged {
+                deployment_id,
+                status,
+            } => f
+                .debug_struct("StatusChanged")
+                .field("deployment_id", deployment_id)
+                .field("status", status)
+                .finish(),
+            DataEvent::Log { session, event } => f
+                .debug_struct("Log")
+                .field("session", session)
+                .field("event", event)
+                .finish(),
+            DataEvent::Budget {
+                interval,
+                blocked_until,
+            } => f
+                .debug_struct("Budget")
+                .field("interval", interval)
+                .field("blocked_until", blocked_until)
+                .finish(),
+            DataEvent::LiveUpdates { ok } => f.debug_struct("LiveUpdates").field("ok", ok).finish(),
+        }
+    }
+}
+
+impl fmt::Debug for VarInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VarInput")
+            .field("name", &self.name)
+            .field("text", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Written by hand so `EditExternal` never prints the value being edited.
+impl fmt::Debug for Command {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Command::LoadWorkspaces => f.write_str("LoadWorkspaces"),
+            Command::LoadEnvironments { project_id } => f
+                .debug_struct("LoadEnvironments")
+                .field("project_id", project_id)
+                .finish(),
+            Command::LoadServices { project_id, env_id } => f
+                .debug_struct("LoadServices")
+                .field("project_id", project_id)
+                .field("env_id", env_id)
+                .finish(),
+            Command::LoadDeployments {
+                project_id,
+                env_id,
+                service_id,
+            } => f
+                .debug_struct("LoadDeployments")
+                .field("project_id", project_id)
+                .field("env_id", env_id)
+                .field("service_id", service_id)
+                .finish(),
+            Command::LoadVariables {
+                project_id,
+                env_id,
+                service_id,
+                purpose,
+            } => f
+                .debug_struct("LoadVariables")
+                .field("project_id", project_id)
+                .field("env_id", env_id)
+                .field("service_id", service_id)
+                .field("purpose", purpose)
+                .finish(),
+            Command::SavePending(p) => f.debug_tuple("SavePending").field(p).finish(),
+            Command::DeployService {
+                project_id,
+                env_id,
+                service_id,
+                upserts,
+                deletes,
+                redeploy_only,
+            } => f
+                .debug_struct("DeployService")
+                .field("project_id", project_id)
+                .field("env_id", env_id)
+                .field("service_id", service_id)
+                .field("upserts", &upserts.keys().collect::<Vec<_>>())
+                .field("deletes", deletes)
+                .field("redeploy_only", redeploy_only)
+                .finish(),
+            Command::EditExternal { name, .. } => f
+                .debug_struct("EditExternal")
+                .field("name", name)
+                .field("initial", &"<redacted>")
+                .finish(),
+            Command::WatchDeployments { ids } => f
+                .debug_struct("WatchDeployments")
+                .field("ids", ids)
+                .finish(),
+            Command::OpenLogs {
+                session,
+                env_id,
+                deployment_id,
+                kind,
+            } => f
+                .debug_struct("OpenLogs")
+                .field("session", session)
+                .field("env_id", env_id)
+                .field("deployment_id", deployment_id)
+                .field("kind", kind)
+                .finish(),
+            Command::CloseLogs { session } => f
+                .debug_struct("CloseLogs")
+                .field("session", session)
+                .finish(),
+            Command::SaveRemembered(r) => f.debug_tuple("SaveRemembered").field(r).finish(),
+            Command::Quit => f.write_str("Quit"),
+        }
+    }
 }
 
 /// Index of `selected` in `ids`, or 0 when it is unset or filtered out.
@@ -1867,5 +2421,1222 @@ mod tests {
         assert!(!app.help);
         app.update(key('/'), now);
         assert_eq!(app.update(ctrl('c'), now), vec![Command::Quit]);
+    }
+
+    // ---- variables ----
+
+    fn vars(pairs: &[(&str, &str)]) -> Variables {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn vars_event(service_id: &str, result: Result<Variables, String>) -> DataEvent {
+        DataEvent::Variables {
+            env_id: "e-prod".into(),
+            service_id: service_id.into(),
+            purpose: VarsPurpose::View,
+            result,
+        }
+    }
+
+    fn names(app: &App) -> Vec<String> {
+        app.variable_rows()
+            .iter()
+            .map(|r| r.name.to_string())
+            .collect()
+    }
+
+    /// Variables view of svc-a, loaded with a few variables.
+    fn app_in_variables(now: Instant) -> App {
+        let mut app = app_in_services(now);
+        app.update(key('v'), now);
+        let loaded = vars(&[
+            ("DB_URL", "postgres://x"),
+            ("PORT", "has db inside"),
+            ("REDIS_DB", "1"),
+        ]);
+        data(&mut app, vars_event("svc-a", Ok(loaded)), now);
+        app
+    }
+
+    #[test]
+    fn v_opens_variables_and_loads() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        let cmds = app.update(key('v'), now);
+        // Leaving Services stops its deployment watch first.
+        assert_eq!(
+            cmds,
+            vec![
+                Command::WatchDeployments { ids: Vec::new() },
+                Command::LoadVariables {
+                    project_id: "p2".into(),
+                    env_id: "e-prod".into(),
+                    service_id: "svc-a".into(),
+                    purpose: VarsPurpose::View,
+                },
+            ]
+        );
+        assert!(matches!(app.stack.last(), Some(View::Variables(_))));
+        assert!(app.variables.loading);
+        let cmds = app.update(code(KeyCode::Esc), now);
+        assert!(matches!(app.stack.as_slice(), [.., View::Services]));
+        assert_eq!(
+            cmds,
+            vec![Command::WatchDeployments {
+                ids: vec!["d2".into(), "d3".into()]
+            }]
+        );
+        typed(&mut app, ":vars", now);
+        let cmds = app.update(code(KeyCode::Enter), now);
+        assert!(matches!(
+            cmds.last(),
+            Some(Command::LoadVariables { service_id, .. }) if service_id == "svc-a"
+        ));
+    }
+
+    #[test]
+    fn ctrl_r_reloads_variables_and_stale_replies_are_ignored() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        let cmds = app.update(ctrl('r'), now);
+        assert!(matches!(cmds.as_slice(), [Command::LoadVariables { .. }]));
+        data(
+            &mut app,
+            vars_event("svc-b", Ok(vars(&[("OTHER", "1")]))),
+            now,
+        );
+        assert_eq!(names(&app), ["DB_URL", "PORT", "REDIS_DB"]);
+        data(&mut app, vars_event("svc-a", Err("boom".into())), now);
+        assert_eq!(app.variables.error.as_deref(), Some("boom"));
+        assert_eq!(names(&app).len(), 3, "a failed reload keeps the old rows");
+    }
+
+    #[test]
+    fn variable_rows_merge_railway_and_pending_sorted() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        let target = crate::pending::Target {
+            project_id: "p2",
+            env_id: "e-prod",
+            env_name: "production",
+            service_id: "svc-a",
+            service_name: "svc-a-name",
+        };
+        app.pending.set(&target, "ALPHA_NEW", "v".into(), None);
+        app.pending.delete(&target, "PORT", Some("has db inside"));
+        app.pending.set(&target, "REDIS_DB", "2".into(), Some("1"));
+        let rows = app.variable_rows();
+        let got: Vec<_> = rows
+            .iter()
+            .map(|r| (r.name, r.current, r.pending.is_some()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("ALPHA_NEW", None, true),
+                ("DB_URL", Some("postgres://x"), false),
+                ("PORT", Some("has db inside"), true),
+                ("REDIS_DB", Some("1"), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn slash_filters_variables_live_by_name_only() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        app.update(key('/'), now);
+        typed(&mut app, "db", now);
+        assert_eq!(names(&app), ["DB_URL", "REDIS_DB"]);
+        assert!(!names(&app).contains(&"PORT".to_string()));
+        app.update(code(KeyCode::Esc), now);
+        assert_eq!(names(&app), ["DB_URL", "PORT", "REDIS_DB"]);
+    }
+
+    #[test]
+    fn search_survives_reload() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        app.update(key('/'), now);
+        typed(&mut app, "db", now);
+        app.update(code(KeyCode::Enter), now);
+        let reloaded = vars(&[("DB_URL", "y"), ("PORT", "db"), ("REDIS_DB", "z")]);
+        data(&mut app, vars_event("svc-a", Ok(reloaded)), now);
+        assert_eq!(names(&app), ["DB_URL", "REDIS_DB"]);
+    }
+
+    #[test]
+    fn leaving_variables_rehides_values() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        if let Some(View::Variables(v)) = app.stack.last_mut() {
+            v.reveal_all = true;
+            v.revealed.insert("PORT".into());
+        }
+        app.update(code(KeyCode::Esc), now);
+        assert!(!app.stack.iter().any(|v| matches!(v, View::Variables(_))));
+        app.update(key('v'), now);
+        match app.stack.last() {
+            Some(View::Variables(v)) => assert!(!v.reveal_all && v.revealed.is_empty()),
+            other => panic!("expected variables, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_error_is_shown_at_start() {
+        let (app, _) = App::new(StartPrefs {
+            pending_error: Some("pending.toml was unreadable".into()),
+            ..StartPrefs::default()
+        });
+        assert_eq!(app.message.as_deref(), Some("pending.toml was unreadable"));
+    }
+
+    #[test]
+    fn save_failed_is_shown_and_debug_hides_values() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        data(
+            &mut app,
+            DataEvent::SaveFailed("could not save".into()),
+            now,
+        );
+        assert_eq!(app.message.as_deref(), Some("could not save"));
+        let event = vars_event("svc-a", Ok(vars(&[("K", "s3cret-value")])));
+        assert!(!format!("{event:?}").contains("s3cret-value"));
+    }
+
+    // ---- editing ----
+
+    fn pending_of(app: &App, name: &str) -> Option<PendingVar> {
+        app.pending
+            .service("e-prod", "svc-a")
+            .and_then(|s| s.vars.get(name))
+            .cloned()
+    }
+
+    fn select_var(app: &mut App, name: &str, now: Instant) {
+        for _ in 0..10 {
+            if app.selection.variable.as_deref() == Some(name) {
+                return;
+            }
+            app.update(key('j'), now);
+            if app.selection.variable.is_none() {
+                app.selection.variable = app.variable_rows().first().map(|r| r.name.into());
+            }
+        }
+        panic!("variable not found");
+    }
+
+    #[test]
+    fn edit_commits_set_and_saves() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        select_var(&mut app, "REDIS_DB", now);
+        assert!(app.update(key('e'), now).is_empty());
+        let input = app.var_input.as_ref().unwrap();
+        assert_eq!(input.name.as_deref(), Some("REDIS_DB"));
+        assert_eq!(input.text, "1");
+        app.update(key('0'), now);
+        let cmds = app.update(code(KeyCode::Enter), now);
+        assert!(app.var_input.is_none());
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(_)]));
+        let p = pending_of(&app, "REDIS_DB").unwrap();
+        assert_eq!(p.change, crate::pending::Change::Set { value: "10".into() });
+        assert_eq!(p.base.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn esc_cancels_inline_edit() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        select_var(&mut app, "REDIS_DB", now);
+        app.update(key('e'), now);
+        app.update(key('x'), now);
+        assert!(app.update(code(KeyCode::Esc), now).is_empty());
+        assert!(app.var_input.is_none());
+        assert!(app.pending.envs.is_empty());
+    }
+
+    #[test]
+    fn add_validates_name() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        app.update(key('a'), now);
+        assert_eq!(app.var_input.as_ref().unwrap().name, None);
+        typed(&mut app, "1BAD", now);
+        let cmds = app.update(code(KeyCode::Enter), now);
+        assert!(cmds.is_empty());
+        assert!(app.message.is_some());
+        assert_eq!(app.var_input.as_ref().unwrap().name, None);
+        for _ in 0..4 {
+            app.update(code(KeyCode::Backspace), now);
+        }
+        typed(&mut app, "GOOD_1", now);
+        app.update(code(KeyCode::Enter), now);
+        let input = app.var_input.as_ref().unwrap();
+        assert_eq!(input.name.as_deref(), Some("GOOD_1"));
+        assert_eq!(input.text, "");
+        typed(&mut app, "v", now);
+        let cmds = app.update(code(KeyCode::Enter), now);
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(_)]));
+        assert_eq!(pending_of(&app, "GOOD_1").unwrap().base, None);
+    }
+
+    #[test]
+    fn add_existing_name_edits_it() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        app.update(key('a'), now);
+        typed(&mut app, "REDIS_DB", now);
+        app.update(code(KeyCode::Enter), now);
+        let input = app.var_input.as_ref().unwrap();
+        assert_eq!(input.name.as_deref(), Some("REDIS_DB"));
+        assert_eq!(input.text, "1");
+    }
+
+    #[test]
+    fn d_toggles_delete_and_u_undoes() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        select_var(&mut app, "REDIS_DB", now);
+        let cmds = app.update(key('d'), now);
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(_)]));
+        assert_eq!(
+            pending_of(&app, "REDIS_DB").unwrap().change,
+            crate::pending::Change::Delete
+        );
+        let cmds = app.update(key('d'), now);
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(_)]));
+        assert!(pending_of(&app, "REDIS_DB").is_none());
+        app.update(key('d'), now);
+        let cmds = app.update(key('u'), now);
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(_)]));
+        assert!(app.pending.envs.is_empty());
+        // Nothing to undo: no save.
+        assert!(app.update(key('u'), now).is_empty());
+    }
+
+    #[test]
+    fn editing_a_deleted_variable_starts_from_railway_value() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        select_var(&mut app, "REDIS_DB", now);
+        app.update(key('d'), now);
+        app.update(key('e'), now);
+        assert_eq!(app.var_input.as_ref().unwrap().text, "1");
+    }
+
+    #[test]
+    fn multiline_value_refuses_inline_edit() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        data(
+            &mut app,
+            vars_event("svc-a", Ok(vars(&[("KEY", "a\nb")]))),
+            now,
+        );
+        app.selection.variable = Some("KEY".into());
+        assert!(app.update(key('e'), now).is_empty());
+        assert!(app.var_input.is_none());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("multi-line value: press E to edit in $EDITOR")
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn E_emits_edit_external_with_current_value() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        select_var(&mut app, "REDIS_DB", now);
+        let cmds = app.update(key('E'), now);
+        assert_eq!(
+            cmds,
+            vec![Command::EditExternal {
+                name: "REDIS_DB".into(),
+                initial: "1".into()
+            }]
+        );
+        assert!(!format!("{cmds:?}").contains('1'));
+    }
+
+    #[test]
+    fn edited_event_sets_pending() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        let cmds = data(
+            &mut app,
+            DataEvent::Edited {
+                name: "REDIS_DB".into(),
+                result: Ok("7".into()),
+            },
+            now,
+        );
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(_)]));
+        let p = pending_of(&app, "REDIS_DB").unwrap();
+        assert_eq!(p.change, crate::pending::Change::Set { value: "7".into() });
+        assert_eq!(p.base.as_deref(), Some("1"));
+        let cmds = data(
+            &mut app,
+            DataEvent::Edited {
+                name: "REDIS_DB".into(),
+                result: Err("editor exited with status 1".into()),
+            },
+            now,
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(app.message.as_deref(), Some("editor exited with status 1"));
+        let event = DataEvent::Edited {
+            name: "N".into(),
+            result: Ok("s3cret-value".into()),
+        };
+        assert!(!format!("{event:?}").contains("s3cret-value"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn r_and_R_toggle_reveal() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        select_var(&mut app, "PORT", now);
+        let revealed = |app: &App| match app.stack.last() {
+            Some(View::Variables(v)) => (v.revealed.clone(), v.reveal_all),
+            _ => panic!(),
+        };
+        app.update(key('r'), now);
+        assert_eq!(revealed(&app).0.iter().collect::<Vec<_>>(), ["PORT"]);
+        app.update(key('r'), now);
+        assert!(revealed(&app).0.is_empty());
+        app.update(key('R'), now);
+        assert!(revealed(&app).1);
+        app.update(key('R'), now);
+        assert!(!revealed(&app).1);
+    }
+
+    /// REDIS_DB set 1 → 10 and written to Railway (applied), the view reloaded with it.
+    fn app_with_applied_edit(now: Instant) -> App {
+        let mut app = app_in_variables(now);
+        select_var(&mut app, "REDIS_DB", now);
+        app.update(key('e'), now);
+        app.update(key('0'), now);
+        app.update(code(KeyCode::Enter), now);
+        app.pending
+            .envs
+            .get_mut("e-prod")
+            .unwrap()
+            .get_mut("svc-a")
+            .unwrap()
+            .vars
+            .get_mut("REDIS_DB")
+            .unwrap()
+            .applied = true;
+        let loaded = vars(&[
+            ("DB_URL", "postgres://x"),
+            ("PORT", "has db inside"),
+            ("REDIS_DB", "10"),
+        ]);
+        data(&mut app, vars_event("svc-a", Ok(loaded)), now);
+        app
+    }
+
+    #[test]
+    fn u_refused_on_an_applied_entry() {
+        let now = Instant::now();
+        let mut app = app_with_applied_edit(now);
+        let before = app.pending.clone();
+        assert!(app.update(key('u'), now).is_empty());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("already written to Railway — edit it to revert")
+        );
+        assert_eq!(app.pending, before);
+    }
+
+    #[test]
+    fn setting_an_applied_entry_back_sends_the_revert() {
+        let now = Instant::now();
+        let mut app = app_with_applied_edit(now);
+        app.update(key('e'), now);
+        assert_eq!(app.var_input.as_ref().unwrap().text, "10");
+        app.update(code(KeyCode::Backspace), now);
+        let cmds = app.update(code(KeyCode::Enter), now);
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(_)]));
+        let p = pending_of(&app, "REDIS_DB").expect("the revert stays pending");
+        assert_eq!(p.change, crate::pending::Change::Set { value: "1".into() });
+        assert_eq!(p.base.as_deref(), Some("10"));
+        assert!(!p.applied);
+    }
+
+    #[test]
+    fn d_on_an_applied_addition_deletes_it_and_d_on_an_applied_delete_is_refused() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        app.update(key('a'), now);
+        typed(&mut app, "NEW", now);
+        app.update(code(KeyCode::Enter), now);
+        typed(&mut app, "n", now);
+        app.update(code(KeyCode::Enter), now);
+        let sp = app
+            .pending
+            .envs
+            .get_mut("e-prod")
+            .unwrap()
+            .get_mut("svc-a")
+            .unwrap();
+        sp.vars.get_mut("NEW").unwrap().applied = true;
+        sp.written_not_deployed = true;
+        select_var(&mut app, "NEW", now);
+        let cmds = app.update(key('d'), now);
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(_)]));
+        let p = pending_of(&app, "NEW").expect("the delete stays pending");
+        assert_eq!(p.change, crate::pending::Change::Delete);
+        assert_eq!(p.base.as_deref(), Some("n"));
+        assert!(!p.applied);
+
+        // Now the delete is written too: `d` again would forget it.
+        app.pending
+            .envs
+            .get_mut("e-prod")
+            .unwrap()
+            .get_mut("svc-a")
+            .unwrap()
+            .vars
+            .get_mut("NEW")
+            .unwrap()
+            .applied = true;
+        let before = app.pending.clone();
+        assert!(app.update(key('d'), now).is_empty());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("already written to Railway — edit it to revert")
+        );
+        assert_eq!(app.pending, before);
+    }
+
+    #[test]
+    fn variable_edits_refused_while_the_service_deploys() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        select_var(&mut app, "REDIS_DB", now);
+        app.update(key('d'), now);
+        app.update(key('p'), now);
+        app.update(key('D'), now);
+        data(
+            &mut app,
+            deploy_vars_event("e-prod", "svc-a", vars(&[("REDIS_DB", "1")])),
+            now,
+        );
+        assert!(app
+            .update(key('y'), now)
+            .iter()
+            .any(|c| matches!(c, Command::DeployService { .. })));
+        app.update(code(KeyCode::Esc), now);
+        assert!(matches!(app.stack.last(), Some(View::Variables(_))));
+        let before = app.pending.clone();
+        for k in [
+            KeyCode::Char('u'),
+            KeyCode::Char('d'),
+            KeyCode::Char('e'),
+            KeyCode::Enter,
+            KeyCode::Char('E'),
+            KeyCode::Char('a'),
+        ] {
+            assert!(app.update(code(k), now).is_empty(), "{k:?}");
+            assert!(app.var_input.is_none(), "{k:?}");
+            assert!(
+                app.message.as_deref().unwrap().contains("is deploying"),
+                "{k:?}: {:?}",
+                app.message
+            );
+            assert_eq!(app.pending, before, "{k:?}");
+        }
+        let edited = DataEvent::Edited {
+            name: "REDIS_DB".into(),
+            result: Ok("7".into()),
+        };
+        assert!(data(&mut app, edited, now).is_empty());
+        assert_eq!(app.pending, before);
+        assert!(app.message.as_deref().unwrap().contains("is deploying"));
+        // Revealing is still fine.
+        app.update(key('r'), now);
+        assert!(!app.message.as_deref().unwrap_or("").contains("deploying"));
+    }
+
+    #[test]
+    fn ctrl_c_quits_while_editing() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        app.update(key('a'), now);
+        assert_eq!(app.update(ctrl('c'), now), vec![Command::Quit]);
+    }
+
+    // ---- review screen ----
+
+    fn add_pending(app: &mut App, env: (&str, &str), svc: (&str, &str), name: &str, v: &str) {
+        let sp = app
+            .pending
+            .envs
+            .entry(env.0.into())
+            .or_default()
+            .entry(svc.0.into())
+            .or_default();
+        sp.project_id = "p2".into();
+        sp.env_name = env.1.into();
+        sp.service_name = svc.1.into();
+        sp.vars.insert(
+            name.into(),
+            crate::pending::PendingVar {
+                change: crate::pending::Change::Set { value: v.into() },
+                base: None,
+                applied: false,
+            },
+        );
+    }
+
+    /// Three groups in two environments plus another project's, then the review open.
+    /// Production's services include s1 and s2.
+    fn app_in_review(now: Instant) -> App {
+        let mut app = app_in_services(now);
+        let mut loaded = services();
+        for id in ["s1", "s2"] {
+            loaded.push(service(id, deploy("d9", DeploymentStatus::Success), vec![]));
+        }
+        data(&mut app, services_event("e-prod", Ok(loaded)), now);
+        add_pending(&mut app, ("e-stg", "staging"), ("s1", "web"), "A", "1");
+        add_pending(
+            &mut app,
+            ("e-prod", "production"),
+            ("s2", "worker"),
+            "B",
+            "2",
+        );
+        add_pending(&mut app, ("e-prod", "production"), ("s1", "api"), "C", "3");
+        add_pending(&mut app, ("e-x", "other"), ("s1", "api"), "D", "4");
+        app.pending
+            .envs
+            .get_mut("e-x")
+            .unwrap()
+            .get_mut("s1")
+            .unwrap()
+            .project_id = "p9".into();
+        app.update(key('p'), now);
+        assert!(matches!(app.stack.last(), Some(View::Pending(_))));
+        app
+    }
+
+    #[test]
+    fn review_lists_all_envs_current_first() {
+        let now = Instant::now();
+        let app = app_in_review(now);
+        assert_eq!(app.environment.as_ref().unwrap().id, "e-prod");
+        let ids: Vec<(String, String)> = app
+            .pending_groups()
+            .into_iter()
+            .map(|g| (g.env_id, g.service_id))
+            .collect();
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            ids,
+            [
+                pair("e-prod", "s1"),
+                pair("e-prod", "s2"),
+                pair("e-stg", "s1")
+            ]
+        );
+    }
+
+    #[test]
+    fn same_named_environments_do_not_interleave() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        app.pending.envs.remove("e-stg");
+        add_pending(&mut app, ("e-b", "dup"), ("s1", "alpha"), "A", "1");
+        add_pending(&mut app, ("e-a", "dup"), ("s1", "beta"), "A", "1");
+        add_pending(&mut app, ("e-a", "dup"), ("s2", "zeta"), "A", "1");
+        let envs: Vec<String> = app
+            .pending_groups()
+            .into_iter()
+            .skip(2)
+            .map(|g| g.env_id)
+            .collect();
+        assert_eq!(envs, ["e-a", "e-a", "e-b"]);
+    }
+
+    #[test]
+    fn review_selection_moves_between_groups() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        assert_eq!(app.selected_index(), Some(0));
+        app.update(key('j'), now);
+        app.update(key('j'), now);
+        app.update(key('j'), now);
+        assert_eq!(app.selected_index(), Some(2));
+    }
+
+    #[test]
+    fn orphaned_group_is_labelled_and_cannot_deploy() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        add_pending(&mut app, ("e-gone", "preview"), ("s1", "web"), "Z", "9");
+        let groups = app.pending_groups();
+        assert_eq!(groups.iter().filter(|g| g.orphaned.is_some()).count(), 1);
+        // Current env first, then "preview" before "staging".
+        assert_eq!(groups[2].orphaned, Some(Orphan::Environment));
+        assert_eq!(groups[2].env_id, "e-gone");
+        for _ in 0..2 {
+            app.update(key('j'), now);
+        }
+        app.update(key('D'), now);
+        assert!(app.message.is_some());
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn group_of_a_service_gone_from_the_current_env_is_orphaned() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        add_pending(
+            &mut app,
+            ("e-prod", "production"),
+            ("s-gone", "old"),
+            "Z",
+            "9",
+        );
+        // Another environment's services are not loaded: not judged.
+        add_pending(&mut app, ("e-stg", "staging"), ("s-other", "x"), "Z", "9");
+        let groups = app.pending_groups();
+        let orphans: Vec<(&str, Option<Orphan>)> = groups
+            .iter()
+            .filter(|g| g.orphaned.is_some())
+            .map(|g| (g.service_id.as_str(), g.orphaned))
+            .collect();
+        assert_eq!(orphans, [("s-gone", Some(Orphan::Service))]);
+        // Groups sort by service name: "old" is after "api" and before "worker".
+        assert_eq!(groups[1].service_id, "s-gone");
+        app.update(key('j'), now);
+        assert!(app.update(key('D'), now).is_empty());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("cannot deploy: the service no longer exists")
+        );
+        // Not judged before the services list has loaded.
+        app.services = Loaded::default();
+        assert!(app.pending_groups().iter().all(|g| g.orphaned.is_none()));
+    }
+
+    #[test]
+    fn discard_requires_y() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        app.update(key('x'), now);
+        assert_eq!(
+            app.confirm,
+            Some(Confirm::Discard {
+                env_id: "e-prod".into(),
+                service_id: "s1".into()
+            })
+        );
+        assert!(app.update(key('n'), now).is_empty());
+        assert!(app.confirm.is_none());
+        assert_eq!(app.pending_groups().len(), 3);
+
+        app.update(key('x'), now);
+        let cmds = app.update(key('y'), now);
+        assert!(app.confirm.is_none());
+        assert_eq!(app.pending_groups().len(), 2);
+        assert!(
+            matches!(cmds.as_slice(), [Command::SavePending(p)] if p.service("e-prod", "s1").is_none())
+        );
+    }
+
+    #[test]
+    fn pending_command_and_p_from_variables_open_review() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        app.update(key('p'), now);
+        assert!(matches!(app.stack.last(), Some(View::Pending(_))));
+        app.update(code(KeyCode::Esc), now);
+        assert!(matches!(app.stack.last(), Some(View::Variables(_))));
+        let mut app = app_in_services(now);
+        app.update(key(':'), now);
+        typed(&mut app, "pending", now);
+        app.update(code(KeyCode::Enter), now);
+        assert!(matches!(app.stack.last(), Some(View::Pending(_))));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn review_r_and_R_toggle_reveal_all() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        let all = |app: &App| match app.stack.last() {
+            Some(View::Pending(v)) => v.reveal_all,
+            _ => panic!(),
+        };
+        app.update(key('r'), now);
+        assert!(all(&app));
+        app.update(key('R'), now);
+        assert!(!all(&app));
+    }
+
+    // ---- deploy ----
+
+    fn deploy_vars_event(env_id: &str, service_id: &str, current: Variables) -> DataEvent {
+        DataEvent::Variables {
+            env_id: env_id.into(),
+            service_id: service_id.into(),
+            purpose: VarsPurpose::Deploy,
+            result: Ok(current),
+        }
+    }
+
+    fn step(env_id: &str, service_id: &str, step: DeployStep) -> DataEvent {
+        DataEvent::Deploy {
+            env_id: env_id.into(),
+            service_id: service_id.into(),
+            step,
+        }
+    }
+
+    fn sp_mut<'a>(
+        app: &'a mut App,
+        env: &str,
+        svc: &str,
+    ) -> &'a mut crate::pending::ServicePending {
+        app.pending.envs.get_mut(env).unwrap().get_mut(svc).unwrap()
+    }
+
+    /// The review open on (e-prod, s1 "api"): `D`, the check's reply, then `y`.
+    fn deploy_first_group(app: &mut App, current: Variables, now: Instant) -> Vec<Command> {
+        let cmds = app.update(key('D'), now);
+        assert_eq!(
+            cmds,
+            vec![Command::LoadVariables {
+                project_id: "p2".into(),
+                env_id: "e-prod".into(),
+                service_id: "s1".into(),
+                purpose: VarsPurpose::Deploy,
+            }]
+        );
+        assert!(app.confirm.is_none(), "no confirm before Railway is read");
+        assert!(data(app, deploy_vars_event("e-prod", "s1", current), now).is_empty());
+        assert!(matches!(app.confirm, Some(Confirm::Deploy(_))));
+        app.update(key('y'), now)
+    }
+
+    fn deploy_cmd(cmds: &[Command]) -> (Variables, Vec<String>, bool) {
+        match cmds {
+            [Command::DeployService {
+                upserts,
+                deletes,
+                redeploy_only,
+                ..
+            }] => (upserts.clone(), deletes.clone(), *redeploy_only),
+            other => panic!("expected one DeployService, got {other:?}"),
+        }
+    }
+
+    fn delete_var(base: &str) -> PendingVar {
+        PendingVar {
+            change: crate::pending::Change::Delete,
+            base: Some(base.into()),
+            applied: false,
+        }
+    }
+
+    #[test]
+    fn deploy_targets_group_not_current_env() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        // Switch to staging and queue an edit there.
+        app.update(key('e'), now);
+        app.update(key('k'), now);
+        app.update(code(KeyCode::Enter), now);
+        assert_eq!(app.env_id(), Some("e-stg"));
+        data(&mut app, services_event("e-stg", Ok(services())), now);
+        app.update(key('v'), now);
+        app.update(key('a'), now);
+        typed(&mut app, "NEW", now);
+        app.update(code(KeyCode::Enter), now);
+        typed(&mut app, "v", now);
+        app.update(code(KeyCode::Enter), now);
+        assert!(app.pending.service("e-stg", "svc-a").is_some());
+        // Back to production, then deploy the staging group from the review.
+        app.update(code(KeyCode::Esc), now);
+        app.update(key('e'), now);
+        app.update(key('j'), now);
+        app.update(code(KeyCode::Enter), now);
+        assert_eq!(app.env_id(), Some("e-prod"));
+        app.update(key('p'), now);
+        let cmds = app.update(key('D'), now);
+        assert_eq!(
+            cmds,
+            vec![Command::LoadVariables {
+                project_id: "p2".into(),
+                env_id: "e-stg".into(),
+                service_id: "svc-a".into(),
+                purpose: VarsPurpose::Deploy,
+            }]
+        );
+        data(
+            &mut app,
+            deploy_vars_event("e-stg", "svc-a", vars(&[])),
+            now,
+        );
+        let cmds = app.update(key('y'), now);
+        assert_eq!(
+            cmds,
+            vec![Command::DeployService {
+                project_id: "p2".into(),
+                env_id: "e-stg".into(),
+                service_id: "svc-a".into(),
+                upserts: vars(&[("NEW", "v")]),
+                deletes: vec![],
+                redeploy_only: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn drift_listed_in_confirm() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        let set = |v: &str, base: &str, applied| PendingVar {
+            change: crate::pending::Change::Set { value: v.into() },
+            base: Some(base.into()),
+            applied,
+        };
+        let sp = sp_mut(&mut app, "e-prod", "s1");
+        sp.vars.insert("X".into(), set("new", "old", false));
+        sp.vars.insert("Y".into(), delete_var("keep"));
+        sp.vars.insert("Z".into(), set("new", "same", false));
+        sp.vars.insert("W".into(), set("new", "b", true));
+        app.update(key('D'), now);
+        // C was added and now exists; X changed; Y is gone; Z is as edited; W is already applied.
+        let current = vars(&[("C", "theirs"), ("X", "other"), ("Z", "same"), ("W", "new")]);
+        data(&mut app, deploy_vars_event("e-prod", "s1", current), now);
+        assert_eq!(
+            app.confirm,
+            Some(Confirm::Deploy(DeployConfirm {
+                env_id: "e-prod".into(),
+                service_id: "s1".into(),
+                drift: vec!["C".into(), "X".into(), "Y".into()],
+            }))
+        );
+    }
+
+    #[test]
+    fn only_y_deploys() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        for cancel in [key('n'), key('Y'), code(KeyCode::Enter), code(KeyCode::Esc)] {
+            app.update(key('D'), now);
+            data(&mut app, deploy_vars_event("e-prod", "s1", vars(&[])), now);
+            assert!(app.confirm.is_some());
+            assert!(app.update(cancel, now).is_empty());
+            assert!(app.confirm.is_none());
+        }
+        assert!(matches!(app.stack.last(), Some(View::Pending(_))));
+        let cmds = deploy_first_group(&mut app, vars(&[]), now);
+        assert_eq!(deploy_cmd(&cmds), (vars(&[("C", "3")]), vec![], false));
+    }
+
+    #[test]
+    fn d_refused_without_environments_or_while_deploying() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        let envs = app.environments.value.take();
+        assert!(app.update(key('D'), now).is_empty());
+        assert!(app.message.as_deref().unwrap().contains("not loaded"));
+        app.environments.value = envs;
+        deploy_first_group(&mut app, vars(&[]), now);
+        assert!(app.update(key('D'), now).is_empty());
+        assert!(app
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("already deploying"));
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn steps_mark_applied_then_redeployed_discards_and_reloads() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        add_pending(&mut app, ("e-prod", "production"), ("s1", "api"), "N", "n");
+        sp_mut(&mut app, "e-prod", "s1")
+            .vars
+            .insert("OLD".into(), delete_var("x"));
+        let cmds = deploy_first_group(&mut app, vars(&[("OLD", "x")]), now);
+        assert_eq!(
+            deploy_cmd(&cmds),
+            (vars(&[("C", "3"), ("N", "n")]), vec!["OLD".into()], false)
+        );
+        let cmds = data(&mut app, step("e-prod", "s1", DeployStep::Upserted), now);
+        let sp = app.pending.service("e-prod", "s1").unwrap();
+        assert!(sp.vars["C"].applied && sp.vars["N"].applied && !sp.vars["OLD"].applied);
+        assert!(!sp.written_not_deployed);
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(p)] if p == &app.pending));
+        let deleted = DeployStep::Deleted("OLD".into());
+        let cmds = data(&mut app, step("e-prod", "s1", deleted), now);
+        let sp = app.pending.service("e-prod", "s1").unwrap();
+        assert!(sp.vars.values().all(|v| v.applied) && sp.written_not_deployed);
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(p)] if p == &app.pending));
+        let cmds = data(&mut app, step("e-prod", "s1", DeployStep::Redeployed), now);
+        assert!(app.pending.service("e-prod", "s1").is_none());
+        assert_eq!(app.message.as_deref(), Some("deployed api to production"));
+        assert!(matches!(cmds.first(), Some(Command::SavePending(p)) if p == &app.pending));
+        assert!(cmds.contains(&load_services("e-prod")), "{cmds:?}");
+    }
+
+    #[test]
+    fn edit_during_deploy_is_not_marked_applied() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        deploy_first_group(&mut app, vars(&[]), now);
+        // C is edited again while its upsert is on the way.
+        sp_mut(&mut app, "e-prod", "s1")
+            .vars
+            .get_mut("C")
+            .unwrap()
+            .change = crate::pending::Change::Set { value: "4".into() };
+        data(&mut app, step("e-prod", "s1", DeployStep::Upserted), now);
+        assert!(!app.pending.service("e-prod", "s1").unwrap().vars["C"].applied);
+        data(&mut app, step("e-prod", "s1", DeployStep::Redeployed), now);
+        let sp = app.pending.service("e-prod", "s1").unwrap();
+        assert_eq!(sp.vars.len(), 1, "the unsent edit is kept");
+        assert!(!sp.written_not_deployed);
+    }
+
+    #[test]
+    fn redeploy_failure_retry_is_redeploy_only() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        deploy_first_group(&mut app, vars(&[]), now);
+        data(&mut app, step("e-prod", "s1", DeployStep::Upserted), now);
+        let failed = DeployStep::Failed {
+            during: Phase::Redeploy,
+            error: "Railway API returned HTTP 400".into(),
+            unknown: false,
+        };
+        assert!(data(&mut app, step("e-prod", "s1", failed), now).is_empty());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("deploy failed during redeploy: Railway API returned HTTP 400")
+        );
+        let sp = app.pending.service("e-prod", "s1").unwrap();
+        assert!(sp.vars["C"].applied && sp.written_not_deployed);
+        // C now matches Railway, but it is applied: no drift.
+        let cmds = deploy_first_group(&mut app, vars(&[("C", "3")]), now);
+        assert_eq!(deploy_cmd(&cmds), (vars(&[]), vec![], true));
+    }
+
+    #[test]
+    fn failed_write_keeps_entries_and_retry_sends_only_unapplied() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        sp_mut(&mut app, "e-prod", "s1")
+            .vars
+            .insert("OLD".into(), delete_var("x"));
+        deploy_first_group(&mut app, vars(&[("OLD", "x")]), now);
+        data(&mut app, step("e-prod", "s1", DeployStep::Upserted), now);
+        let failed = DeployStep::Failed {
+            during: Phase::Delete("OLD".into()),
+            error: "Railway API returned HTTP 400".into(),
+            unknown: false,
+        };
+        data(&mut app, step("e-prod", "s1", failed), now);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("deploy failed during delete OLD: Railway API returned HTTP 400")
+        );
+        let sp = app.pending.service("e-prod", "s1").unwrap();
+        assert!(sp.vars["C"].applied && !sp.vars["OLD"].applied && !sp.written_not_deployed);
+        let cmds = deploy_first_group(&mut app, vars(&[("OLD", "x"), ("C", "3")]), now);
+        assert_eq!(deploy_cmd(&cmds), (vars(&[]), vec!["OLD".into()], false));
+    }
+
+    #[test]
+    fn unknown_write_reconciles_and_unknown_redeploy_is_reported() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        add_pending(&mut app, ("e-prod", "production"), ("s1", "api"), "N", "n");
+        deploy_first_group(&mut app, vars(&[]), now);
+        let unknown = DeployStep::Failed {
+            during: Phase::Upsert,
+            error: "timed out".into(),
+            unknown: true,
+        };
+        let cmds = data(&mut app, step("e-prod", "s1", unknown), now);
+        assert_eq!(
+            cmds,
+            vec![Command::LoadVariables {
+                project_id: "p2".into(),
+                env_id: "e-prod".into(),
+                service_id: "s1".into(),
+                purpose: VarsPurpose::Reconcile,
+            }]
+        );
+        // Still in flight until Railway has been read.
+        assert!(app.update(key('D'), now).is_empty());
+        let reply = DataEvent::Variables {
+            env_id: "e-prod".into(),
+            service_id: "s1".into(),
+            purpose: VarsPurpose::Reconcile,
+            result: Ok(vars(&[("C", "3"), ("N", "other")])),
+        };
+        let cmds = data(&mut app, reply, now);
+        let sp = app.pending.service("e-prod", "s1").unwrap();
+        assert!(sp.vars["C"].applied && !sp.vars["N"].applied);
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(_)]));
+        // Retry: only N; then the redeploy's outcome is unknown.
+        let cmds = deploy_first_group(&mut app, vars(&[("C", "3")]), now);
+        assert_eq!(deploy_cmd(&cmds), (vars(&[("N", "n")]), vec![], false));
+        data(&mut app, step("e-prod", "s1", DeployStep::Upserted), now);
+        let unknown = DeployStep::Failed {
+            during: Phase::Redeploy,
+            error: "timed out".into(),
+            unknown: true,
+        };
+        assert!(data(&mut app, step("e-prod", "s1", unknown), now).is_empty());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("redeploy outcome unknown — check the deployments view")
+        );
+        let sp = app.pending.service("e-prod", "s1").unwrap();
+        assert!(sp.written_not_deployed);
+    }
+
+    #[test]
+    fn deploy_debug_hides_values() {
+        let cmd = Command::DeployService {
+            project_id: "p".into(),
+            env_id: "e".into(),
+            service_id: "s".into(),
+            upserts: vars(&[("KEY", "s3cret-value")]),
+            deletes: vec!["OLD".into()],
+            redeploy_only: false,
+        };
+        let out = format!("{cmd:?}");
+        assert!(out.contains("KEY") && out.contains("OLD"), "{out}");
+        assert!(!out.contains("s3cret-value"), "{out}");
+        let ev = deploy_vars_event("e", "s", vars(&[("KEY", "s3cret-value")]));
+        assert!(!format!("{ev:?}").contains("s3cret-value"));
+    }
+
+    fn no_deploy(cmds: &[Command]) -> bool {
+        !cmds
+            .iter()
+            .any(|c| matches!(c, Command::DeployService { .. }))
+    }
+
+    #[test]
+    fn deploy_check_never_pops_over_typing() {
+        let now = Instant::now();
+        // Typing a variable value in another view.
+        let mut app = app_in_review(now);
+        app.update(key('D'), now);
+        app.update(code(KeyCode::Esc), now);
+        app.update(key('v'), now);
+        app.update(key('a'), now);
+        typed(&mut app, "KE", now);
+        data(&mut app, deploy_vars_event("e-prod", "s1", vars(&[])), now);
+        assert!(app.confirm.is_none());
+        assert!(app.message.as_deref().unwrap().contains("press D again"));
+        assert!(no_deploy(&app.update(key('y'), now)));
+        assert_eq!(app.var_input.as_ref().unwrap().text, "KEy");
+
+        // A filter being typed on the review itself, and the command line.
+        for start in [key('/'), key(':')] {
+            let mut app = app_in_review(now);
+            app.update(key('D'), now);
+            app.update(start, now);
+            data(&mut app, deploy_vars_event("e-prod", "s1", vars(&[])), now);
+            assert!(app.confirm.is_none());
+            assert!(no_deploy(&app.update(key('y'), now)));
+        }
+
+        // Help open on the review.
+        let mut app = app_in_review(now);
+        app.update(key('D'), now);
+        app.update(key('?'), now);
+        data(&mut app, deploy_vars_event("e-prod", "s1", vars(&[])), now);
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn discard_refused_while_deploying() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        deploy_first_group(&mut app, vars(&[]), now);
+        assert!(app.update(key('x'), now).is_empty());
+        assert!(app.confirm.is_none());
+        assert!(app.message.as_deref().unwrap().contains("deploying"));
+        assert!(app.pending.service("e-prod", "s1").is_some());
+    }
+
+    const DEPLOY_IN_PROGRESS: &str =
+        "a deploy is in progress — wait for it to finish, or press ctrl-c twice to force quit";
+
+    #[test]
+    fn quit_refused_while_deploying_and_ctrl_c_twice_forces_it() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        deploy_first_group(&mut app, vars(&[]), now);
+        assert!(app.update(key('q'), now).is_empty());
+        assert_eq!(app.message.as_deref(), Some(DEPLOY_IN_PROGRESS));
+        typed(&mut app, ":q", now);
+        assert!(app.update(code(KeyCode::Enter), now).is_empty());
+        assert_eq!(app.message.as_deref(), Some(DEPLOY_IN_PROGRESS));
+        assert!(app.update(ctrl('c'), now).is_empty());
+        assert_eq!(app.message.as_deref(), Some(DEPLOY_IN_PROGRESS));
+        assert_eq!(app.update(ctrl('c'), now), vec![Command::Quit]);
+    }
+
+    #[test]
+    fn ctrl_c_arming_ends_with_the_deploy() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        deploy_first_group(&mut app, vars(&[]), now);
+        assert!(app.update(ctrl('c'), now).is_empty());
+        let failed = DeployStep::Failed {
+            during: Phase::Upsert,
+            error: "Railway API returned HTTP 400".into(),
+            unknown: false,
+        };
+        data(&mut app, step("e-prod", "s1", failed), now);
+        // A new deploy is a new in-flight period: one ctrl-c only warns.
+        deploy_first_group(&mut app, vars(&[]), now);
+        assert!(app.update(ctrl('c'), now).is_empty());
+        assert_eq!(app.message.as_deref(), Some(DEPLOY_IN_PROGRESS));
+        data(&mut app, step("e-prod", "s1", DeployStep::Upserted), now);
+        data(&mut app, step("e-prod", "s1", DeployStep::Redeployed), now);
+        assert_eq!(app.update(key('q'), now), vec![Command::Quit]);
+    }
+
+    #[test]
+    fn progress_is_shown_step_by_step() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        sp_mut(&mut app, "e-prod", "s1")
+            .vars
+            .insert("OLD".into(), delete_var("x"));
+        deploy_first_group(&mut app, vars(&[("OLD", "x")]), now);
+        assert_eq!(app.message.as_deref(), Some("deploying api to production…"));
+        data(&mut app, step("e-prod", "s1", DeployStep::Upserted), now);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("deploying api to production: variables written…")
+        );
+        let deleted = DeployStep::Deleted("OLD".into());
+        data(&mut app, step("e-prod", "s1", deleted), now);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("deploying api to production: OLD deleted…")
+        );
     }
 }

@@ -13,17 +13,17 @@ use crate::model::{DeploymentStatus, DeploymentSummary, InstanceStatus};
 use crate::status::{box_colour, derive_row, Health, RowTag};
 use crate::theme::Theme;
 
-fn heading(t: &Theme) -> Style {
+pub(super) fn heading(t: &Theme) -> Style {
     Style::new().fg(t.accent).add_modifier(Modifier::BOLD)
 }
 
-fn fg(c: Color) -> Style {
+pub(super) fn fg(c: Color) -> Style {
     Style::new().fg(c)
 }
 
 /// Selection is painted into the row style rather than as a table highlight, because a
 /// highlight overrides the explicit background of the `▚▚` marker.
-fn row_style(t: &Theme, fg: Style, selected: bool) -> Style {
+pub(super) fn row_style(t: &Theme, fg: Style, selected: bool) -> Style {
     if selected {
         fg.bg(t.select_bg).add_modifier(Modifier::BOLD)
     } else {
@@ -82,11 +82,11 @@ fn message(d: &DeploymentSummary) -> String {
     )
 }
 
-fn header(t: &Theme, cols: &[&'static str]) -> Row<'static> {
+pub(super) fn header(t: &Theme, cols: &[&'static str]) -> Row<'static> {
     Row::new(cols.iter().map(|c| Cell::from(*c))).style(heading(t))
 }
 
-fn render_table(
+pub(super) fn render_table(
     frame: &mut Frame,
     area: Rect,
     header: Row<'static>,
