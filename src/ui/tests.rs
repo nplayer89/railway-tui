@@ -11,7 +11,10 @@ use crate::theme::{Theme, THEMES};
 
 /// The default theme, which the fixtures render with.
 const T: &Theme = &THEMES[0];
-use crate::app::{App, Confirm, LatestConfirm, LogsView, StartPrefs, View};
+use crate::app::{
+    App, BranchChoices, BranchPicker, BranchSwitch, Confirm, LatestConfirm, LogsView, StartPrefs,
+    View,
+};
 use crate::logs::buffer::{LogBuffer, LOG_CAP};
 use crate::logs::follow::StreamState;
 use crate::model::{
@@ -1264,6 +1267,7 @@ fn latest_commit_confirm_shows_target_source_and_what_runs_now() {
         branch: Some("main".into()),
         current: Some(deploy("d1", DeploymentStatus::Success, &[])),
         written: 2,
+        switch: None,
     })));
     let screen = text(&render(&app, Instant::now()));
     for want in [
@@ -1278,4 +1282,76 @@ fn latest_commit_confirm_shows_target_source_and_what_runs_now() {
     ] {
         assert!(screen.contains(want), "missing {want:?} in\n{screen}");
     }
+}
+
+fn latest_confirm(switch: Option<BranchSwitch>) -> LatestConfirm {
+    LatestConfirm {
+        project_id: "p".into(),
+        env_id: "e-prod".into(),
+        env_name: "production".into(),
+        service_id: "api-id".into(),
+        service_name: "api".into(),
+        repo: Some("acme/api".into()),
+        branch: Some("feat/x".into()),
+        current: Some(deploy("d1", DeploymentStatus::Success, &[])),
+        written: 0,
+        switch,
+    }
+}
+
+#[test]
+fn branch_confirm_shows_the_switch_and_that_it_stays() {
+    let mut app = services_app(vec![]);
+    app.confirm = Some(Confirm::DeployLatest(Box::new(latest_confirm(Some(
+        BranchSwitch {
+            trigger_id: "t1".into(),
+            from: "main".into(),
+            to: "feat/x".into(),
+        },
+    )))));
+    let screen = text(&render(&app, Instant::now()));
+    for want in [
+        "Deploy branch feat/x to production",
+        "branch:  main → feat/x",
+        "the service stays on feat/x afterwards",
+        "deploy:  latest commit on feat/x",
+    ] {
+        assert!(screen.contains(want), "missing {want:?} in\n{screen}");
+    }
+}
+
+#[test]
+fn branch_picker_shows_loading_then_the_filtered_list() {
+    let mut app = services_app(vec![]);
+    let mut picker = BranchPicker {
+        target: latest_confirm(None),
+        choices: None,
+        query: "fe".into(),
+        index: 1,
+    };
+    app.branch_picker = Some(picker.clone());
+    let screen = text(&render(&app, Instant::now()));
+    assert!(screen.contains("Deploy branch: api"), "{screen}");
+    assert!(screen.contains("> fe▏"), "{screen}");
+    assert!(screen.contains("loading branches…"), "{screen}");
+
+    picker.choices = Some(Ok(BranchChoices {
+        trigger_id: "t1".into(),
+        connected: "feat/a".into(),
+        names: vec!["feat/a".into(), "feat/b".into(), "main".into()],
+    }));
+    app.branch_picker = Some(picker);
+    let buf = render(&app, Instant::now());
+    let screen = text(&buf);
+    assert!(screen.contains("feat/a  (connected)"), "{screen}");
+    assert!(!screen.contains(" main"), "filtered out: {screen}");
+    let row = (0..buf.area.height)
+        .find(|&y| row_text(&buf, y).contains("feat/b"))
+        .unwrap();
+    let x = row_text(&buf, row).find("feat/b").unwrap() as u16;
+    assert_eq!(
+        buf[(x, row)].bg,
+        app.theme().select_bg,
+        "feat/b is highlighted"
+    );
 }

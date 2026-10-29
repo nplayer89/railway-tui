@@ -1,7 +1,8 @@
 # Security policy
 
 railway-tui runs with your Railway login and can change environment variables, redeploy
-services and deploy a service's latest commit on your account, so security reports are welcome.
+services, deploy a service's latest commit and switch the branch a service deploys from on your
+account, so security reports are welcome.
 
 ## Reporting a vulnerability
 

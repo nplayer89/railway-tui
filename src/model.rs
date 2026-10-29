@@ -128,6 +128,15 @@ pub struct ServiceInstance {
     pub active: Vec<DeploymentSummary>,
 }
 
+/// The GitHub trigger that decides which branch a service deploys from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trigger {
+    pub id: String,
+    pub branch: String,
+    /// `owner/name`.
+    pub repository: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectRef {
     pub id: String,

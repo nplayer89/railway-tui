@@ -1,0 +1,6 @@
+mutation DeploymentTriggerUpdate($id: String!, $branch: String!) {
+  deploymentTriggerUpdate(id: $id, input: { branch: $branch }) {
+    id
+    branch
+  }
+}

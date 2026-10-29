@@ -1,4 +1,4 @@
-//! The only code that changes anything on Railway: four allowlisted
+//! The only code that changes anything on Railway: five allowlisted
 //! mutations (`tests/no_mutations.rs` enforces the list).
 //!
 //! Every write goes through [`Api::send_write`], which shares the read path's
@@ -46,6 +46,13 @@ mod ops {
         query_path = "graphql/write/ServiceInstanceDeploy.graphql"
     )]
     pub struct ServiceInstanceDeploy;
+
+    #[derive(GraphQLQuery)]
+    #[graphql(
+        schema_path = "graphql/schema.json",
+        query_path = "graphql/write/DeploymentTriggerUpdate.graphql"
+    )]
+    pub struct DeploymentTriggerUpdate;
 }
 
 /// Why a write did not succeed, split by whether Railway may have applied it.
@@ -142,6 +149,18 @@ impl Api {
             })
             .await?;
         applied(data.service_instance_deploy)
+    }
+
+    /// Points a deploy trigger at another branch: the service deploys from it
+    /// from now on. Applied only when Railway answers with that branch.
+    pub async fn switch_branch(&self, trigger_id: &str, branch: &str) -> Result<(), WriteError> {
+        let data = self
+            .send_write::<ops::DeploymentTriggerUpdate>(ops::deployment_trigger_update::Variables {
+                id: trigger_id.to_string(),
+                branch: branch.to_string(),
+            })
+            .await?;
+        applied(data.deployment_trigger_update.branch == branch)
     }
 
     /// Sends one mutation exactly once. Refuses without sending while the rate

@@ -1,0 +1,5 @@
+query GitHubRepoBranches($owner: String!, $repo: String!) {
+  githubRepoBranches(owner: $owner, repo: $repo) {
+    name
+  }
+}

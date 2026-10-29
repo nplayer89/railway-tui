@@ -39,6 +39,8 @@ impl App {
             self.command_key(key, now, out);
         } else if self.filter_input.is_some() {
             self.filter_key(key);
+        } else if self.branch_picker.is_some() {
+            self.branch_picker_key(key);
         } else if self.env_picker.is_some() {
             self.picker_key(key.code, now, out);
         } else if self.theme_picker.is_some() {
@@ -260,9 +262,31 @@ impl App {
                 Some(id) => self.request_deploy_latest(id),
                 None => self.message = Some("no service selected".into()),
             },
+            KeyCode::Char('d') => match selected {
+                Some(id) => self.open_branch_picker(id, out),
+                None => self.message = Some("no service selected".into()),
+            },
             _ => return false,
         }
         true
+    }
+
+    /// Typing filters the branches; arrows move, Enter picks, Esc closes.
+    fn branch_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.branch_picker.as_mut() else {
+            return;
+        };
+        let last = picker.filtered().len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc => self.branch_picker = None,
+            KeyCode::Enter => self.pick_branch(),
+            KeyCode::Down => picker.index = (picker.index + 1).min(last),
+            KeyCode::Up => picker.index = picker.index.saturating_sub(1),
+            _ => {
+                edit_text(&mut picker.query, key);
+                picker.index = 0;
+            }
+        }
     }
 
     fn open_env_picker(&mut self, now: Instant, out: &mut Vec<Command>) {
@@ -283,9 +307,13 @@ impl App {
     }
 
     fn deployments_key(&mut self, code: KeyCode, out: &mut Vec<Command>) -> bool {
-        if code == KeyCode::Char('D') {
-            if let Some(id) = self.view_service_id(Kind::Deployments) {
-                self.request_deploy_latest(id.to_string());
+        if let KeyCode::Char(c @ ('D' | 'd')) = code {
+            if let Some(id) = self.view_service_id(Kind::Deployments).map(String::from) {
+                if c == 'D' {
+                    self.request_deploy_latest(id);
+                } else {
+                    self.open_branch_picker(id, out);
+                }
             }
             return true;
         }

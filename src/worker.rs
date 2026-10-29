@@ -18,7 +18,7 @@ use url::Url;
 use crate::api::subscribe::{connect_authed, deployment_status_stream};
 use crate::api::write::WriteError;
 use crate::api::{Api, ApiError};
-use crate::app::{AppEvent, Command, DataEvent, DeployStep, LatestOutcome, Phase};
+use crate::app::{AppEvent, BranchSwitch, Command, DataEvent, DeployStep, LatestOutcome, Phase};
 use crate::auth::TokenSource;
 use crate::budget::{backstop_interval, RateBudget};
 use crate::logs::follow::{follow_logs, FollowEvent, LogSource, RailwayLogSource, StreamState};
@@ -189,6 +189,22 @@ impl Worker {
                     result,
                 })
             }
+            Command::LoadBranches {
+                project_id,
+                env_id,
+                service_id,
+                repo,
+            } => {
+                let (e, s) = (env_id.clone(), service_id.clone());
+                let request = async move {
+                    tokio::try_join!(api.triggers(&project_id, &e, &s), api.branches(&repo))
+                };
+                self.load(request, |result| DataEvent::Branches {
+                    env_id,
+                    service_id,
+                    result,
+                })
+            }
             Command::LoadVariables {
                 project_id,
                 env_id,
@@ -229,15 +245,15 @@ impl Worker {
                     }
                 });
             }
-            Command::DeployLatest { env_id, service_id } => {
+            Command::DeployLatest {
+                env_id,
+                service_id,
+                switch,
+            } => {
                 let (budget, interval) = (api.budget(), self.configured_interval);
                 let events = self.events.clone();
                 tokio::spawn(async move {
-                    let outcome = match api.deploy_latest_commit(&env_id, &service_id).await {
-                        Ok(()) => LatestOutcome::Started,
-                        Err(WriteError::Refused(e)) => LatestOutcome::Refused(e.to_string()),
-                        Err(WriteError::Unknown(e)) => LatestOutcome::Unknown(e.to_string()),
-                    };
+                    let outcome = deploy_latest(&api, &env_id, &service_id, switch).await;
                     let data = DataEvent::DeployedLatest {
                         env_id,
                         service_id,
@@ -442,6 +458,38 @@ async fn run_deploy(
         Err(e) => failed(Phase::Redeploy, e),
     };
     send(step).await.is_ok()
+}
+
+/// Switches the service's branch when asked, then deploys the latest commit;
+/// a switch that did not go through stops before the deploy. Nothing is resent.
+async fn deploy_latest(
+    api: &Api,
+    env_id: &str,
+    service_id: &str,
+    switch: Option<BranchSwitch>,
+) -> LatestOutcome {
+    if let Some(sw) = switch {
+        match api.switch_branch(&sw.trigger_id, &sw.to).await {
+            Ok(()) => {}
+            Err(WriteError::Refused(e)) => {
+                return LatestOutcome::SwitchFailed {
+                    error: e.to_string(),
+                    unknown: false,
+                }
+            }
+            Err(WriteError::Unknown(e)) => {
+                return LatestOutcome::SwitchFailed {
+                    error: e.to_string(),
+                    unknown: true,
+                }
+            }
+        }
+    }
+    match api.deploy_latest_commit(env_id, service_id).await {
+        Ok(()) => LatestOutcome::Started,
+        Err(WriteError::Refused(e)) => LatestOutcome::Refused(e.to_string()),
+        Err(WriteError::Unknown(e)) => LatestOutcome::Unknown(e.to_string()),
+    }
 }
 
 /// Replaces every non-empty sent value in `error` with the hidden marker, the
@@ -1043,6 +1091,7 @@ mod tests {
         h.send(Command::DeployLatest {
             env_id: "e1".into(),
             service_id: "s1".into(),
+            switch: None,
         })
         .await;
         let event = loop {
@@ -1080,6 +1129,7 @@ mod tests {
         h.send(Command::DeployLatest {
             env_id: "e1".into(),
             service_id: "s1".into(),
+            switch: None,
         })
         .await;
         let event = loop {
@@ -1099,6 +1149,139 @@ mod tests {
             "{event:?}"
         );
         assert_eq!(h.server.received_requests().await.unwrap().len(), 1);
+    }
+
+    fn switch() -> Option<crate::app::BranchSwitch> {
+        Some(crate::app::BranchSwitch {
+            trigger_id: "t1".into(),
+            from: "main".into(),
+            to: "feat/x".into(),
+        })
+    }
+
+    async fn deployed_latest(h: &mut Harness) -> LatestOutcome {
+        loop {
+            match h.next().await {
+                DataEvent::DeployedLatest { outcome, .. } => return outcome,
+                DataEvent::Budget { .. } => continue,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_picked_branch_is_switched_to_then_deployed() {
+        let mut h = Harness::start(None).await;
+        let switched =
+            json!({"data": {"deploymentTriggerUpdate": {"id": "t1", "branch": "feat/x"}}});
+        mount(&h.server, "deploymentTriggerUpdate", 200, switched).await;
+        mount(
+            &h.server,
+            "serviceInstanceDeploy",
+            200,
+            ok("serviceInstanceDeploy"),
+        )
+        .await;
+        h.send(Command::DeployLatest {
+            env_id: "e1".into(),
+            service_id: "s1".into(),
+            switch: switch(),
+        })
+        .await;
+        assert_eq!(deployed_latest(&mut h).await, LatestOutcome::Started);
+        let requests = h.server.received_requests().await.unwrap();
+        let bodies: Vec<serde_json::Value> = requests
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        let ops: Vec<&str> = bodies
+            .iter()
+            .map(|b| b["operationName"].as_str().unwrap())
+            .collect();
+        assert_eq!(ops, ["DeploymentTriggerUpdate", "ServiceInstanceDeploy"]);
+        assert_eq!(
+            bodies[0]["variables"],
+            json!({"id": "t1", "branch": "feat/x"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_switch_never_deploys() {
+        let mut h = Harness::start(None).await;
+        mount(&h.server, "deploymentTriggerUpdate", 400, json!({})).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("serviceInstanceDeploy"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok("serviceInstanceDeploy")))
+            .expect(0)
+            .mount(&h.server)
+            .await;
+        h.send(Command::DeployLatest {
+            env_id: "e1".into(),
+            service_id: "s1".into(),
+            switch: switch(),
+        })
+        .await;
+        assert!(matches!(
+            deployed_latest(&mut h).await,
+            LatestOutcome::SwitchFailed { unknown: false, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_switch_answered_with_another_branch_is_unknown() {
+        let mut h = Harness::start(None).await;
+        let other = json!({"data": {"deploymentTriggerUpdate": {"id": "t1", "branch": "main"}}});
+        mount(&h.server, "deploymentTriggerUpdate", 200, other).await;
+        h.send(Command::DeployLatest {
+            env_id: "e1".into(),
+            service_id: "s1".into(),
+            switch: switch(),
+        })
+        .await;
+        assert!(matches!(
+            deployed_latest(&mut h).await,
+            LatestOutcome::SwitchFailed { unknown: true, .. }
+        ));
+        assert_eq!(h.server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn load_branches_returns_triggers_and_branch_names() {
+        let mut h = Harness::start(None).await;
+        let triggers = json!({"data": {"deploymentTriggers": {"edges": [
+            {"node": {"id": "t1", "branch": "main", "repository": "acme/api"}}
+        ]}}});
+        mount(&h.server, "deploymentTriggers", 200, triggers).await;
+        let branches =
+            json!({"data": {"githubRepoBranches": [{"name": "main"}, {"name": "feat/x"}]}});
+        mount(&h.server, "githubRepoBranches", 200, branches).await;
+        h.send(Command::LoadBranches {
+            project_id: "p1".into(),
+            env_id: "e1".into(),
+            service_id: "s1".into(),
+            repo: "acme/api".into(),
+        })
+        .await;
+        let result = loop {
+            match h.next().await {
+                DataEvent::Branches { result, .. } => break result,
+                DataEvent::Budget { .. } => continue,
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        let (triggers, names) = result.unwrap();
+        assert_eq!(triggers[0].id, "t1");
+        assert_eq!(names, ["main", "feat/x"]);
+        let requests = h.server.received_requests().await.unwrap();
+        let branch_req = requests
+            .iter()
+            .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).unwrap())
+            .find(|b| b["operationName"] == "GitHubRepoBranches")
+            .unwrap();
+        assert_eq!(
+            branch_req["variables"],
+            json!({"owner": "acme", "repo": "api"})
+        );
     }
 
     async fn mount(server: &MockServer, op: &str, status: u16, body: serde_json::Value) {

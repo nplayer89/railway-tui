@@ -1,5 +1,5 @@
 //! Guards the mutation allowlist: GraphQL mutations live only in
-//! `graphql/write/`, they use exactly four mutation fields, only
+//! `graphql/write/`, they use exactly five mutation fields, only
 //! `src/api/write.rs` may derive from them, and no `query_path` points
 //! outside the `graphql/` directory.
 
@@ -8,11 +8,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The only mutation fields the app may ever send.
-const ALLOWED_MUTATIONS: [&str; 4] = [
+const ALLOWED_MUTATIONS: [&str; 5] = [
     "variableCollectionUpsert",
     "variableDelete",
     "serviceInstanceRedeploy",
     "serviceInstanceDeploy",
+    "deploymentTriggerUpdate",
 ];
 
 fn files_with_ext(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
