@@ -309,10 +309,11 @@ impl Api {
                     .filter(|n| n.is_sealed && n.service_id.as_deref() == Some(service_id))
                     .map(|n| n.name),
             );
-            if !page.page_info.has_next_page {
-                return Ok(sealed);
+            // Without a cursor the next request would fetch page 1 again.
+            match page.page_info.end_cursor {
+                Some(cursor) if page.page_info.has_next_page => after = Some(cursor),
+                _ => return Ok(sealed),
             }
-            after = page.page_info.end_cursor;
         }
     }
 

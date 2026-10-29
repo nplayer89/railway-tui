@@ -1933,6 +1933,81 @@ mod tests {
         assert_eq!(sealed, Some(Ok(["S".to_string()].into())));
     }
 
+    fn sealed_page(names: &[&str], has_next: bool, cursor: Option<&str>) -> serde_json::Value {
+        let edges: Vec<_> = names
+            .iter()
+            .map(|n| json!({"node": {"name": n, "serviceId": "svc", "isSealed": true}}))
+            .collect();
+        json!({"data": {"environment": {"variables": {
+            "edges": edges,
+            "pageInfo": {"hasNextPage": has_next, "endCursor": cursor}
+        }}}})
+    }
+
+    async fn sealed_requests(h: &Harness) -> usize {
+        sent(h)
+            .await
+            .iter()
+            .filter(|(op, _)| op == "SealedVariables")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn sealed_names_are_collected_across_pages() {
+        let mut h = Harness::start(None).await;
+        let vars = json!({"data": {"variables": {"A": "1"}}});
+        mount(&h.server, "query Variables", 200, vars).await;
+        // Only the request for page 2 carries the cursor; its mock outranks page 1's.
+        mount(
+            &h.server,
+            "query SealedVariables",
+            200,
+            sealed_page(&["P1"], true, Some("c1")),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("query SealedVariables"))
+            .and(body_string_contains(r#""after":"c1""#))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sealed_page(
+                &["P2"],
+                false,
+                None,
+            )))
+            .with_priority(1)
+            .mount(&h.server)
+            .await;
+        h.send(load_variables(crate::app::VarsPurpose::View)).await;
+        let DataEvent::Variables { sealed, .. } = variables_event(&mut h).await else {
+            panic!("expected Variables");
+        };
+        assert_eq!(
+            sealed,
+            Some(Ok(["P1".to_string(), "P2".to_string()].into()))
+        );
+        assert_eq!(sealed_requests(&h).await, 2);
+    }
+
+    #[tokio::test]
+    async fn sealed_paging_stops_without_a_cursor() {
+        let mut h = Harness::start(None).await;
+        let vars = json!({"data": {"variables": {"A": "1"}}});
+        mount(&h.server, "query Variables", 200, vars).await;
+        // More pages claimed, but no cursor to ask for them with.
+        mount(
+            &h.server,
+            "query SealedVariables",
+            200,
+            sealed_page(&["P1"], true, None),
+        )
+        .await;
+        h.send(load_variables(crate::app::VarsPurpose::View)).await;
+        let DataEvent::Variables { sealed, .. } = variables_event(&mut h).await else {
+            panic!("expected Variables");
+        };
+        assert_eq!(sealed, Some(Ok(["P1".to_string()].into())));
+        assert_eq!(sealed_requests(&h).await, 1);
+    }
+
     #[tokio::test]
     async fn deploy_load_skips_the_sealed_query() {
         let mut h = Harness::start(None).await;
