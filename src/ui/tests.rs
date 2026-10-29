@@ -1000,6 +1000,14 @@ fn review_values_hidden_until_revealed() {
 }
 
 #[test]
+fn variables_hint_fits_80_columns_and_keeps_help() {
+    let app = vars_app("staging", &[]);
+    let hint = super::hints(&app);
+    assert!(hint.chars().count() <= 80, "{hint}");
+    assert!(hint.ends_with("<?> help"), "{hint}");
+}
+
+#[test]
 fn review_shows_an_unread_sealed_base_as_opaque() {
     let mut app = review_app();
     add_pending(&mut app, "SEALED", crate::pending::Change::Delete, Some(""));

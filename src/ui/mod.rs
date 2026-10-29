@@ -104,8 +104,9 @@ fn hints(app: &App) -> &'static str {
         Some(View::Instances { .. }) => {
             "<enter> logs  <r> reload  </> filter  <esc> back  <?> help"
         }
+        // Fits 80 columns; `?` lists the rest (add, undo, Y).
         Some(View::Variables(_)) => {
-            "<e> edit  <a> add  <d> del  <u> undo  <r> reveal  <y/Y> copy  <v> select  <p> review  <?> help"
+            "<e> edit  <d> del  <r> reveal  <y> copy  <v> select  <p> review  <?> help"
         }
         Some(View::Pending(_)) => "<D> deploy  <x> discard  <r> reveal  <esc> back  <?> help",
         Some(View::Logs(_)) => {
