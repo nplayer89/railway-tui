@@ -85,13 +85,15 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
 fn hints(app: &App) -> &'static str {
     match app.stack.last() {
         Some(View::Services) => {
-            "<e> env  <l> logs  <i> instances  <v> vars  <p> pending  <enter> deploys  </> filter  <?> help"
+            "<e> env  <l> logs  <i> inst  <v> vars  <p> pending  </> filter  <?> help"
         }
         Some(View::Deployments { .. }) | Some(View::Instances { .. }) => {
             "<enter> logs  </> filter  <esc> back  <?> help"
         }
-        Some(View::Variables(_)) => "<p> review  </> filter  <esc> back  <?> help",
-        Some(View::Pending(_)) => "<x> discard  <D> deploy  <r> reveal  <esc> back  <?> help",
+        Some(View::Variables(_)) => {
+            "<e> edit  <a> add  <d> del  <u> undo  <r> reveal  <p> review  <?> help"
+        }
+        Some(View::Pending(_)) => "<D> deploy  <x> discard  <r> reveal  <esc> back  <?> help",
         Some(View::Logs(_)) => "<b> build/runtime  <f> follow  </> filter  <esc> back  <?> help",
         _ => "<enter> open  </> filter  <:> command  <t> theme  <?> help",
     }
@@ -308,14 +310,18 @@ fn draw_help(frame: &mut Frame, area: Rect, t: &Theme) {
         "enter        open",
         "esc          back / clear filter",
         "/            filter",
-        ":            command (projects services deploys logs q)",
+        ":            command (projects services deploys logs vars pending q)",
         "e            environment picker (services)",
         "l            latest logs   i  instances",
         "b            build/runtime logs",
         "f, G         follow logs",
         "ctrl-r       reload (in logs: reconnect)",
         "t            theme picker (:theme)",
+        "v            service variables (:vars)",
+        "  e/enter edit  E $EDITOR  a add  d delete  u undo",
+        "  r reveal  R reveal all  p review  / name filter",
         "p            review pending changes (:pending)",
+        "  D deploy  x discard  r/R reveal  (y confirms)",
         "?            toggle help",
         "q            quit",
     ];
