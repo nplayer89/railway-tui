@@ -217,6 +217,8 @@ impl App {
         match code {
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+            // Views that bind `r` themselves (reveal) keep it; Ctrl-R still reloads there.
+            KeyCode::Char('r') => self.reload_current(now, out),
             KeyCode::Esc if self.table_filter.is_some() => self.table_filter = None,
             KeyCode::Esc => self.pop(out),
             _ => {}

@@ -62,7 +62,7 @@ On launch it reopens the last-used project and environment.
 | `b` | switch between build and runtime logs (Logs) |
 | `f`, `G` | resume following the log (Logs) |
 | `PageUp` / `PageDown` | scroll the log by a page (Logs) |
-| `ctrl-r` | reload (in the log view: reconnect the stream) |
+| `r`, `ctrl-r` | reload now instead of waiting for the next refresh (in the log view: reconnect the stream; in Variables and the review `r` reveals, so use `ctrl-r`) |
 | `t` | theme picker (also `:theme`): moving previews, `enter` keeps and remembers, `esc` reverts |
 | `?` | toggle the help overlay |
 | `q`, `ctrl-c` | quit (refused while a deploy is in flight; `ctrl-c` twice forces it) |
