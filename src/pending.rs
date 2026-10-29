@@ -212,8 +212,9 @@ pub fn pending_path(xdg_state_home: Option<&Path>, home: &Path) -> PathBuf {
     base.join("railway-tui").join("pending.toml")
 }
 
-/// A missing file gives the default. A corrupt file is moved to `pending.toml.corrupt` and
-/// reported, never silently dropped. Error text never includes file contents.
+/// A missing file gives the default. A corrupt file is moved to
+/// `pending.toml.corrupt-<unix seconds>` (never over an earlier one) and reported,
+/// never silently dropped. Error text never includes file contents.
 pub fn load_pending(path: &Path) -> Result<Pending, String> {
     let parsed = match std::fs::read_to_string(path) {
         Ok(text) => toml::from_str::<Pending>(&text).ok(),
@@ -227,7 +228,7 @@ pub fn load_pending(path: &Path) -> Result<Pending, String> {
     if let Some(p) = parsed {
         return Ok(p);
     }
-    let aside = path.with_extension("toml.corrupt");
+    let aside = corrupt_aside_path(path);
     match std::fs::rename(path, &aside) {
         Ok(()) => Err(format!(
             "pending changes file was unreadable; moved to {}",
@@ -238,6 +239,23 @@ pub fn load_pending(path: &Path) -> Result<Pending, String> {
             e.kind()
         )),
     }
+}
+
+/// `pending.toml.corrupt-<unix seconds>`, with `-<n>` added while that name is taken.
+fn corrupt_aside_path(path: &Path) -> PathBuf {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let base = path.with_extension(format!("toml.corrupt-{secs}"));
+    let mut aside = base.clone();
+    let mut n = 1;
+    while aside.exists() {
+        let mut name = base.clone().into_os_string();
+        name.push(format!("-{n}"));
+        aside = PathBuf::from(name);
+        n += 1;
+    }
+    aside
 }
 
 /// Creates parent directories, writes a 0600 temp file, then renames it into place.
@@ -505,21 +523,43 @@ mod tests {
         );
     }
 
+    /// The path `load_pending` reported moving the corrupt file to.
+    fn moved_to(err: &str) -> PathBuf {
+        let prefix = "pending changes file was unreadable; moved to ";
+        assert!(err.starts_with(prefix), "{err}");
+        PathBuf::from(&err[prefix.len()..])
+    }
+
     #[test]
     fn corrupt_file_is_moved_aside_and_reported() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pending.toml");
         std::fs::write(&path, "SECRET = = not toml [").unwrap();
         let err = load_pending(&path).unwrap_err();
-        let aside = dir.path().join("pending.toml.corrupt");
-        assert!(err.starts_with("pending changes file was unreadable; moved to "));
-        assert!(err.contains(&aside.display().to_string()));
+        let aside = moved_to(&err);
+        assert_eq!(aside.parent(), Some(dir.path()));
+        let name = aside.file_name().unwrap().to_str().unwrap();
+        let stamp = name.strip_prefix("pending.toml.corrupt-").unwrap();
+        assert!(stamp.parse::<u64>().is_ok(), "{name}");
         assert!(!err.contains("SECRET"));
         assert!(!path.exists());
         assert_eq!(
             std::fs::read_to_string(&aside).unwrap(),
             "SECRET = = not toml ["
         );
+    }
+
+    #[test]
+    fn a_second_corrupt_file_does_not_overwrite_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending.toml");
+        std::fs::write(&path, "first [").unwrap();
+        let first = moved_to(&load_pending(&path).unwrap_err());
+        std::fs::write(&path, "second [").unwrap();
+        let second = moved_to(&load_pending(&path).unwrap_err());
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "first [");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second [");
     }
 
     #[test]

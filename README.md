@@ -102,8 +102,8 @@ variables are re-read from Railway first. Nothing is ever resent automatically.
 
 Pending changes are saved to `$XDG_STATE_HOME/railway-tui/pending.toml` (default
 `~/.local/state/railway-tui/pending.toml`) with mode 0600, so they survive a restart. **The file
-holds secret values in plain text.** A corrupt file is moved to `pending.toml.corrupt` and you
-start empty.
+holds secret values in plain text.** A corrupt file is moved to `pending.toml.corrupt-<unix seconds>`
+(never over an earlier one; the message names the path) and you start empty.
 
 ### First live run checklist
 
