@@ -915,6 +915,56 @@ fn review_orphan_label_and_discard_prompt() {
 }
 
 #[test]
+fn written_not_deployed_only_when_every_entry_is_written() {
+    let mut app = review_app();
+    let sp = app
+        .pending
+        .envs
+        .get_mut("e1")
+        .unwrap()
+        .get_mut("svc-1")
+        .unwrap();
+    // Written earlier, then more edits: some entries are not on Railway yet.
+    sp.written_not_deployed = true;
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("partly written"), "{t}");
+    assert!(!t.contains("written, not deployed"), "{t}");
+    // An edit re-based on a written value: nothing applied, but the flag is set.
+    let sp = app
+        .pending
+        .envs
+        .get_mut("e1")
+        .unwrap()
+        .get_mut("svc-1")
+        .unwrap();
+    sp.vars.values_mut().for_each(|v| v.applied = false);
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("partly written"), "{t}");
+    let sp = app
+        .pending
+        .envs
+        .get_mut("e1")
+        .unwrap()
+        .get_mut("svc-1")
+        .unwrap();
+    sp.vars.values_mut().for_each(|v| v.applied = true);
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("written, not deployed"), "{t}");
+    assert!(!t.contains("partly written"), "{t}");
+    let sp = app
+        .pending
+        .envs
+        .get_mut("e1")
+        .unwrap()
+        .get_mut("svc-1")
+        .unwrap();
+    sp.vars.values_mut().for_each(|v| v.applied = false);
+    sp.written_not_deployed = false;
+    let t = text(&render(&app, Instant::now()));
+    assert!(!t.contains("written"), "{t}");
+}
+
+#[test]
 fn review_labels_a_group_whose_service_is_gone() {
     let mut app = review_app();
     app.services.value.as_mut().unwrap()[0].service_id = "svc-other".into();

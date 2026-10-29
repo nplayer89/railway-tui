@@ -55,10 +55,13 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, view: &PendingView) {
             Some(Orphan::Service) => head.push_str("  (service no longer exists)"),
             None => {}
         }
-        if sp.written_not_deployed {
-            head.push_str("  written, not deployed");
-        } else if applied > 0 && applied < sp.vars.len() {
+        // Written, but some entries are not on Railway yet (a failed write, or
+        // an edit of a written entry): never shown as fully written.
+        let unapplied = applied < sp.vars.len();
+        if unapplied && (applied > 0 || sp.written_not_deployed) {
             head.push_str("  partly written");
+        } else if !unapplied && sp.written_not_deployed {
+            head.push_str("  written, not deployed");
         }
         let mut style = fg(t.text).add_modifier(Modifier::BOLD);
         if i == selected {
