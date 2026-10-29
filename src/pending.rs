@@ -41,6 +41,18 @@ impl fmt::Debug for PendingVar {
     }
 }
 
+impl PendingVar {
+    /// Railway now holds what this entry wrote: make that the base of a new,
+    /// unapplied edit.
+    fn rebase_on_written(&mut self) {
+        self.base = match &self.change {
+            Change::Set { value } => Some(value.clone()),
+            Change::Delete => None,
+        };
+        self.applied = false;
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServicePending {
     pub project_id: String,
@@ -78,10 +90,16 @@ impl Pending {
         sp
     }
 
+    /// Drops an emptied group (and environment). A group whose remaining entries
+    /// are all on Railway is written but not deployed.
     fn prune(&mut self, env_id: &str, service_id: &str) {
         if let Some(services) = self.envs.get_mut(env_id) {
-            if services.get(service_id).is_some_and(|s| s.vars.is_empty()) {
-                services.remove(service_id);
+            if let Some(sp) = services.get_mut(service_id) {
+                if sp.vars.is_empty() {
+                    services.remove(service_id);
+                } else if sp.vars.values().all(|v| v.applied) {
+                    sp.written_not_deployed = true;
+                }
             }
             if services.is_empty() {
                 self.envs.remove(env_id);
@@ -89,8 +107,19 @@ impl Pending {
         }
     }
 
+    /// An entry already written to Railway (applied) is re-based on what it wrote,
+    /// so going back to the old value is a real revert to send. Setting it to the
+    /// value it already wrote changes nothing.
     pub fn set(&mut self, t: &Target, name: &str, value: String, current: Option<&str>) {
         let sp = self.entry(t);
+        if let Some(v) = sp.vars.get_mut(name) {
+            if v.applied {
+                if matches!(&v.change, Change::Set { value: written } if *written == value) {
+                    return;
+                }
+                v.rebase_on_written();
+            }
+        }
         let base = match sp.vars.get(name) {
             Some(v) => v.base.clone(),
             None => current.map(str::to_string),
@@ -110,8 +139,17 @@ impl Pending {
         self.prune(t.env_id, t.service_id);
     }
 
+    /// Like `set`: an applied entry is re-based on what it wrote first.
     pub fn delete(&mut self, t: &Target, name: &str, current: Option<&str>) {
         let sp = self.entry(t);
+        if let Some(v) = sp.vars.get_mut(name) {
+            if v.applied {
+                if v.change == Change::Delete {
+                    return;
+                }
+                v.rebase_on_written();
+            }
+        }
         let base = match sp.vars.get(name) {
             Some(v) => v.base.clone(),
             None => current.map(str::to_string),
@@ -131,6 +169,8 @@ impl Pending {
         self.prune(t.env_id, t.service_id);
     }
 
+    /// Forgets an entry. The caller refuses this for an applied entry Neil asked to
+    /// undo: Railway already holds its value.
     pub fn undo(&mut self, env_id: &str, service_id: &str, name: &str) {
         if let Some(sp) = self
             .envs
@@ -313,6 +353,94 @@ mod tests {
         assert!(p.service("e", "s2").is_some());
         p.discard("e", "s2");
         assert!(p.envs.is_empty());
+    }
+
+    /// Pending on (e, s): A set one → two and applied, NEW added as "n" and applied.
+    fn applied_pending() -> Pending {
+        let mut p = Pending::default();
+        let tg = t("p", "e", "s");
+        p.set(&tg, "A", "two".into(), Some("one"));
+        p.set(&tg, "NEW", "n".into(), None);
+        p.set(&tg, "B", "y".into(), Some("x"));
+        let sp = p.envs.get_mut("e").unwrap().get_mut("s").unwrap();
+        sp.vars.get_mut("A").unwrap().applied = true;
+        sp.vars.get_mut("NEW").unwrap().applied = true;
+        p
+    }
+
+    #[test]
+    fn setting_an_applied_entry_back_is_a_revert_to_send() {
+        let mut p = applied_pending();
+        let tg = t("p", "e", "s");
+        // Railway holds "two" now; going back to "one" must be written.
+        p.set(&tg, "A", "one".into(), Some("two"));
+        let v = &p.service("e", "s").unwrap().vars["A"];
+        assert_eq!(
+            v.change,
+            Change::Set {
+                value: "one".into()
+            }
+        );
+        assert_eq!(v.base.as_deref(), Some("two"));
+        assert!(!v.applied);
+    }
+
+    #[test]
+    fn setting_an_applied_entry_to_its_written_value_changes_nothing() {
+        let mut p = applied_pending();
+        let before = p.clone();
+        p.set(&t("p", "e", "s"), "A", "two".into(), Some("two"));
+        assert_eq!(p, before);
+        p.delete(&t("p", "e", "s"), "GONE", Some("g"));
+        let sp = p.envs.get_mut("e").unwrap().get_mut("s").unwrap();
+        sp.vars.get_mut("GONE").unwrap().applied = true;
+        let before = p.clone();
+        p.delete(&t("p", "e", "s"), "GONE", None);
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn deleting_an_applied_addition_deletes_it_on_railway() {
+        let mut p = applied_pending();
+        p.delete(&t("p", "e", "s"), "NEW", Some("n"));
+        let v = &p.service("e", "s").unwrap().vars["NEW"];
+        assert_eq!(v.change, Change::Delete);
+        assert_eq!(v.base.as_deref(), Some("n"));
+        assert!(!v.applied);
+    }
+
+    #[test]
+    fn editing_an_applied_delete_is_an_addition() {
+        let mut p = Pending::default();
+        let tg = t("p", "e", "s");
+        p.delete(&tg, "GONE", Some("g"));
+        let sp = p.envs.get_mut("e").unwrap().get_mut("s").unwrap();
+        sp.vars.get_mut("GONE").unwrap().applied = true;
+        sp.written_not_deployed = true;
+        p.set(&tg, "GONE", "back".into(), None);
+        let sp = p.service("e", "s").unwrap();
+        let v = &sp.vars["GONE"];
+        assert_eq!(
+            v.change,
+            Change::Set {
+                value: "back".into()
+            }
+        );
+        assert_eq!(v.base, None);
+        assert!(!v.applied);
+        assert!(sp.written_not_deployed, "the written state is kept");
+    }
+
+    #[test]
+    fn dropping_the_last_unapplied_entry_leaves_the_group_written() {
+        let mut p = applied_pending();
+        let tg = t("p", "e", "s");
+        assert!(!p.service("e", "s").unwrap().written_not_deployed);
+        // B goes back to its base: only applied entries remain.
+        p.set(&tg, "B", "x".into(), Some("x"));
+        let sp = p.service("e", "s").unwrap();
+        assert_eq!(sp.vars.len(), 2);
+        assert!(sp.written_not_deployed);
     }
 
     #[test]

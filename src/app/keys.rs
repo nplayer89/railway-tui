@@ -320,6 +320,13 @@ impl App {
     }
 
     fn variables_key(&mut self, code: KeyCode, out: &mut Vec<Command>) -> bool {
+        let edits = matches!(
+            code,
+            KeyCode::Char('a' | 'e' | 'E' | 'd' | 'u') | KeyCode::Enter
+        );
+        if edits && self.refuse_while_deploying() {
+            return true;
+        }
         match code {
             KeyCode::Char('a') => self.var_input = Some(VarInput::default()),
             KeyCode::Char('e') | KeyCode::Enter => {
@@ -514,7 +521,26 @@ impl App {
         true
     }
 
+    /// True (with a message) when the open service has a deploy in flight: its
+    /// pending entries are being written and must not change underneath it.
+    fn refuse_while_deploying(&mut self) -> bool {
+        let deploying = self
+            .env_id()
+            .zip(self.view_service_id(Kind::Variables))
+            .is_some_and(|(env, svc)| self.is_deploying(env, svc));
+        if deploying {
+            let name = self.view_service_name(Kind::Variables);
+            self.message = Some(format!(
+                "{name} is deploying — wait for it to finish before changing its variables"
+            ));
+        }
+        deploying
+    }
+
     pub(super) fn set_variable(&mut self, name: &str, value: String, out: &mut Vec<Command>) {
+        if self.refuse_while_deploying() {
+            return;
+        }
         let (current, _) = self.var_state(name);
         if self.with_target(|p, t| p.set(t, name, value, current.as_deref())) {
             out.push(Command::SavePending(self.pending.clone()));
@@ -530,14 +556,24 @@ impl App {
         }
     }
 
+    /// Forgets the pending change of `name`, unless Railway already holds it:
+    /// forgetting that would leave the written value to ship with the next deploy.
     fn undo_variable(&mut self, name: &str, out: &mut Vec<Command>) {
-        if self.var_state(name).1.is_none() {
-            return;
-        }
         if let (Some(env), Some(svc)) = (
             self.env_id().map(String::from),
             self.view_service_id(Kind::Variables).map(String::from),
         ) {
+            let Some(var) = self
+                .pending
+                .service(&env, &svc)
+                .and_then(|s| s.vars.get(name))
+            else {
+                return;
+            };
+            if var.applied {
+                self.message = Some("already written to Railway — edit it to revert".into());
+                return;
+            }
             self.pending.undo(&env, &svc, name);
             out.push(Command::SavePending(self.pending.clone()));
         }

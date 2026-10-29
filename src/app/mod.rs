@@ -2788,6 +2788,155 @@ mod tests {
         assert!(!revealed(&app).1);
     }
 
+    /// REDIS_DB set 1 → 10 and written to Railway (applied), the view reloaded with it.
+    fn app_with_applied_edit(now: Instant) -> App {
+        let mut app = app_in_variables(now);
+        select_var(&mut app, "REDIS_DB", now);
+        app.update(key('e'), now);
+        app.update(key('0'), now);
+        app.update(code(KeyCode::Enter), now);
+        app.pending
+            .envs
+            .get_mut("e-prod")
+            .unwrap()
+            .get_mut("svc-a")
+            .unwrap()
+            .vars
+            .get_mut("REDIS_DB")
+            .unwrap()
+            .applied = true;
+        let loaded = vars(&[
+            ("DB_URL", "postgres://x"),
+            ("PORT", "has db inside"),
+            ("REDIS_DB", "10"),
+        ]);
+        data(&mut app, vars_event("svc-a", Ok(loaded)), now);
+        app
+    }
+
+    #[test]
+    fn u_refused_on_an_applied_entry() {
+        let now = Instant::now();
+        let mut app = app_with_applied_edit(now);
+        let before = app.pending.clone();
+        assert!(app.update(key('u'), now).is_empty());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("already written to Railway — edit it to revert")
+        );
+        assert_eq!(app.pending, before);
+    }
+
+    #[test]
+    fn setting_an_applied_entry_back_sends_the_revert() {
+        let now = Instant::now();
+        let mut app = app_with_applied_edit(now);
+        app.update(key('e'), now);
+        assert_eq!(app.var_input.as_ref().unwrap().text, "10");
+        app.update(code(KeyCode::Backspace), now);
+        let cmds = app.update(code(KeyCode::Enter), now);
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(_)]));
+        let p = pending_of(&app, "REDIS_DB").expect("the revert stays pending");
+        assert_eq!(p.change, crate::pending::Change::Set { value: "1".into() });
+        assert_eq!(p.base.as_deref(), Some("10"));
+        assert!(!p.applied);
+    }
+
+    #[test]
+    fn d_on_an_applied_addition_deletes_it_and_d_on_an_applied_delete_is_refused() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        app.update(key('a'), now);
+        typed(&mut app, "NEW", now);
+        app.update(code(KeyCode::Enter), now);
+        typed(&mut app, "n", now);
+        app.update(code(KeyCode::Enter), now);
+        let sp = app
+            .pending
+            .envs
+            .get_mut("e-prod")
+            .unwrap()
+            .get_mut("svc-a")
+            .unwrap();
+        sp.vars.get_mut("NEW").unwrap().applied = true;
+        sp.written_not_deployed = true;
+        select_var(&mut app, "NEW", now);
+        let cmds = app.update(key('d'), now);
+        assert!(matches!(cmds.as_slice(), [Command::SavePending(_)]));
+        let p = pending_of(&app, "NEW").expect("the delete stays pending");
+        assert_eq!(p.change, crate::pending::Change::Delete);
+        assert_eq!(p.base.as_deref(), Some("n"));
+        assert!(!p.applied);
+
+        // Now the delete is written too: `d` again would forget it.
+        app.pending
+            .envs
+            .get_mut("e-prod")
+            .unwrap()
+            .get_mut("svc-a")
+            .unwrap()
+            .vars
+            .get_mut("NEW")
+            .unwrap()
+            .applied = true;
+        let before = app.pending.clone();
+        assert!(app.update(key('d'), now).is_empty());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("already written to Railway — edit it to revert")
+        );
+        assert_eq!(app.pending, before);
+    }
+
+    #[test]
+    fn variable_edits_refused_while_the_service_deploys() {
+        let now = Instant::now();
+        let mut app = app_in_variables(now);
+        select_var(&mut app, "REDIS_DB", now);
+        app.update(key('d'), now);
+        app.update(key('p'), now);
+        app.update(key('D'), now);
+        data(
+            &mut app,
+            deploy_vars_event("e-prod", "svc-a", vars(&[("REDIS_DB", "1")])),
+            now,
+        );
+        assert!(app
+            .update(key('y'), now)
+            .iter()
+            .any(|c| matches!(c, Command::DeployService { .. })));
+        app.update(code(KeyCode::Esc), now);
+        assert!(matches!(app.stack.last(), Some(View::Variables(_))));
+        let before = app.pending.clone();
+        for k in [
+            KeyCode::Char('u'),
+            KeyCode::Char('d'),
+            KeyCode::Char('e'),
+            KeyCode::Enter,
+            KeyCode::Char('E'),
+            KeyCode::Char('a'),
+        ] {
+            assert!(app.update(code(k), now).is_empty(), "{k:?}");
+            assert!(app.var_input.is_none(), "{k:?}");
+            assert!(
+                app.message.as_deref().unwrap().contains("is deploying"),
+                "{k:?}: {:?}",
+                app.message
+            );
+            assert_eq!(app.pending, before, "{k:?}");
+        }
+        let edited = DataEvent::Edited {
+            name: "REDIS_DB".into(),
+            result: Ok("7".into()),
+        };
+        assert!(data(&mut app, edited, now).is_empty());
+        assert_eq!(app.pending, before);
+        assert!(app.message.as_deref().unwrap().contains("is deploying"));
+        // Revealing is still fine.
+        app.update(key('r'), now);
+        assert!(!app.message.as_deref().unwrap_or("").contains("deploying"));
+    }
+
     #[test]
     fn ctrl_c_quits_while_editing() {
         let now = Instant::now();
