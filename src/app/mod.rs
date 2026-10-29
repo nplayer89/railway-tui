@@ -541,11 +541,12 @@ impl App {
         for (env_id, services) in &self.pending.envs {
             for (service_id, sp) in services {
                 if sp.project_id == project_id {
+                    // The env id after its name keeps same-named environments apart.
                     found.push((
                         current != Some(env_id.as_str()),
                         &sp.env_name,
-                        &sp.service_name,
                         env_id,
+                        &sp.service_name,
                         service_id,
                     ));
                 }
@@ -554,7 +555,7 @@ impl App {
         found.sort();
         found
             .into_iter()
-            .map(|(_, _, _, env_id, service_id)| {
+            .map(|(_, _, env_id, _, service_id)| {
                 let env_gone = loaded.is_some_and(|l| !l.iter().any(|e| e.id == env_id));
                 let service_gone = current == Some(env_id)
                     && services.is_some_and(|l| !l.iter().any(|s| s.service_id == service_id));
@@ -3046,6 +3047,23 @@ mod tests {
                 pair("e-stg", "s1")
             ]
         );
+    }
+
+    #[test]
+    fn same_named_environments_do_not_interleave() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        app.pending.envs.remove("e-stg");
+        add_pending(&mut app, ("e-b", "dup"), ("s1", "alpha"), "A", "1");
+        add_pending(&mut app, ("e-a", "dup"), ("s1", "beta"), "A", "1");
+        add_pending(&mut app, ("e-a", "dup"), ("s2", "zeta"), "A", "1");
+        let envs: Vec<String> = app
+            .pending_groups()
+            .into_iter()
+            .skip(2)
+            .map(|g| g.env_id)
+            .collect();
+        assert_eq!(envs, ["e-a", "e-a", "e-b"]);
     }
 
     #[test]
