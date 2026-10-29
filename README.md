@@ -75,6 +75,8 @@ On launch it reopens the last-used project and environment.
 
 From Services press `v` (or `:vars`) to open the selected service's variables in the current
 environment. Values are hidden until revealed and are hidden again when you leave the view.
+Each open or reload costs at least two API requests (the values, then which are sealed, one more
+per 100 variables in the environment), so it uses the hourly request budget faster than other views.
 
 | key | action |
 | --- | --- |
