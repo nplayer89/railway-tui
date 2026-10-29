@@ -1503,7 +1503,7 @@ fn statusline_shows_mode_label_env_project_and_position() {
     let y = buf.area.height - 2;
     let x = row_text(&buf, y).chars().position(|c| c == 'N').unwrap() as u16;
     assert_eq!(buf[(x, y)].bg, app.theme().accent);
-    let x = row_text(&buf, y).find('\u{f0e8}').unwrap();
+    let x = row_text(&buf, y).find('\u{f0631}').unwrap();
     let x = row_text(&buf, y)[..x].chars().count() as u16;
     assert_eq!(buf[(x, y)].bg, app.theme().bad);
 }
@@ -1690,14 +1690,14 @@ fn statusline_shows_branch_and_a_scrolling_env_block() {
     assert!(r0.contains('\u{e725}') && r0.contains("feat/x"), "{r0}");
     assert!(!r0.contains('\u{f0ac}') && !r0.contains('\u{f07b}'), "{r0}");
     let field = |r: &str| {
-        let i = r.find('\u{f0e8}').unwrap();
+        let i = r.find('\u{f0631}').unwrap();
         r[i..].chars().skip(3).take(20).collect::<String>()
     };
     assert_eq!(field(&r0), "production-eu-west-2");
     assert_eq!(field(&r1), "roduction-eu-west-2-");
     // A long name fills the capped field, with a space of padding either side.
     assert!(
-        r0.contains("\u{f0e8}  production-eu-west-2  \u{f03a}"),
+        r0.contains("\u{f0631}  production-eu-west-2  \u{f03a}"),
         "{r0}"
     );
 }
@@ -1708,7 +1708,7 @@ fn production_env_block_is_red_and_bold() {
     let buf = render_at_step(&app, 140, 0);
     let y = buf.area.height - 2;
     let r = row_text(&buf, y);
-    let icon = r[..r.find('\u{f0e8}').unwrap()].chars().count() as u16;
+    let icon = r[..r.find('\u{f0631}').unwrap()].chars().count() as u16;
     assert_eq!(buf[(icon, y)].bg, T.bad);
     let name = r[..r.find("production").unwrap()].chars().count() as u16;
     let cell = &buf[(name, y)];
@@ -1722,7 +1722,7 @@ fn other_env_blocks_use_the_accent_and_plain_text() {
     let buf = render_at_step(&app, 140, 0);
     let y = buf.area.height - 2;
     let r = row_text(&buf, y);
-    let icon = r[..r.find('\u{f0e8}').unwrap()].chars().count() as u16;
+    let icon = r[..r.find('\u{f0631}').unwrap()].chars().count() as u16;
     assert_eq!(buf[(icon, y)].bg, T.accent);
     let name = r[..r.find("staging").unwrap()].chars().count() as u16;
     assert!(!buf[(name, y)]
@@ -1735,12 +1735,16 @@ fn short_env_name_sizes_the_field_and_does_not_scroll() {
     let app = branch_app("staging");
     let row = |step| status_row(&render_at_step(&app, 140, step));
     assert_eq!(row(0), row(7));
-    assert!(row(0).contains("\u{f0e8}  staging  \u{f03a}"), "{}", row(0));
+    assert!(
+        row(0).contains("\u{f0631}  staging  \u{f03a}"),
+        "{}",
+        row(0)
+    );
     // Up to the cap the field is exactly as wide as the name.
     let app = branch_app("production-eu-west-2");
     let r = status_row(&render_at_step(&app, 140, 0));
     assert!(
-        r.contains("\u{f0e8}  production-eu-west-2  \u{f03a}"),
+        r.contains("\u{f0631}  production-eu-west-2  \u{f03a}"),
         "{r}"
     );
 }
@@ -1751,7 +1755,7 @@ fn no_branch_or_env_omits_those_segments() {
     app.stack = vec![View::Projects];
     let row = status_row(&render_sized(&app, Instant::now(), 140, 20));
     assert!(
-        !row.contains('\u{e725}') && !row.contains('\u{f0e8}'),
+        !row.contains('\u{e725}') && !row.contains('\u{f0631}'),
         "{row}"
     );
 }
