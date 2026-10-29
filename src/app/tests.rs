@@ -3148,3 +3148,61 @@ fn a_command_leaving_variables_drops_the_selection_with_the_view() {
     assert!(matches!(app.stack.last(), Some(View::Pending(_))));
     assert!(!app.stack.iter().any(|v| matches!(v, View::Variables(_))));
 }
+
+#[test]
+fn mode_follows_modal_and_visual_anchor() {
+    let now = Instant::now();
+    let mut app = app_in_variables(now);
+    assert_eq!(app.mode(), Mode::Normal);
+    app.update(key(':'), now);
+    assert_eq!(app.mode(), Mode::Command);
+    app.update(code(KeyCode::Esc), now);
+    app.update(key('/'), now);
+    assert_eq!(app.mode(), Mode::Filter);
+    app.update(code(KeyCode::Esc), now);
+    app.update(key('a'), now);
+    assert_eq!(app.mode(), Mode::Insert);
+    app.update(code(KeyCode::Esc), now);
+    assert_eq!(app.mode(), Mode::Normal);
+    // The first `j` from an unselected cursor lands on PORT, so step back up.
+    select_var(&mut app, "PORT", now);
+    app.update(key('k'), now);
+    assert_eq!(app.selection.variable.as_deref(), Some("DB_URL"));
+    app.update(key('v'), now);
+    assert_eq!(app.mode(), Mode::Visual);
+    assert_eq!(app.mode().name(), "VISUAL");
+    app.update(code(KeyCode::Esc), now);
+    assert_eq!(app.mode(), Mode::Normal);
+}
+
+#[test]
+fn overlays_are_not_modes() {
+    let now = Instant::now();
+    let mut app = app_in_variables(now);
+    app.update(key('?'), now);
+    assert_eq!(app.mode(), Mode::Normal);
+    app.update(code(KeyCode::Esc), now);
+    app.update(key('t'), now);
+    assert_eq!(app.mode(), Mode::Normal);
+}
+
+#[test]
+fn position_is_one_based_and_absent_on_empty_or_logs() {
+    let now = Instant::now();
+    let mut app = app_in_variables(now);
+    select_var(&mut app, "PORT", now);
+    assert_eq!(app.position(), Some((2, 3)));
+    app.update(key('/'), now);
+    typed(&mut app, "zzzz", now);
+    app.update(code(KeyCode::Enter), now);
+    assert_eq!(app.position(), None);
+}
+
+#[test]
+fn status_label_names_the_context_and_view() {
+    let now = Instant::now();
+    let mut app = app_in_services(now);
+    assert_eq!(app.status_label(), "Beta › services");
+    app.update(key('v'), now);
+    assert_eq!(app.status_label(), "svc-a-name › variables");
+}

@@ -56,6 +56,28 @@ pub enum View {
     Pending(PendingView),
 }
 
+/// What the statusline's mode chip shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Normal,
+    Visual,
+    Command,
+    Insert,
+    Filter,
+}
+
+impl Mode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Normal => "NORMAL",
+            Mode::Visual => "VISUAL",
+            Mode::Command => "COMMAND",
+            Mode::Insert => "INSERT",
+            Mode::Filter => "FILTER",
+        }
+    }
+}
+
 /// The Variables view of one service. Dropping it re-hides every value.
 #[derive(Debug)]
 pub struct VarsView {
@@ -854,6 +876,46 @@ impl App {
     pub fn selected_index(&self) -> Option<usize> {
         self.row_count_and_selected()
             .and_then(|(len, i)| (len > 0).then_some(i))
+    }
+
+    /// The input mode: a text modal wins over the visual anchor; overlays are not modes.
+    pub fn mode(&self) -> Mode {
+        match &self.modal {
+            Some(Modal::Command(_)) => Mode::Command,
+            Some(Modal::Filter(_)) => Mode::Filter,
+            Some(Modal::VarInput(_)) => Mode::Insert,
+            _ if self.visual_range().is_some() => Mode::Visual,
+            _ => Mode::Normal,
+        }
+    }
+
+    /// 1-based `(row, total)` of the top table view; None for logs and empty tables.
+    pub fn position(&self) -> Option<(usize, usize)> {
+        self.selected_index()
+            .zip(self.row_count_and_selected())
+            .map(|(i, (len, _))| (i + 1, len))
+    }
+
+    /// `<context> › <view>` for the statusline, uncleaned.
+    pub fn status_label(&self) -> String {
+        let project = || self.project.as_ref().map_or("-", |p| p.name.as_str());
+        let service = |kind| {
+            self.view_service_id(kind)
+                .and_then(|id| self.service(id))
+                .map_or("-", |s| s.service_name.as_str())
+        };
+        match self.kind() {
+            Kind::Projects => "projects".to_string(),
+            Kind::Services => format!("{} › services", project()),
+            Kind::Deployments => format!("{} › deployments", service(Kind::Deployments)),
+            Kind::Instances => format!("{} › instances", service(Kind::Instances)),
+            Kind::Variables => format!("{} › variables", service(Kind::Variables)),
+            Kind::Pending => format!("{} › pending", project()),
+            Kind::Logs => match self.stack.last() {
+                Some(View::Logs(l)) => format!("{} › logs", l.service_name),
+                _ => unreachable!("kind() is Logs only for a Logs view"),
+            },
+        }
     }
 
     // ---- data events ----
