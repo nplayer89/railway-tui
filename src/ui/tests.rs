@@ -1579,6 +1579,32 @@ fn narrow_statusline_drops_pieces_and_keeps_the_mode() {
 }
 
 #[test]
+fn statusline_drops_count_then_project_then_env_then_position() {
+    let mut app = vars_app("staging", &[("A", "1"), ("B", "2")]);
+    press(&mut app, 'v');
+    press(&mut app, 'j');
+    let row = |w| status_row(&render_sized(&app, Instant::now(), w, 20));
+    let full = row(120);
+    assert!(
+        full.contains("2 selected") && full.contains("proj"),
+        "{full}"
+    );
+    // Find the widest width at which each piece is still absent or present.
+    let w_no_count = (1..120)
+        .rev()
+        .find(|&w| !row(w).contains("selected"))
+        .unwrap();
+    let r = row(w_no_count);
+    assert!(r.contains("proj") && r.contains("staging"), "{r}");
+    let w_no_env = (1..120)
+        .rev()
+        .find(|&w| !row(w).contains("staging"))
+        .unwrap();
+    let r = row(w_no_env);
+    assert!(!r.contains("proj") && r.contains("2/2"), "{r}");
+}
+
+#[test]
 fn logs_statusline_has_no_position_and_names_the_service() {
     let app = logs_app(vec![line(0, "hi")], StreamState::Live);
     let row = status_row(&render_sized(&app, Instant::now(), 120, 20));

@@ -98,82 +98,34 @@ pub(super) fn draw_statusline(frame: &mut Frame, area: Rect, app: &App) {
             ),
         ]
     });
-    let mut count_block = match (mode, app.visual_range()) {
+    let count_block = match (mode, app.visual_range()) {
         (Mode::Visual, Some(r)) => Some(vec![Span::styled(
             format!("{} selected ", r.end() - r.start() + 1),
             Style::new().fg(t.muted).bg(t.bg),
         )]),
         _ => None,
     };
-    let (mut project_block, mut env_block, mut position_block) =
-        (project_block, env_block, position_block);
-
-    let total = |count: &Option<Vec<Span>>,
-                 env: &Option<Vec<Span>>,
-                 project: &Option<Vec<Span>>,
-                 position: &Option<Vec<Span>>,
-                 label: &str| {
-        let mut n = width(&mode_block) + width(&view_block(label));
-        for block in [count, env, project, position].into_iter().flatten() {
-            n += width(block);
-        }
-        n
-    };
+    // In drop order: selection count, project, env, position.
+    let mut optional = [count_block, project_block, env_block, position_block];
     let max = area.width as usize;
-    // Drop order: selection count, project, env, position.
-    if total(
-        &count_block,
-        &env_block,
-        &project_block,
-        &position_block,
-        &label,
-    ) > max
-    {
-        count_block = None;
-    }
-    if total(
-        &count_block,
-        &env_block,
-        &project_block,
-        &position_block,
-        &label,
-    ) > max
-    {
-        project_block = None;
-    }
-    if total(
-        &count_block,
-        &env_block,
-        &project_block,
-        &position_block,
-        &label,
-    ) > max
-    {
-        env_block = None;
-    }
-    if total(
-        &count_block,
-        &env_block,
-        &project_block,
-        &position_block,
-        &label,
-    ) > max
-    {
-        position_block = None;
+    let total = |optional: &[Option<Vec<Span>>], label: &str| {
+        width(&mode_block)
+            + width(&view_block(label))
+            + optional.iter().flatten().map(|b| width(b)).sum::<usize>()
+    };
+    for i in 0..optional.len() {
+        if total(&optional, &label) <= max {
+            break;
+        }
+        optional[i] = None;
     }
     let mut label = label;
-    let over = total(
-        &count_block,
-        &env_block,
-        &project_block,
-        &position_block,
-        &label,
-    )
-    .saturating_sub(max);
+    let over = total(&optional, &label).saturating_sub(max);
     if over > 0 {
         let keep = label.chars().count().saturating_sub(over);
         label = truncate(&label, keep);
     }
+    let [count_block, project_block, env_block, position_block] = optional;
 
     let mut spans = mode_block.clone();
     spans.extend(view_block(&label));
