@@ -1458,22 +1458,164 @@ fn unlisted_branches_explain_why_wrapped_and_ask_for_a_name() {
     }
 }
 
-#[test]
-fn visual_mode_shows_title_marker() {
-    let mut app = vars_app("staging", &[("A", "1"), ("B", "2")]);
-    let t = text(&render(&app, Instant::now()));
-    assert!(!t.contains("-- VISUAL --"), "{t}");
-    press(&mut app, 'v');
-    let t = text(&render(&app, Instant::now()));
-    assert!(t.contains("-- VISUAL --"), "{t}");
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+fn key(app: &mut App, code: crossterm::event::KeyCode) {
+    use crossterm::event::{KeyEvent, KeyModifiers};
     app.update(
-        crate::app::AppEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        crate::app::AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)),
         Instant::now(),
     );
+}
+
+fn status_row(buf: &Buffer) -> String {
+    row_text(buf, buf.area.height - 2)
+}
+
+fn last_row(buf: &Buffer) -> String {
+    row_text(buf, buf.area.height - 1)
+}
+
+#[test]
+fn statusline_shows_mode_label_env_project_and_position() {
+    let app = vars_app("production", &[("A", "1"), ("B", "2")]);
+    let buf = render_sized(&app, Instant::now(), 120, 20);
+    let row = status_row(&buf);
+    for want in [
+        "NORMAL",
+        "api › variables",
+        "production",
+        "proj",
+        "1/2",
+        "\u{e0bc}",
+    ] {
+        assert!(row.contains(want), "missing {want:?} in {row:?}");
+    }
+    let y = buf.area.height - 2;
+    let x = row_text(&buf, y).chars().position(|c| c == 'N').unwrap() as u16;
+    assert_eq!(buf[(x, y)].bg, app.theme().accent);
+    let x = row_text(&buf, y).find("production").unwrap();
+    let x = row_text(&buf, y)[..x].chars().count() as u16;
+    assert_eq!(buf[(x, y)].fg, app.theme().bad);
+}
+
+#[test]
+fn visual_mode_shows_in_the_statusline_with_a_count() {
+    let mut app = vars_app("staging", &[("A", "1"), ("B", "2")]);
+    let buf = render_sized(&app, Instant::now(), 120, 20);
+    assert!(!status_row(&buf).contains("VISUAL"));
+    press(&mut app, 'v');
+    press(&mut app, 'j');
+    let buf = render_sized(&app, Instant::now(), 120, 20);
+    let row = status_row(&buf);
+    assert!(
+        row.contains("VISUAL") && row.contains("2 selected"),
+        "{row}"
+    );
+    let y = buf.area.height - 2;
+    let x = row.chars().position(|c| c == 'V').unwrap() as u16;
+    assert_eq!(buf[(x, y)].bg, app.theme().hint);
+    assert!(!text(&buf).contains("-- VISUAL --"));
+    key(&mut app, crossterm::event::KeyCode::Esc);
     let t = text(&render(&app, Instant::now()));
-    assert!(!t.contains("-- VISUAL --"), "{t}");
     assert!(t.contains("api · variables"), "{t}");
+}
+
+#[test]
+fn command_mode_marks_the_bar_and_types_on_the_last_line() {
+    let mut app = vars_app("staging", &[("A", "1")]);
+    for c in ":dep".chars() {
+        press(&mut app, c);
+    }
+    let buf = render_sized(&app, Instant::now(), 120, 20);
+    let row = status_row(&buf);
+    assert!(row.contains("COMMAND"), "{row}");
+    let x = row.chars().position(|c| c == 'C').unwrap() as u16;
+    assert_eq!(buf[(x, buf.area.height - 2)].bg, app.theme().busy);
+    assert!(last_row(&buf).starts_with(":dep"), "{}", last_row(&buf));
+}
+
+#[test]
+fn insert_and_filter_modes_are_marked() {
+    let mut app = vars_app("staging", &[("A", "1")]);
+    press(&mut app, 'a');
+    let buf = render_sized(&app, Instant::now(), 120, 20);
+    let row = status_row(&buf);
+    assert!(row.contains("INSERT"), "{row}");
+    let x = row.chars().position(|c| c == 'I').unwrap() as u16;
+    assert_eq!(buf[(x, buf.area.height - 2)].bg, app.theme().ok);
+    key(&mut app, crossterm::event::KeyCode::Esc);
+    press(&mut app, '/');
+    let buf = render_sized(&app, Instant::now(), 120, 20);
+    assert!(status_row(&buf).contains("FILTER"));
+    assert!(last_row(&buf).starts_with('/'), "{}", last_row(&buf));
+}
+
+#[test]
+fn message_wins_over_filter_on_the_last_line() {
+    let mut app = vars_app("staging", &[("A", "1"), ("B", "2")]);
+    press(&mut app, '/');
+    press(&mut app, 'A');
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    app.message = Some("hello".into());
+    let last = last_row(&render_sized(&app, Instant::now(), 120, 20));
+    assert!(
+        last.contains("hello") && !last.contains("filter: A"),
+        "{last}"
+    );
+    app.message = None;
+    let last = last_row(&render_sized(&app, Instant::now(), 120, 20));
+    assert!(last.contains("filter: A"), "{last}");
+}
+
+#[test]
+fn narrow_statusline_drops_pieces_and_keeps_the_mode() {
+    let app = vars_app("staging", &[("A", "1")]);
+    let row = status_row(&render_sized(&app, Instant::now(), 40, 20));
+    assert!(row.contains("NORMAL") && !row.contains("proj"), "{row}");
+    let row = status_row(&render_sized(&app, Instant::now(), 24, 20));
+    assert!(row.contains("NORMAL") && row.contains('…'), "{row}");
+    for w in 0..12 {
+        render_sized(&app, Instant::now(), w, 20);
+    }
+}
+
+#[test]
+fn statusline_drops_count_then_project_then_env_then_position() {
+    let mut app = vars_app("staging", &[("A", "1"), ("B", "2")]);
+    press(&mut app, 'v');
+    press(&mut app, 'j');
+    let row = |w| status_row(&render_sized(&app, Instant::now(), w, 20));
+    let full = row(120);
+    assert!(
+        full.contains("2 selected") && full.contains("proj"),
+        "{full}"
+    );
+    // Find the widest width at which each piece is still absent or present.
+    let w_no_count = (1..120)
+        .rev()
+        .find(|&w| !row(w).contains("selected"))
+        .unwrap();
+    let r = row(w_no_count);
+    assert!(r.contains("proj") && r.contains("staging"), "{r}");
+    let w_no_env = (1..120)
+        .rev()
+        .find(|&w| !row(w).contains("staging"))
+        .unwrap();
+    let r = row(w_no_env);
+    assert!(!r.contains("proj") && r.contains("2/2"), "{r}");
+}
+
+#[test]
+fn logs_statusline_has_no_position_and_names_the_service() {
+    let app = logs_app(vec![line(0, "hi")], StreamState::Live);
+    let row = status_row(&render_sized(&app, Instant::now(), 120, 20));
+    assert!(row.contains("› logs"), "{row}");
+    assert!(!row.contains('\u{f03a}'), "{row}");
+}
+
+#[test]
+fn breadcrumb_pill_is_gone() {
+    let app = vars_app("staging", &[("A", "1")]);
+    assert!(!text(&render(&app, Instant::now())).contains("projects > "));
 }
 
 #[test]
