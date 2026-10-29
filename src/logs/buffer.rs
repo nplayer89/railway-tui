@@ -69,7 +69,11 @@ impl LogBuffer {
 
     /// Pushes every line, returning how many were added.
     pub fn extend(&mut self, lines: impl IntoIterator<Item = LogLine>) -> usize {
-        lines.into_iter().filter(|l| self.push(l.clone())).count()
+        lines
+            .into_iter()
+            .map(|l| self.push(l))
+            .filter(|&added| added)
+            .count()
     }
 
     pub fn last_timestamp(&self) -> Option<DateTime<Utc>> {

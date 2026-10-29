@@ -16,11 +16,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, BranchPicker, Confirm, LatestConfirm, Loaded, View};
+use crate::app::{App, BranchPicker, Confirm, LatestConfirm, Loaded, Modal, View};
 use crate::status::BoxColour;
 use crate::theme::{Theme, THEMES};
 
-fn box_style(t: &Theme, c: &BoxColour) -> Style {
+fn box_style(t: &Theme, c: BoxColour) -> Style {
     Style::new().fg(match c {
         BoxColour::Green => t.ok,
         BoxColour::Red => t.bad,
@@ -76,20 +76,20 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
     if app.help {
         draw_help(frame, body, t);
     }
-    if let Some(index) = app.env_picker {
-        draw_env_picker(frame, body, app, index);
-    }
-    if app.theme_picker.is_some() {
-        draw_theme_picker(frame, body, app);
-    }
-    if let Some(Confirm::Deploy(d)) = &app.confirm {
-        pending::draw_deploy_confirm(frame, body, app, d);
-    }
-    if let Some(picker) = &app.branch_picker {
-        draw_branch_picker(frame, body, app, picker);
-    }
-    if let Some(Confirm::DeployLatest(c)) = &app.confirm {
-        draw_latest_confirm(frame, body, app, c);
+    match &app.modal {
+        Some(Modal::EnvPicker(index)) => draw_env_picker(frame, body, app, *index),
+        Some(Modal::ThemePicker { .. }) => draw_theme_picker(frame, body, app),
+        Some(Modal::Confirm(Confirm::Deploy(d))) => {
+            pending::draw_deploy_confirm(frame, body, app, d)
+        }
+        Some(Modal::BranchPicker(picker)) => draw_branch_picker(frame, body, app, picker),
+        Some(Modal::Confirm(Confirm::DeployLatest(c))) => draw_latest_confirm(frame, body, app, c),
+        // Drawn in the footer.
+        Some(Modal::Confirm(Confirm::Discard { .. }))
+        | Some(Modal::VarInput(_))
+        | Some(Modal::Command(_))
+        | Some(Modal::Filter(_))
+        | None => {}
     }
 }
 
@@ -115,12 +115,21 @@ fn hints(app: &App) -> &'static str {
     }
 }
 
-type Freshness<'a> = (bool, Option<Instant>, Option<&'a str>);
+/// What the freshness indicator shows of a load.
+struct Freshness<'a> {
+    loading: bool,
+    fetched_at: Option<Instant>,
+    error: Option<&'a str>,
+}
 
 /// The load that backs the current view, for the freshness indicator.
 fn freshness_source(app: &App) -> Option<Freshness<'_>> {
     fn of<T>(l: &Loaded<T>) -> Option<Freshness<'_>> {
-        Some((l.loading, l.fetched_at, l.error.as_deref()))
+        Some(Freshness {
+            loading: l.loading,
+            fetched_at: l.fetched_at,
+            error: l.error.as_deref(),
+        })
     }
     match app.stack.last() {
         Some(View::Projects) | None => of(&app.workspaces),
@@ -165,7 +174,12 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
     ]);
 
     let mut spans: Vec<Span> = Vec::new();
-    if let Some((loading, fetched_at, error)) = freshness_source(app) {
+    if let Some(Freshness {
+        loading,
+        fetched_at,
+        error,
+    }) = freshness_source(app)
+    {
         let age = fetched_at.map(|at| now.saturating_duration_since(at).as_secs());
         let red = Style::new().fg(t.bad);
         match (error, age, loading) {
@@ -207,33 +221,36 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let t = app.theme();
-    if let Some(Confirm::Discard { env_id, service_id }) = &app.confirm {
-        let sp = app.pending.service(env_id, service_id);
-        let service = sp.map_or(service_id.as_str(), |s| s.service_name.as_str());
-        let env = sp.map_or(env_id.as_str(), |s| s.env_name.as_str());
-        let line = format!(
-            "Discard pending changes for {} in {}? (y/n)",
-            clean(service),
-            clean(env)
-        );
-        frame.render_widget(Paragraph::new(line).style(Style::new().fg(t.busy)), area);
-        return;
-    }
-    if let Some(input) = &app.var_input {
-        let line = match &input.name {
-            None => format!("name: {}▏", clean(&input.text)),
-            Some(name) => format!("{} = {}▏", clean(name), clean(&input.text)),
-        };
-        frame.render_widget(Paragraph::new(line), area);
-        return;
-    }
-    if let Some(text) = &app.command_line {
-        frame.render_widget(Paragraph::new(format!(":{}▏", clean(text))), area);
-        return;
-    }
-    if let Some(text) = &app.filter_input {
-        frame.render_widget(Paragraph::new(format!("/{}▏", clean(text))), area);
-        return;
+    match &app.modal {
+        Some(Modal::Confirm(Confirm::Discard { env_id, service_id })) => {
+            let sp = app.pending.service(env_id, service_id);
+            let service = sp.map_or(service_id.as_str(), |s| s.service_name.as_str());
+            let env = sp.map_or(env_id.as_str(), |s| s.env_name.as_str());
+            let line = format!(
+                "Discard pending changes for {} in {}? (y/n)",
+                clean(service),
+                clean(env)
+            );
+            frame.render_widget(Paragraph::new(line).style(Style::new().fg(t.busy)), area);
+            return;
+        }
+        Some(Modal::VarInput(input)) => {
+            let line = match &input.name {
+                None => format!("name: {}▏", clean(input.text.expose())),
+                Some(name) => format!("{} = {}▏", clean(name), clean(input.text.expose())),
+            };
+            frame.render_widget(Paragraph::new(line), area);
+            return;
+        }
+        Some(Modal::Command(text)) => {
+            frame.render_widget(Paragraph::new(format!(":{}▏", clean(text))), area);
+            return;
+        }
+        Some(Modal::Filter(text)) => {
+            frame.render_widget(Paragraph::new(format!("/{}▏", clean(text))), area);
+            return;
+        }
+        _ => {}
     }
     let mut crumbs = vec!["projects".to_string()];
     for view in app.stack.iter().skip(1) {
@@ -366,11 +383,7 @@ fn draw_latest_confirm(frame: &mut Frame, area: Rect, app: &App, c: &LatestConfi
     let unknown = || "unknown".to_string();
     let now = match &c.current {
         Some(d) => {
-            let sha = d
-                .commit_sha
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map_or("-".into(), |s| s.chars().take(7).collect::<String>());
+            let sha = tables::short_sha(d);
             let msg = d.commit_message.as_deref().unwrap_or_default();
             let msg = msg.lines().next().unwrap_or_default();
             format!("{sha}  {}", clean(msg))

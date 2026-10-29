@@ -1,5 +1,6 @@
 //! Rate budget: tracks Railway's hourly API quota and derives a polling backstop.
 
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use reqwest::header::HeaderMap;
@@ -81,6 +82,30 @@ impl RateBudget {
     }
 }
 
+/// One `RateBudget` shared by the API client and the worker. Its state is plain
+/// counters, so a lock poisoned by a panic elsewhere is recovered, not spread.
+#[derive(Debug, Clone)]
+pub struct SharedBudget(Arc<Mutex<RateBudget>>);
+
+impl SharedBudget {
+    pub fn new(budget: RateBudget) -> Self {
+        Self(Arc::new(Mutex::new(budget)))
+    }
+
+    pub fn lock(&self) -> MutexGuard<'_, RateBudget> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Time left on a rate-limit block at `now`, rounded up to whole seconds.
+    pub fn blocked_for(&self, now: Instant) -> Option<Duration> {
+        let until = self.lock().blocked_until()?;
+        let left = until.checked_duration_since(now).filter(|d| !d.is_zero())?;
+        Some(Duration::from_secs(
+            left.as_secs() + u64::from(left.subsec_nanos() > 0),
+        ))
+    }
+}
+
 /// The seconds form of `Retry-After`; an HTTP-date is ignored.
 pub fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     header_str(headers, "retry-after")
@@ -134,6 +159,27 @@ mod tests {
             );
         }
         h
+    }
+
+    #[test]
+    fn shared_budget_rounds_a_block_up_and_survives_a_poisoned_lock() {
+        let budget = SharedBudget::new(RateBudget::new(None));
+        let now = Instant::now();
+        assert_eq!(budget.blocked_for(now), None);
+        budget
+            .lock()
+            .on_rate_limited(Some(Duration::from_secs(30)), now);
+        let later = now + Duration::from_millis(500);
+        assert_eq!(budget.blocked_for(later), Some(Duration::from_secs(30)));
+        assert_eq!(budget.blocked_for(now + Duration::from_secs(30)), None);
+
+        let held = budget.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = held.lock();
+            panic!("poison the lock");
+        })
+        .join();
+        assert!(budget.blocked_for(later).is_some());
     }
 
     #[test]

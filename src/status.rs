@@ -52,10 +52,10 @@ pub fn derive_row(svc: &ServiceInstance) -> RowStatus {
                     if prev_running {
                         (
                             Health::FailedButServing,
-                            format!("{} (prev running)", latest.status.label()),
+                            format!("{} (prev running)", latest.status),
                         )
                     } else {
-                        (Health::Failing, latest.status.label())
+                        (Health::Failing, latest.status.to_string())
                     }
                 }
                 D::Building
@@ -63,9 +63,9 @@ pub fn derive_row(svc: &ServiceInstance) -> RowStatus {
                 | D::Queued
                 | D::Waiting
                 | D::Initializing
-                | D::NeedsApproval => (Health::Progressing, latest.status.label()),
+                | D::NeedsApproval => (Health::Progressing, latest.status.to_string()),
                 D::Removed | D::Removing | D::Skipped | D::Sleeping | D::Unknown(_) => {
-                    (Health::Inactive, latest.status.label())
+                    (Health::Inactive, latest.status.to_string())
                 }
                 D::Success if ready < desired => (Health::Degraded, "DEGRADED".to_string()),
                 D::Success => (Health::Healthy, "SUCCESS".to_string()),
@@ -96,16 +96,28 @@ pub fn box_colour(s: &InstanceStatus) -> BoxColour {
         I::Running => BoxColour::Green,
         I::Crashed | I::Exited => BoxColour::Red,
         I::Created | I::Initializing | I::Restarting => BoxColour::Yellow,
-        _ => BoxColour::Grey,
+        I::Removed | I::Removing | I::Skipped | I::Stopped | I::Unknown(_) => BoxColour::Grey,
     }
 }
 
 /// Railway uses CRASHED for runtime failures and FAILED for build or
 /// healthcheck failures, so Failed and Building default to the build log.
 pub fn default_log_kind(d: &DeploymentSummary) -> LogKind {
+    use DeploymentStatus as D;
     match d.status {
-        DeploymentStatus::Failed | DeploymentStatus::Building => LogKind::Build,
-        _ => LogKind::Runtime,
+        D::Failed | D::Building => LogKind::Build,
+        D::Crashed
+        | D::Deploying
+        | D::Initializing
+        | D::NeedsApproval
+        | D::Queued
+        | D::Removed
+        | D::Removing
+        | D::Skipped
+        | D::Sleeping
+        | D::Success
+        | D::Waiting
+        | D::Unknown(_) => LogKind::Runtime,
     }
 }
 
@@ -115,22 +127,22 @@ pub enum RowTag {
     Active,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeploymentRow {
-    pub deployment: DeploymentSummary,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeploymentRow<'a> {
+    pub deployment: &'a DeploymentSummary,
     pub tag: Option<RowTag>,
 }
 
 /// Latest first (if not also active), then active, then the rest of history
 /// in its original order, with no duplicate ids.
-pub fn deployment_rows(svc: &ServiceInstance, history: &[DeploymentSummary]) -> Vec<DeploymentRow> {
+pub fn deployment_rows<'a>(
+    svc: &'a ServiceInstance,
+    history: &'a [DeploymentSummary],
+) -> Vec<DeploymentRow<'a>> {
     let mut rows: Vec<DeploymentRow> = Vec::new();
-    let mut push = |d: &DeploymentSummary, tag: Option<RowTag>| {
-        if !rows.iter().any(|r| r.deployment.id == d.id) {
-            rows.push(DeploymentRow {
-                deployment: d.clone(),
-                tag,
-            });
+    let mut push = |deployment: &'a DeploymentSummary, tag: Option<RowTag>| {
+        if !rows.iter().any(|r| r.deployment.id == deployment.id) {
+            rows.push(DeploymentRow { deployment, tag });
         }
     };
     if let Some(latest) = &svc.latest {
@@ -255,11 +267,34 @@ mod tests {
         let d2 = deploy("d2", D::Success, &[I::Running]);
         let d3 = deploy("d3", D::Failed, &[]);
         let s = svc(1, Some(d3.clone()), vec![d2.clone()]);
-        let rows = deployment_rows(&s, &[d3, d2, d1]);
+        let history = [d3, d2, d1];
+        let rows = deployment_rows(&s, &history);
         let ids: Vec<_> = rows.iter().map(|r| r.deployment.id.as_str()).collect();
         let tags: Vec<_> = rows.iter().map(|r| r.tag).collect();
         assert_eq!(ids, ["d3", "d2", "d1"]);
         assert_eq!(tags, [Some(RowTag::Latest), Some(RowTag::Active), None]);
+    }
+
+    #[test]
+    fn instance_status_shows_its_api_spelling() {
+        let known = [
+            I::Crashed,
+            I::Created,
+            I::Exited,
+            I::Initializing,
+            I::Removed,
+            I::Removing,
+            I::Restarting,
+            I::Running,
+            I::Skipped,
+            I::Stopped,
+        ];
+        for s in known {
+            // What the Instances view showed before it had a label.
+            assert_eq!(s.to_string(), format!("{s:?}").to_uppercase());
+            assert_eq!(I::from_api(&s.to_string()), s);
+        }
+        assert_eq!(I::from_api("WEIRD").to_string(), "UNKNOWN(WEIRD)");
     }
 
     #[test]

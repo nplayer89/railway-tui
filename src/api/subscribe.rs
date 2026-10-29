@@ -68,17 +68,15 @@ mod ops {
 /// Keepalive: after 15s of silence a ping is sent, and again 15s later; if
 /// nothing at all has arrived 30s after the first unanswered ping, the
 /// connection is closed.
-pub async fn connect(ws: &Url, token: &str) -> Result<Client, ApiError> {
-    tokio::time::timeout(CONNECT_TIMEOUT, open(ws, token))
+///
+/// `http` must be HTTP/1.1 only, as [`Api::ws_http`](super::Api::ws_http) is.
+pub async fn connect(http: &reqwest::Client, ws: &Url, token: &str) -> Result<Client, ApiError> {
+    tokio::time::timeout(CONNECT_TIMEOUT, open(http, ws, token))
         .await
         .map_err(|_| ApiError::Network("timed out connecting to the Railway websocket".into()))?
 }
 
-async fn open(ws: &Url, token: &str) -> Result<Client, ApiError> {
-    let http = reqwest::Client::builder()
-        .http1_only()
-        .build()
-        .map_err(|e| ApiError::Network(e.to_string()))?;
+async fn open(http: &reqwest::Client, ws: &Url, token: &str) -> Result<Client, ApiError> {
     let resp = http
         .get(ws.clone())
         .timeout(UPGRADE_TIMEOUT)
@@ -87,7 +85,7 @@ async fn open(ws: &Url, token: &str) -> Result<Client, ApiError> {
         .protocols(["graphql-transport-ws"])
         .send()
         .await
-        .map_err(|e| ApiError::Network(e.to_string()))?;
+        .map_err(|e| ApiError::Network(e.into()))?;
     let status = resp.status();
     if status == StatusCode::UNAUTHORIZED {
         return Err(ApiError::Auth(AuthError::Rejected));
@@ -98,7 +96,7 @@ async fn open(ws: &Url, token: &str) -> Result<Client, ApiError> {
     let socket = resp
         .into_websocket()
         .await
-        .map_err(|e| ApiError::Network(e.to_string()))?;
+        .map_err(|e| ApiError::Network(e.into()))?;
     handshake(Socket(socket), KEEPALIVE_INTERVAL).await
 }
 
@@ -120,14 +118,18 @@ where
 
 /// Connects with a token from `tokens`; if the upgrade is refused, asks the
 /// token source for a fresh one and tries once more (as `Api` does for queries).
-pub async fn connect_authed(ws: &Url, tokens: &Arc<dyn TokenSource>) -> Result<Client, ApiError> {
+pub async fn connect_authed(
+    http: &reqwest::Client,
+    ws: &Url,
+    tokens: &Arc<dyn TokenSource>,
+) -> Result<Client, ApiError> {
     let token = blocking_token(tokens, |t| t.token()).await?;
-    match connect(ws, &token).await {
+    match connect(http, ws, &token).await {
         Err(ApiError::Auth(AuthError::Rejected)) => {}
         other => return other,
     }
     let token = blocking_token(tokens, move |t| t.refresh_after_rejection_of(&token)).await?;
-    connect(ws, &token).await
+    connect(http, ws, &token).await
 }
 
 /// Live status of one deployment.
@@ -252,8 +254,8 @@ where
 
 fn ws_error(e: graphql_ws_client::Error) -> ApiError {
     match e {
-        graphql_ws_client::Error::Decode(msg) => ApiError::Decode(msg),
-        other => ApiError::Network(other.to_string()),
+        graphql_ws_client::Error::Decode(msg) => ApiError::Decode(msg.into()),
+        other => ApiError::Network(other.into()),
     }
 }
 

@@ -1,13 +1,13 @@
 //! HTTP API client tests against a wiremock server (never the live API).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use railway_tui::api::write::WriteError;
 use railway_tui::api::{Api, ApiError};
 use railway_tui::auth::{AuthError, TokenSource};
-use railway_tui::budget::{LimitSource, RateBudget};
+use railway_tui::budget::{LimitSource, RateBudget, SharedBudget};
 use railway_tui::model::{DeploymentStatus, Instance, InstanceStatus, Variables};
 use serde_json::json;
 use url::Url;
@@ -46,11 +46,7 @@ impl TokenSource for FakeTokens {
 
 fn api_for(server: &MockServer, tokens: Arc<FakeTokens>) -> Api {
     let endpoint = Url::parse(&format!("{}/graphql/v2", server.uri())).unwrap();
-    Api::new(
-        endpoint,
-        tokens,
-        Arc::new(Mutex::new(RateBudget::new(None))),
-    )
+    Api::new(endpoint, tokens, SharedBudget::new(RateBudget::new(None))).unwrap()
 }
 
 fn instances_body(latest_status: &str) -> serde_json::Value {
@@ -249,7 +245,7 @@ async fn http_429_is_rate_limited_with_retry_after() {
         ApiError::RateLimited { retry_after } => assert_eq!(retry_after, Duration::from_secs(30)),
         other => panic!("expected RateLimited, got {other:?}"),
     }
-    assert!(api.budget().lock().unwrap().blocked_until().is_some());
+    assert!(api.budget().lock().blocked_until().is_some());
 }
 
 #[tokio::test]
@@ -267,7 +263,7 @@ async fn http_429_without_retry_after_defaults_to_60s() {
         matches!(err, ApiError::RateLimited { retry_after } if retry_after == Duration::from_secs(60)),
         "{err:?}"
     );
-    assert!(api.budget().lock().unwrap().blocked_until().is_some());
+    assert!(api.budget().lock().blocked_until().is_some());
 }
 
 #[tokio::test]
@@ -303,7 +299,7 @@ async fn policy_header_updates_budget() {
     api.service_instances("proj1", "env1").await.unwrap();
 
     assert_eq!(
-        api.budget().lock().unwrap().hourly_limit(),
+        api.budget().lock().hourly_limit(),
         (1000, LimitSource::Detected)
     );
 }
@@ -552,9 +548,10 @@ fn write_api(server: &MockServer, tokens: Arc<FakeTokens>, timeout: Duration) ->
     Api::with_timeout(
         endpoint,
         tokens,
-        Arc::new(Mutex::new(RateBudget::new(None))),
+        SharedBudget::new(RateBudget::new(None)),
         timeout,
     )
+    .unwrap()
 }
 
 fn ok_body(field: &str) -> serde_json::Value {
@@ -795,7 +792,7 @@ async fn write_429_is_refused_and_blocks_the_budget() {
         matches!(err, WriteError::Refused(ApiError::RateLimited { .. })),
         "{err:?}"
     );
-    assert!(api.budget().lock().unwrap().blocked_until().is_some());
+    assert!(api.budget().lock().blocked_until().is_some());
 }
 
 #[tokio::test]
@@ -813,7 +810,6 @@ async fn write_is_refused_without_sending_while_budget_blocked() {
     );
     api.budget()
         .lock()
-        .unwrap()
         .on_rate_limited(Some(Duration::from_secs(60)), std::time::Instant::now());
 
     let err = api.redeploy_service("e1", "s1").await.unwrap_err();
@@ -836,9 +832,10 @@ async fn write_connect_failure_is_refused() {
     let api = Api::with_timeout(
         endpoint,
         FakeTokens::new("tok", "tok2"),
-        Arc::new(Mutex::new(RateBudget::new(None))),
+        SharedBudget::new(RateBudget::new(None)),
         Duration::from_secs(5),
-    );
+    )
+    .unwrap();
 
     let err = api.redeploy_service("e1", "s1").await.unwrap_err();
 

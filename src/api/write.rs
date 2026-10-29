@@ -12,7 +12,7 @@ use graphql_client::GraphQLQuery;
 
 use super::{Api, ApiError, Attempt};
 use crate::auth::AuthError;
-use crate::model::Variables;
+use crate::model::{Variables, WriteFailure};
 
 mod ops {
     use graphql_client::GraphQLQuery;
@@ -64,6 +64,16 @@ pub enum WriteError {
     /// Sent, but the outcome is unknown (timeout, connection lost, 5xx, undecodable reply).
     #[error("Railway may or may not have applied the change: {0}")]
     Unknown(ApiError),
+}
+
+impl WriteError {
+    /// Railway's own error, and whether the write may have been applied anyway.
+    pub fn into_parts(self) -> (ApiError, WriteFailure) {
+        match self {
+            WriteError::Refused(e) => (e, WriteFailure::Refused),
+            WriteError::Unknown(e) => (e, WriteFailure::Unknown),
+        }
+    }
 }
 
 impl Api {
@@ -170,14 +180,7 @@ impl Api {
         &self,
         variables: Q::Variables,
     ) -> Result<Q::ResponseData, WriteError> {
-        let blocked_for = {
-            let budget = self.budget.lock().unwrap_or_else(|e| e.into_inner());
-            budget
-                .blocked_until()
-                .and_then(|until| until.checked_duration_since(Instant::now()))
-                .filter(|d| !d.is_zero())
-        };
-        if let Some(retry_after) = blocked_for {
+        if let Some(retry_after) = self.budget.blocked_for(Instant::now()) {
             return Err(WriteError::Refused(ApiError::RateLimited { retry_after }));
         }
 
@@ -212,7 +215,7 @@ fn classify(e: ApiError) -> WriteError {
         ApiError::Http(_) | ApiError::Network(_) => WriteError::Unknown(e),
         // A decoder message can quote the reply; keep it out of the error.
         ApiError::Decode(_) => {
-            WriteError::Unknown(ApiError::Decode("unreadable reply to a write".to_string()))
+            WriteError::Unknown(ApiError::Decode("unreadable reply to a write".into()))
         }
     }
 }
@@ -224,7 +227,28 @@ fn applied(ok: bool) -> Result<(), WriteError> {
         Ok(())
     } else {
         Err(WriteError::Unknown(ApiError::Decode(
-            "Railway answered false".to_string(),
+            "Railway answered false".into(),
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_decode_error_on_a_write_keeps_no_trace_of_the_reply() {
+        let quoted = serde_json::from_str::<u32>("\"s3cret-value\"").unwrap_err();
+        assert!(quoted.to_string().contains("s3cret-value"), "{quoted}");
+        let err = classify(ApiError::Decode(quoted.into()));
+        let mut shown = vec![err.to_string(), format!("{err:?}")];
+        let mut source = std::error::Error::source(&err);
+        while let Some(e) = source {
+            shown.push(e.to_string());
+            source = e.source();
+        }
+        for text in shown {
+            assert!(!text.contains("s3cret-value"), "{text}");
+        }
     }
 }

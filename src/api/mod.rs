@@ -1,7 +1,7 @@
 //! Railway's public GraphQL API over HTTP. Reads live here; the only writes
 //! (five allowlisted mutations) live in [`write`].
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -11,7 +11,7 @@ use serde::Serialize;
 use url::Url;
 
 use crate::auth::{AuthError, TokenSource};
-use crate::budget::{parse_retry_after, RateBudget};
+use crate::budget::{parse_retry_after, SharedBudget};
 use crate::model::{
     DeploymentStatus, DeploymentSummary, Environment, Instance, InstanceStatus, LogLine,
     ProjectRef, ServiceInstance, Trigger, Variables, Workspace,
@@ -113,10 +113,14 @@ mod ops {
     pub struct DeploymentTriggers;
 }
 
+/// The underlying cause of a network or decode error, kept for its source
+/// chain; a plain message converts with `.into()`.
+pub type Cause = Box<dyn std::error::Error + Send + Sync>;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("{0}")]
-    Auth(AuthError),
+    Auth(#[from] AuthError),
     #[error("Railway API rate limit reached; retry in {}s", retry_after.as_secs())]
     RateLimited { retry_after: Duration },
     #[error("Railway API returned HTTP {0}")]
@@ -124,9 +128,10 @@ pub enum ApiError {
     #[error("Railway API error: {}", .0.join("; "))]
     GraphQl(Vec<String>),
     #[error("Network error talking to Railway: {0}")]
-    Network(String),
+    Network(#[source] Cause),
+    /// Can quote the reply; a write's is scrubbed (see `write::classify`).
     #[error("Could not decode Railway API response: {0}")]
-    Decode(String),
+    Decode(#[source] Cause),
 }
 
 /// The build snapshot of a deployment; it never changes once it exists.
@@ -146,17 +151,20 @@ pub(crate) enum Attempt {
 
 pub struct Api {
     http: reqwest::Client,
+    /// HTTP/1.1 only, for websocket upgrades; shared by every connection.
+    ws_http: reqwest::Client,
     endpoint: Url,
     tokens: Arc<dyn TokenSource>,
-    budget: Arc<Mutex<RateBudget>>,
+    budget: SharedBudget,
 }
 
 impl Api {
+    /// Fails only if the TLS backend cannot be set up.
     pub fn new(
         endpoint: Url,
         tokens: Arc<dyn TokenSource>,
-        budget: Arc<Mutex<RateBudget>>,
-    ) -> Self {
+        budget: SharedBudget,
+    ) -> Result<Self, reqwest::Error> {
         Self::with_timeout(endpoint, tokens, budget, REQUEST_TIMEOUT)
     }
 
@@ -165,23 +173,27 @@ impl Api {
     pub fn with_timeout(
         endpoint: Url,
         tokens: Arc<dyn TokenSource>,
-        budget: Arc<Mutex<RateBudget>>,
+        budget: SharedBudget,
         timeout: Duration,
-    ) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .expect("reqwest client with a timeout builds");
-        Self {
+    ) -> Result<Self, reqwest::Error> {
+        let http = reqwest::Client::builder().timeout(timeout).build()?;
+        let ws_http = reqwest::Client::builder().http1_only().build()?;
+        Ok(Self {
             http,
+            ws_http,
             endpoint,
             tokens,
             budget,
-        }
+        })
     }
 
-    pub fn budget(&self) -> Arc<Mutex<RateBudget>> {
+    pub fn budget(&self) -> SharedBudget {
         self.budget.clone()
+    }
+
+    /// The client websocket upgrades go through (see [`subscribe::connect`]).
+    pub fn ws_http(&self) -> &reqwest::Client {
+        &self.ws_http
     }
 
     /// The user's own workspaces plus any external workspaces they can see.
@@ -269,7 +281,9 @@ impl Api {
     /// as such and never makes the token refresh.
     pub async fn branches(&self, repo: &str) -> Result<Vec<String>, ApiError> {
         let Some((owner, name)) = repo.split_once('/') else {
-            return Err(ApiError::Decode(format!("not an owner/name repo: {repo}")));
+            return Err(ApiError::Decode(
+                format!("not an owner/name repo: {repo}").into(),
+            ));
         };
         let data = self
             .query_once::<ops::GitHubRepoBranches>(ops::git_hub_repo_branches::Variables {
@@ -551,8 +565,9 @@ impl Api {
             .send()
             .await
             .map_err(|e| {
-                let err = ApiError::Network(e.to_string());
-                if e.is_connect() {
+                let unsent = e.is_connect();
+                let err = ApiError::Network(e.into());
+                if unsent {
                     Attempt::Unsent(err)
                 } else {
                     Attempt::Failed(err)
@@ -560,7 +575,7 @@ impl Api {
             })?;
         let status = resp.status();
         {
-            let mut budget = self.budget.lock().unwrap_or_else(|e| e.into_inner());
+            let mut budget = self.budget.lock();
             let now = Instant::now();
             budget.observe(resp.headers(), now);
             if status == StatusCode::TOO_MANY_REQUESTS {
@@ -579,9 +594,9 @@ impl Api {
         let bytes = resp
             .bytes()
             .await
-            .map_err(|e| Attempt::Failed(ApiError::Network(e.to_string())))?;
+            .map_err(|e| Attempt::Failed(ApiError::Network(e.into())))?;
         let parsed: graphql_client::Response<Q::ResponseData> = serde_json::from_slice(&bytes)
-            .map_err(|e| Attempt::Failed(ApiError::Decode(e.to_string())))?;
+            .map_err(|e| Attempt::Failed(ApiError::Decode(e.into())))?;
         if let Some(errors) = parsed.errors.filter(|e| !e.is_empty()) {
             if errors.iter().any(|e| e.message.contains("Not Authorized")) {
                 return Err(Attempt::Rejected);
@@ -602,10 +617,10 @@ where
     F: FnOnce(&dyn TokenSource) -> Result<String, AuthError> + Send + 'static,
 {
     let tokens = tokens.clone();
-    tokio::task::spawn_blocking(move || f(tokens.as_ref()))
+    let token = tokio::task::spawn_blocking(move || f(tokens.as_ref()))
         .await
-        .map_err(|e| ApiError::Auth(AuthError::Io(e.to_string())))?
-        .map_err(ApiError::Auth)
+        .map_err(AuthError::Task)??;
+    Ok(token)
 }
 
 /// Scopes `environmentLogs` to one build, as the CLI and dashboard do.
@@ -667,7 +682,7 @@ fn log_line(
     attributes: impl Iterator<Item = (String, String)>,
 ) -> Result<LogLine, ApiError> {
     let timestamp = DateTime::parse_from_rfc3339(timestamp)
-        .map_err(|e| ApiError::Decode(format!("log timestamp {timestamp:?}: {e}")))?
+        .map_err(|e| ApiError::Decode(format!("log timestamp {timestamp:?}: {e}").into()))?
         .with_timezone(&Utc);
     Ok(LogLine {
         timestamp,

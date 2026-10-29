@@ -24,8 +24,26 @@ pub enum AuthError {
     RefreshFailed(String),
     #[error("Railway rejected the API token. Check RAILWAY_API_TOKEN, or run `railway login`.")]
     Rejected,
+    /// Running `railway whoami` failed.
     #[error("Auth I/O error: {0}")]
-    Io(String),
+    Cli(#[source] std::io::Error),
+    #[error("Auth I/O error: {}: {source}", path.display())]
+    ReadConfig {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Auth I/O error: {}: {source}", path.display())]
+    ParseConfig {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("Auth I/O error: cannot determine home directory")]
+    NoHome,
+    /// The blocking task asking the token source panicked or was cancelled.
+    #[error("Auth I/O error: {0}")]
+    Task(#[from] tokio::task::JoinError),
 }
 
 pub trait TokenSource: Send + Sync {
@@ -65,7 +83,7 @@ impl CliRunner for RealCliRunner {
             .spawn()
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => AuthError::CliMissing,
-                _ => AuthError::Io(e.to_string()),
+                _ => AuthError::Cli(e),
             })?;
         let start = Instant::now();
         loop {
@@ -84,7 +102,7 @@ impl CliRunner for RealCliRunner {
                     ));
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                Err(e) => return Err(AuthError::Io(e.to_string())),
+                Err(e) => return Err(AuthError::Cli(e)),
             }
         }
     }
@@ -136,15 +154,18 @@ impl<R: CliRunner> CliTokenSource<R> {
         let bytes = match std::fs::read(&self.config_path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(self.not_logged_in()),
-            Err(e) => {
-                return Err(AuthError::Io(format!(
-                    "{}: {e}",
-                    self.config_path.display()
-                )))
+            Err(source) => {
+                return Err(AuthError::ReadConfig {
+                    path: self.config_path.clone(),
+                    source,
+                })
             }
         };
-        let file: ConfigFile = serde_json::from_slice(&bytes)
-            .map_err(|e| AuthError::Io(format!("{}: {e}", self.config_path.display())))?;
+        let file: ConfigFile =
+            serde_json::from_slice(&bytes).map_err(|source| AuthError::ParseConfig {
+                path: self.config_path.clone(),
+                source,
+            })?;
         let user = file.user.ok_or_else(|| self.not_logged_in())?;
         let non_empty = |s: Option<String>| s.filter(|s| !s.is_empty());
         if let Some(token) = non_empty(user.access_token) {
@@ -177,7 +198,7 @@ impl<R: CliRunner> CliTokenSource<R> {
         self.runner.run_whoami()?;
         // The CLI may have been mid-write; retry a failed read once.
         let creds = match self.read_creds() {
-            Err(AuthError::Io(_)) => {
+            Err(AuthError::ReadConfig { .. } | AuthError::ParseConfig { .. }) => {
                 std::thread::sleep(Duration::from_millis(100));
                 self.read_creds()?
             }
@@ -241,8 +262,7 @@ pub fn token_source_from_env() -> Result<Arc<dyn TokenSource>, AuthError> {
             return Ok(Arc::new(EnvTokenSource(token)));
         }
     }
-    let home =
-        dirs::home_dir().ok_or_else(|| AuthError::Io("cannot determine home directory".into()))?;
+    let home = dirs::home_dir().ok_or(AuthError::NoHome)?;
     let railway_env = std::env::var("RAILWAY_ENV").ok();
     let path = cli_config_path(railway_env.as_deref(), &home);
     let now = Box::new(|| {

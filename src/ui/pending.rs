@@ -32,11 +32,11 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, view: &PendingView) {
     let mut span = (0, 0);
     let mut last_env: Option<&str> = None;
     for (i, g) in groups.iter().enumerate() {
-        let Some(sp) = app.pending.service(&g.env_id, &g.service_id) else {
+        let Some(sp) = app.pending.service(&g.key.env_id, &g.key.service_id) else {
             continue;
         };
-        if last_env != Some(g.env_id.as_str()) {
-            last_env = Some(g.env_id.as_str());
+        if last_env != Some(g.key.env_id.as_str()) {
+            last_env = Some(g.key.env_id.as_str());
             let colour = if is_production(&sp.env_name) {
                 t.bad
             } else {

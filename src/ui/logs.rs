@@ -1,5 +1,7 @@
 //! The log view: title, stream/follow badges and the visible window of lines.
 
+use std::fmt::Write as _;
+
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -32,10 +34,10 @@ pub fn draw(frame: &mut Frame, area: Rect, logs: &LogsView, building: Option<&st
         kind
     );
     if let Some(replica) = &logs.replica {
-        text.push_str(&format!(" · replica {}", clean(replica)));
+        let _ = write!(text, " · replica {}", clean(replica));
     }
     if let Some(filter) = logs.filter.as_deref().filter(|f| !f.is_empty()) {
-        text.push_str(&format!(" · filter: {}", clean(filter)));
+        let _ = write!(text, " · filter: {}", clean(filter));
     }
     frame.render_widget(
         Paragraph::new(Span::styled(

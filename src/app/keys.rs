@@ -5,7 +5,10 @@ use std::time::Instant;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use super::{App, Command, Confirm, Kind, LogsView, Orphan, PendingGroup, VarInput, View};
+use super::{
+    position, App, Command, Confirm, Kind, LogsView, Modal, Orphan, PendingGroup, Secret, VarInput,
+    View,
+};
 use crate::model::LogKind;
 use crate::pending::{Change, Pending, Target};
 use crate::status::default_log_kind;
@@ -31,41 +34,43 @@ impl App {
                 self.force_quit_armed = true;
                 self.message = Some(DEPLOY_IN_PROGRESS.into());
             }
-        } else if self.confirm.is_some() {
-            self.confirm_key(key.code, out);
-        } else if self.var_input.is_some() {
-            self.var_input_key(key, out);
-        } else if self.command_line.is_some() {
-            self.command_key(key, now, out);
-        } else if self.filter_input.is_some() {
-            self.filter_key(key);
-        } else if self.branch_picker.is_some() {
-            self.branch_picker_key(key);
-        } else if self.env_picker.is_some() {
-            self.picker_key(key.code, now, out);
-        } else if self.theme_picker.is_some() {
-            self.theme_key(key.code, out);
-        } else if ctrl {
-            if key.code == KeyCode::Char('r') {
-                self.reload_current(now, out);
+            return;
+        }
+        match self.modal {
+            Some(Modal::Confirm(_)) => self.confirm_key(key.code, out),
+            Some(Modal::VarInput(_)) => self.var_input_key(key, out),
+            Some(Modal::Command(_)) => self.command_key(key, now, out),
+            Some(Modal::Filter(_)) => self.filter_key(key),
+            Some(Modal::BranchPicker(_)) => self.branch_picker_key(key),
+            Some(Modal::EnvPicker(_)) => self.picker_key(key.code, now, out),
+            Some(Modal::ThemePicker { .. }) => self.theme_key(key.code, out),
+            None if ctrl => {
+                if key.code == KeyCode::Char('r') {
+                    self.reload_current(now, out);
+                }
             }
-        } else {
-            match key.code {
+            None => match key.code {
                 KeyCode::Char('q') => self.quit(out),
-                KeyCode::Char(':') => self.command_line = Some(String::new()),
+                KeyCode::Char(':') => self.modal = Some(Modal::Command(String::new())),
                 KeyCode::Char('/') => {
                     let current = match self.logs_mut() {
                         Some(logs) => logs.filter.clone(),
                         None => self.table_filter.clone(),
                     };
-                    self.filter_input = Some(current.unwrap_or_default());
+                    self.modal = Some(Modal::Filter(current.unwrap_or_default()));
                 }
                 KeyCode::Char('?') => self.help = !self.help,
-                KeyCode::Char('t') => self.theme_picker = Some(self.theme),
+                KeyCode::Char('t') => self.open_theme_picker(),
                 KeyCode::Esc if self.help => self.help = false,
                 code => self.view_key(code, now, out),
-            }
+            },
         }
+    }
+
+    fn open_theme_picker(&mut self) {
+        self.modal = Some(Modal::ThemePicker {
+            restore: self.theme,
+        });
     }
 
     /// `q` and `:q`: refused while a deploy is in flight (Ctrl-C twice forces it).
@@ -78,16 +83,16 @@ impl App {
     }
 
     fn command_key(&mut self, key: KeyEvent, now: Instant, out: &mut Vec<Command>) {
-        let Some(text) = self.command_line.as_mut() else {
+        let Some(Modal::Command(text)) = &mut self.modal else {
             return;
         };
         match key.code {
             KeyCode::Enter => {
                 let text = std::mem::take(text);
-                self.command_line = None;
+                self.modal = None;
                 self.run_command(&text, now, out);
             }
-            KeyCode::Esc => self.command_line = None,
+            KeyCode::Esc => self.modal = None,
             _ => edit_text(text, key),
         }
     }
@@ -125,45 +130,51 @@ impl App {
                     self.open_pending(out);
                 }
             }
-            "theme" => self.theme_picker = Some(self.theme),
+            "theme" => self.open_theme_picker(),
             "" => {}
             other => self.message = Some(format!("unknown command: {other}")),
         }
     }
 
     fn filter_key(&mut self, key: KeyEvent) {
-        let Some(text) = self.filter_input.as_mut() else {
+        let Some(Modal::Filter(text)) = &mut self.modal else {
             return;
         };
         match key.code {
             KeyCode::Enter => {
                 let text = std::mem::take(text);
-                self.filter_input = None;
+                self.modal = None;
                 let filter = (!text.is_empty()).then_some(text);
                 match self.logs_mut() {
                     Some(logs) => logs.filter = filter,
                     None => self.table_filter = filter,
                 }
             }
-            KeyCode::Esc => self.filter_input = None,
+            KeyCode::Esc => self.modal = None,
             _ => edit_text(text, key),
         }
     }
 
     fn picker_key(&mut self, code: KeyCode, now: Instant, out: &mut Vec<Command>) {
-        let (Some(index), Some(envs)) = (self.env_picker, self.environments.value.as_ref()) else {
-            self.env_picker = None;
+        let Some(Modal::EnvPicker(index)) = self.modal else {
+            return;
+        };
+        let Some(envs) = self.environments.value.as_ref() else {
+            self.modal = None;
             return;
         };
         match code {
             KeyCode::Char('j') | KeyCode::Down => {
-                self.env_picker = Some((index + 1).min(envs.len().saturating_sub(1)));
+                let next = (index + 1).min(envs.len().saturating_sub(1));
+                self.modal = Some(Modal::EnvPicker(next));
             }
-            KeyCode::Char('k') | KeyCode::Up => self.env_picker = Some(index.saturating_sub(1)),
-            KeyCode::Esc => self.env_picker = None,
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.modal = Some(Modal::EnvPicker(index.saturating_sub(1)));
+            }
+            KeyCode::Esc => self.modal = None,
             KeyCode::Enter => {
                 let chosen = envs.get(index).cloned();
-                self.env_picker = None;
+                self.modal = None;
                 if let Some(env) = chosen {
                     if self.env_id() != Some(env.id.as_str()) {
                         if self.kind() == Kind::Services {
@@ -179,7 +190,7 @@ impl App {
 
     /// Moving previews a theme; Enter keeps and saves it, Esc restores the previous one.
     fn theme_key(&mut self, code: KeyCode, out: &mut Vec<Command>) {
-        let Some(original) = self.theme_picker else {
+        let Some(Modal::ThemePicker { restore }) = self.modal else {
             return;
         };
         match code {
@@ -188,11 +199,11 @@ impl App {
             }
             KeyCode::Char('k') | KeyCode::Up => self.theme = self.theme.saturating_sub(1),
             KeyCode::Esc => {
-                self.theme = original;
-                self.theme_picker = None;
+                self.theme = restore;
+                self.modal = None;
             }
             KeyCode::Enter => {
-                self.theme_picker = None;
+                self.modal = None;
                 let id = self.theme().id.to_string();
                 if self.prefs.remembered.theme.as_deref() != Some(id.as_str()) {
                     self.prefs.remembered.theme = Some(id);
@@ -273,12 +284,12 @@ impl App {
 
     /// Typing filters the branches; arrows move, Enter picks, Esc closes.
     fn branch_picker_key(&mut self, key: KeyEvent) {
-        let Some(picker) = self.branch_picker.as_mut() else {
+        let Some(Modal::BranchPicker(picker)) = &mut self.modal else {
             return;
         };
         let last = picker.filtered().len().saturating_sub(1);
         match key.code {
-            KeyCode::Esc => self.branch_picker = None,
+            KeyCode::Esc => self.modal = None,
             KeyCode::Enter => self.pick_branch(),
             KeyCode::Down => picker.index = (picker.index + 1).min(last),
             KeyCode::Up => picker.index = picker.index.saturating_sub(1),
@@ -295,7 +306,7 @@ impl App {
                 let current = envs
                     .iter()
                     .position(|e| Some(e.id.as_str()) == self.env_id());
-                self.env_picker = Some(current.unwrap_or(0));
+                self.modal = Some(Modal::EnvPicker(current.unwrap_or(0)));
             }
             _ => {
                 self.message = Some("environments are not loaded yet".into());
@@ -320,10 +331,10 @@ impl App {
         if code != KeyCode::Enter {
             return false;
         }
-        if let Some(deployment) = self.selected_deployment() {
+        let selected = self.selected_deployment();
+        if let Some((id, kind)) = selected.map(|d| (d.id.clone(), default_log_kind(d))) {
             let name = self.view_service_name(Kind::Deployments);
-            let kind = default_log_kind(&deployment);
-            self.open_logs(deployment.id, name, kind, None, out);
+            self.open_logs(id, name, kind, None, out);
         }
         true
     }
@@ -385,7 +396,7 @@ impl App {
             return true;
         }
         match code {
-            KeyCode::Char('a') => self.var_input = Some(VarInput::default()),
+            KeyCode::Char('a') => self.modal = Some(Modal::VarInput(VarInput::default())),
             KeyCode::Char('e') | KeyCode::Enter => {
                 if let Some(name) = self.selected_var_name() {
                     self.start_inline_edit(name);
@@ -394,7 +405,10 @@ impl App {
             KeyCode::Char('E') => {
                 if let Some(name) = self.selected_var_name() {
                     let initial = self.edit_start_value(&name);
-                    out.push(Command::EditExternal { name, initial });
+                    out.push(Command::EditExternal {
+                        name,
+                        initial: Secret::new(initial),
+                    });
                 }
             }
             KeyCode::Char('d') => {
@@ -436,14 +450,14 @@ impl App {
             }
             KeyCode::Char('x') => {
                 if let Some(g) = self.selected_group() {
-                    if self.is_deploying(&g.env_id, &g.service_id) {
+                    if self.is_deploying(&g.key.env_id, &g.key.service_id) {
                         self.message = Some("cannot discard while it is deploying".into());
                         return true;
                     }
-                    self.confirm = Some(Confirm::Discard {
-                        env_id: g.env_id,
-                        service_id: g.service_id,
-                    });
+                    self.modal = Some(Modal::Confirm(Confirm::Discard {
+                        env_id: g.key.env_id,
+                        service_id: g.key.service_id,
+                    }));
                 }
             }
             KeyCode::Char('D') => match self.selected_group() {
@@ -457,7 +471,7 @@ impl App {
                     };
                     self.message = Some(format!("cannot deploy: the {gone} no longer exists"));
                 }
-                Some(g) => out.extend(self.request_deploy(g.env_id, g.service_id)),
+                Some(g) => out.extend(self.request_deploy(g.key.env_id, g.key.service_id)),
                 None => {}
             },
             _ => return false,
@@ -467,7 +481,7 @@ impl App {
 
     /// `y` answers the question; any other key cancels it.
     fn confirm_key(&mut self, code: KeyCode, out: &mut Vec<Command>) {
-        let Some(confirm) = self.confirm.take() else {
+        let Some(Modal::Confirm(confirm)) = self.modal.take() else {
             return;
         };
         if code != KeyCode::Char('y') {
@@ -475,8 +489,8 @@ impl App {
         }
         match confirm {
             Confirm::Discard { env_id, service_id } => {
-                self.pending.discard(&env_id, &service_id);
-                out.push(Command::SavePending(self.pending.clone()));
+                self.pending_mut().discard(&env_id, &service_id);
+                out.push(self.save_pending());
             }
             Confirm::Deploy(d) => self.start_deploy(d, out),
             Confirm::DeployLatest(c) => self.start_deploy_latest(*c, out),
@@ -485,14 +499,14 @@ impl App {
 
     /// Keys while a variable name or value is being typed.
     fn var_input_key(&mut self, key: KeyEvent, out: &mut Vec<Command>) {
-        let Some(input) = self.var_input.as_mut() else {
+        let Some(Modal::VarInput(input)) = &mut self.modal else {
             return;
         };
         match key.code {
-            KeyCode::Esc => self.var_input = None,
+            KeyCode::Esc => self.modal = None,
             KeyCode::Enter => match input.name.clone() {
                 None => {
-                    let name = input.text.clone();
+                    let name = input.text.expose().clone();
                     if !valid_var_name(&name) {
                         self.message = Some(
                             "invalid name: use letters, digits and _, not starting with a digit"
@@ -500,28 +514,25 @@ impl App {
                         );
                         return;
                     }
-                    self.var_input = None;
+                    self.modal = None;
                     self.selection.variable = Some(name.clone());
                     self.start_inline_edit(name);
                 }
                 Some(name) => {
-                    let value = std::mem::take(&mut input.text);
-                    self.var_input = None;
+                    let value = std::mem::take(&mut input.text).into_inner();
+                    self.modal = None;
                     self.set_variable(&name, value, out);
                 }
             },
-            _ => edit_text(&mut input.text, key),
+            _ => edit_text(input.text.expose_mut(), key),
         }
     }
 
     fn selected_var_name(&self) -> Option<String> {
         let rows = self.variable_rows();
         let selected = self.selection.variable.as_deref();
-        let index = rows
-            .iter()
-            .position(|r| Some(r.name) == selected)
-            .unwrap_or(0);
-        rows.get(index).map(|r| r.name.to_string())
+        rows.get(position(&rows, selected, |r| r.name))
+            .map(|r| r.name.to_string())
     }
 
     /// The value on Railway and the pending change of `name` (unfiltered).
@@ -556,10 +567,10 @@ impl App {
             self.message = Some("multi-line value: press E to edit in $EDITOR".into());
             return;
         }
-        self.var_input = Some(VarInput {
+        self.modal = Some(Modal::VarInput(VarInput {
             name: Some(name),
-            text,
-        });
+            text: Secret::new(text),
+        }));
     }
 
     /// Runs `f` with the pending store and the open service as the target; false when
@@ -582,7 +593,7 @@ impl App {
             service_id: &service_id,
             service_name: &service_name,
         };
-        f(&mut self.pending, &target);
+        f(self.pending_mut(), &target);
         true
     }
 
@@ -608,7 +619,7 @@ impl App {
         }
         let (current, _) = self.var_state(name);
         if self.with_target(|p, t| p.set(t, name, value, current.as_deref())) {
-            out.push(Command::SavePending(self.pending.clone()));
+            out.push(self.save_pending());
         }
     }
 
@@ -617,7 +628,7 @@ impl App {
         if pending == Some(Change::Delete) {
             self.undo_variable(name, out);
         } else if self.with_target(|p, t| p.delete(t, name, current.as_deref())) {
-            out.push(Command::SavePending(self.pending.clone()));
+            out.push(self.save_pending());
         }
     }
 
@@ -639,8 +650,8 @@ impl App {
                 self.message = Some("already written to Railway — edit it to revert".into());
                 return;
             }
-            self.pending.undo(&env, &svc, name);
-            out.push(Command::SavePending(self.pending.clone()));
+            self.pending_mut().undo(&env, &svc, name);
+            out.push(self.save_pending());
         }
     }
 

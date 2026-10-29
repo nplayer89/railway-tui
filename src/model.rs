@@ -1,9 +1,19 @@
 //! Domain model shared by the API layer and the UI.
 
+use std::fmt;
+
 use chrono::{DateTime, Utc};
 
 /// A service's variables, name to (unrendered) value.
 pub type Variables = std::collections::BTreeMap<String, String>;
+
+/// Why a write did not succeed: Railway refused it, or it was sent and Railway
+/// may or may not have applied it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteFailure {
+    Refused,
+    Unknown,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeploymentStatus {
@@ -44,24 +54,44 @@ impl DeploymentStatus {
         }
     }
 
-    /// The API spelling; unknown values show as `UNKNOWN(<raw>)`.
-    pub fn label(&self) -> String {
+    /// Whether the deployment has stopped changing on its own: it succeeded,
+    /// failed, crashed or was removed.
+    pub fn is_terminal(&self) -> bool {
         match self {
-            Self::Building => "BUILDING".into(),
-            Self::Crashed => "CRASHED".into(),
-            Self::Deploying => "DEPLOYING".into(),
-            Self::Failed => "FAILED".into(),
-            Self::Initializing => "INITIALIZING".into(),
-            Self::NeedsApproval => "NEEDS_APPROVAL".into(),
-            Self::Queued => "QUEUED".into(),
-            Self::Removed => "REMOVED".into(),
-            Self::Removing => "REMOVING".into(),
-            Self::Skipped => "SKIPPED".into(),
-            Self::Sleeping => "SLEEPING".into(),
-            Self::Success => "SUCCESS".into(),
-            Self::Waiting => "WAITING".into(),
-            Self::Unknown(raw) => format!("UNKNOWN({raw})"),
+            Self::Success | Self::Failed | Self::Crashed | Self::Removed => true,
+            Self::Building
+            | Self::Deploying
+            | Self::Initializing
+            | Self::NeedsApproval
+            | Self::Queued
+            | Self::Removing
+            | Self::Skipped
+            | Self::Sleeping
+            | Self::Waiting
+            | Self::Unknown(_) => false,
         }
+    }
+}
+
+/// The API spelling; unknown values show as `UNKNOWN(<raw>)`.
+impl fmt::Display for DeploymentStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Building => "BUILDING",
+            Self::Crashed => "CRASHED",
+            Self::Deploying => "DEPLOYING",
+            Self::Failed => "FAILED",
+            Self::Initializing => "INITIALIZING",
+            Self::NeedsApproval => "NEEDS_APPROVAL",
+            Self::Queued => "QUEUED",
+            Self::Removed => "REMOVED",
+            Self::Removing => "REMOVING",
+            Self::Skipped => "SKIPPED",
+            Self::Sleeping => "SLEEPING",
+            Self::Success => "SUCCESS",
+            Self::Waiting => "WAITING",
+            Self::Unknown(raw) => return write!(f, "UNKNOWN({raw})"),
+        })
     }
 }
 
@@ -96,6 +126,25 @@ impl InstanceStatus {
             "STOPPED" => Self::Stopped,
             other => Self::Unknown(other.to_string()),
         }
+    }
+}
+
+/// The API spelling; unknown values show as `UNKNOWN(<raw>)`.
+impl fmt::Display for InstanceStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Crashed => "CRASHED",
+            Self::Created => "CREATED",
+            Self::Exited => "EXITED",
+            Self::Initializing => "INITIALIZING",
+            Self::Removed => "REMOVED",
+            Self::Removing => "REMOVING",
+            Self::Restarting => "RESTARTING",
+            Self::Running => "RUNNING",
+            Self::Skipped => "SKIPPED",
+            Self::Stopped => "STOPPED",
+            Self::Unknown(raw) => return write!(f, "UNKNOWN({raw})"),
+        })
     }
 }
 
