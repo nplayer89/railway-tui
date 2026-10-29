@@ -821,6 +821,62 @@ fn markers_and_strikethrough() {
         .contains(ratatui::style::Modifier::CROSSED_OUT));
 }
 
+/// A Variables view with an added and a changed pending value.
+fn pending_values_app() -> App {
+    use crate::pending::Change;
+    let mut app = vars_app("staging", &[("CHG", "oldsecret")]);
+    let set = |value: &str| Change::Set {
+        value: value.into(),
+    };
+    add_pending(&mut app, "ADD", set("addsecret"), None);
+    add_pending(&mut app, "CHG", set("chgsecret"), Some("oldsecret"));
+    let sp = app
+        .pending
+        .envs
+        .get_mut("e1")
+        .unwrap()
+        .get_mut("svc-1")
+        .unwrap();
+    sp.env_name = "staging".into();
+    sp.service_name = "api".into();
+    app
+}
+
+#[test]
+fn pending_new_values_hidden_until_revealed() {
+    let mut app = pending_values_app();
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("ADD") && t.contains("CHG"), "{t}");
+    for secret in ["addsecret", "chgsecret", "oldsecret"] {
+        assert!(!t.contains(secret), "{t}");
+    }
+    app.environments.value = Some(vec![crate::model::Environment {
+        id: "e1".into(),
+        name: "staging".into(),
+    }]);
+    app.stack.push(View::Pending(Default::default()));
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("+ ADD") && t.contains("~ CHG"), "{t}");
+    for secret in ["addsecret", "chgsecret", "oldsecret"] {
+        assert!(!t.contains(secret), "{t}");
+    }
+}
+
+#[test]
+fn r_on_a_pending_row_reveals_only_that_row() {
+    let mut app = pending_values_app();
+    app.selection.variable = Some("ADD".into());
+    press(&mut app, 'r');
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("addsecret"), "{t}");
+    assert!(!t.contains("chgsecret") && !t.contains("oldsecret"), "{t}");
+    app.selection.variable = Some("CHG".into());
+    press(&mut app, 'r');
+    let t = text(&render(&app, Instant::now()));
+    assert!(t.contains("addsecret") && t.contains("chgsecret"), "{t}");
+    assert!(!t.contains("oldsecret"), "{t}");
+}
+
 #[test]
 fn header_shows_pending_count() {
     use crate::pending::Change;
