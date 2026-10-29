@@ -1630,6 +1630,10 @@ fn header_is_one_line_with_status_left_and_hints_right() {
     assert!(row.contains("updated") && row.contains("<?> help"), "{row}");
     assert!(row.find("updated").unwrap() < row.find("<?> help").unwrap());
     assert!(row.trim_end().ends_with("<?> help"), "{row}");
+    assert!(
+        row.ends_with("<?> help "),
+        "one space of padding on the right: {row:?}"
+    );
     let all = text(&buf);
     assert!(!all.contains("Workspace:") && !all.contains("Project:") && !all.contains("Env:"));
 }
