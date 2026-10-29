@@ -45,6 +45,12 @@ impl App {
         }]
     }
 
+    /// Whether a deploy of this group is in flight (including its reconcile read).
+    pub(super) fn is_deploying(&self, env_id: &str, service_id: &str) -> bool {
+        self.deploys
+            .contains_key(&(env_id.to_string(), service_id.to_string()))
+    }
+
     /// Railway's variables for a deploy check arrived: open the confirm.
     pub(super) fn on_deploy_check(
         &mut self,
@@ -72,8 +78,21 @@ impl App {
             self.message = Some(format!("already deploying {}", sp.service_name));
             return;
         }
-        if self.confirm.is_some() {
-            self.message = Some("deploy not started: another question is open".into());
+        // The confirm takes the next key, so it may only appear where Neil is
+        // waiting for it: on the review, with nothing being typed or picked.
+        let busy = self.confirm.is_some()
+            || self.var_input.is_some()
+            || self.filter_input.is_some()
+            || self.command_line.is_some()
+            || self.env_picker.is_some()
+            || self.theme_picker.is_some()
+            || self.help
+            || self.kind() != Kind::Pending;
+        if busy {
+            self.message = Some(format!(
+                "deploy check of {} done; press D again to deploy",
+                sp.service_name
+            ));
             return;
         }
         let drift = sp
@@ -157,12 +176,20 @@ impl App {
                         .is_some_and(|v| *change == Change::Set { value: v.clone() })
                 });
                 out.push(Command::SavePending(self.pending.clone()));
+                self.message = Some(format!(
+                    "deploying {} to {}: variables written…",
+                    sent.service_name, sent.env_name
+                ));
             }
             DeployStep::Deleted(deleted) => {
                 self.mark_applied(&key, |name, change| {
                     name == deleted && sent.deletes.contains(&deleted) && *change == Change::Delete
                 });
                 out.push(Command::SavePending(self.pending.clone()));
+                self.message = Some(format!(
+                    "deploying {} to {}: {deleted} deleted…",
+                    sent.service_name, sent.env_name
+                ));
             }
             DeployStep::Redeployed => {
                 self.deploys.remove(&key);

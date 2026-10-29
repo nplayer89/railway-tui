@@ -998,5 +998,5 @@ fn long_deploy_confirm_keeps_the_prompt() {
         t.contains("Deploy? y to confirm, any other key cancels"),
         "{t}"
     );
-    assert!(t.contains("more"), "{t}");
+    assert!(t.contains("more changes"), "{t}");
 }

@@ -3292,4 +3292,77 @@ mod tests {
         let ev = deploy_vars_event("e", "s", vars(&[("KEY", "s3cret-value")]));
         assert!(!format!("{ev:?}").contains("s3cret-value"));
     }
+
+    fn no_deploy(cmds: &[Command]) -> bool {
+        !cmds
+            .iter()
+            .any(|c| matches!(c, Command::DeployService { .. }))
+    }
+
+    #[test]
+    fn deploy_check_never_pops_over_typing() {
+        let now = Instant::now();
+        // Typing a variable value in another view.
+        let mut app = app_in_review(now);
+        app.update(key('D'), now);
+        app.update(code(KeyCode::Esc), now);
+        app.update(key('v'), now);
+        app.update(key('a'), now);
+        typed(&mut app, "KE", now);
+        data(&mut app, deploy_vars_event("e-prod", "s1", vars(&[])), now);
+        assert!(app.confirm.is_none());
+        assert!(app.message.as_deref().unwrap().contains("press D again"));
+        assert!(no_deploy(&app.update(key('y'), now)));
+        assert_eq!(app.var_input.as_ref().unwrap().text, "KEy");
+
+        // A filter being typed on the review itself, and the command line.
+        for start in [key('/'), key(':')] {
+            let mut app = app_in_review(now);
+            app.update(key('D'), now);
+            app.update(start, now);
+            data(&mut app, deploy_vars_event("e-prod", "s1", vars(&[])), now);
+            assert!(app.confirm.is_none());
+            assert!(no_deploy(&app.update(key('y'), now)));
+        }
+
+        // Help open on the review.
+        let mut app = app_in_review(now);
+        app.update(key('D'), now);
+        app.update(key('?'), now);
+        data(&mut app, deploy_vars_event("e-prod", "s1", vars(&[])), now);
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn discard_refused_while_deploying() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        deploy_first_group(&mut app, vars(&[]), now);
+        assert!(app.update(key('x'), now).is_empty());
+        assert!(app.confirm.is_none());
+        assert!(app.message.as_deref().unwrap().contains("deploying"));
+        assert!(app.pending.service("e-prod", "s1").is_some());
+    }
+
+    #[test]
+    fn progress_is_shown_step_by_step() {
+        let now = Instant::now();
+        let mut app = app_in_review(now);
+        sp_mut(&mut app, "e-prod", "s1")
+            .vars
+            .insert("OLD".into(), delete_var("x"));
+        deploy_first_group(&mut app, vars(&[("OLD", "x")]), now);
+        assert_eq!(app.message.as_deref(), Some("deploying api to production…"));
+        data(&mut app, step("e-prod", "s1", DeployStep::Upserted), now);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("deploying api to production: variables written…")
+        );
+        let deleted = DeployStep::Deleted("OLD".into());
+        data(&mut app, step("e-prod", "s1", deleted), now);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("deploying api to production: OLD deleted…")
+        );
+    }
 }

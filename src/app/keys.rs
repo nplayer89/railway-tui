@@ -372,6 +372,10 @@ impl App {
             }
             KeyCode::Char('x') => {
                 if let Some(g) = self.selected_group() {
+                    if self.is_deploying(&g.env_id, &g.service_id) {
+                        self.message = Some("cannot discard while it is deploying".into());
+                        return true;
+                    }
                     self.confirm = Some(Confirm::Discard {
                         env_id: g.env_id,
                         service_id: g.service_id,
