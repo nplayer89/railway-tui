@@ -112,6 +112,9 @@ pub struct DeploymentSummary {
     pub created_at: DateTime<Utc>,
     pub commit_sha: Option<String>,
     pub commit_message: Option<String>,
+    /// `owner/name` of the GitHub repo it was built from.
+    pub repo: Option<String>,
+    pub branch: Option<String>,
     pub image: Option<String>,
     pub instances: Vec<Instance>,
 }

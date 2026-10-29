@@ -25,7 +25,7 @@ impl App {
         self.message = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
-            if self.deploys.is_empty() || self.force_quit_armed {
+            if !self.deploy_in_flight() || self.force_quit_armed {
                 out.push(Command::Quit);
             } else {
                 self.force_quit_armed = true;
@@ -68,7 +68,7 @@ impl App {
 
     /// `q` and `:q`: refused while a deploy is in flight (Ctrl-C twice forces it).
     fn quit(&mut self, out: &mut Vec<Command>) {
-        if self.deploys.is_empty() {
+        if !self.deploy_in_flight() {
             out.push(Command::Quit);
         } else {
             self.message = Some(DEPLOY_IN_PROGRESS.into());
@@ -256,6 +256,10 @@ impl App {
             },
             KeyCode::Char('p') => self.open_pending(out),
             KeyCode::Char('e') => self.open_env_picker(now, out),
+            KeyCode::Char('D') => match selected {
+                Some(id) => self.request_deploy_latest(id),
+                None => self.message = Some("no service selected".into()),
+            },
             _ => return false,
         }
         true
@@ -279,6 +283,12 @@ impl App {
     }
 
     fn deployments_key(&mut self, code: KeyCode, out: &mut Vec<Command>) -> bool {
+        if code == KeyCode::Char('D') {
+            if let Some(id) = self.view_service_id(Kind::Deployments) {
+                self.request_deploy_latest(id.to_string());
+            }
+            return true;
+        }
         if code != KeyCode::Enter {
             return false;
         }
@@ -441,6 +451,7 @@ impl App {
                 out.push(Command::SavePending(self.pending.clone()));
             }
             Confirm::Deploy(d) => self.start_deploy(d, out),
+            Confirm::DeployLatest(c) => self.start_deploy_latest(*c, out),
         }
     }
 

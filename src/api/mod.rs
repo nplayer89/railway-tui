@@ -1,5 +1,5 @@
 //! Railway's public GraphQL API over HTTP. Reads live here; the only writes
-//! (three allowlisted mutations) live in [`write`].
+//! (four allowlisted mutations) live in [`write`].
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -572,6 +572,8 @@ fn summarize<S: Serialize>(
         created_at,
         commit_sha: meta_str("commitHash"),
         commit_message: meta_str("commitMessage"),
+        repo: meta_str("repo"),
+        branch: meta_str("branch"),
         image: meta_str("image"),
         instances: instances
             .map(|(id, status)| Instance {

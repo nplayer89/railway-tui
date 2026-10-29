@@ -18,7 +18,7 @@ use url::Url;
 use crate::api::subscribe::{connect_authed, deployment_status_stream};
 use crate::api::write::WriteError;
 use crate::api::{Api, ApiError};
-use crate::app::{AppEvent, Command, DataEvent, DeployStep, Phase};
+use crate::app::{AppEvent, Command, DataEvent, DeployStep, LatestOutcome, Phase};
 use crate::auth::TokenSource;
 use crate::budget::{backstop_interval, RateBudget};
 use crate::logs::follow::{follow_logs, FollowEvent, LogSource, RailwayLogSource, StreamState};
@@ -224,6 +224,26 @@ impl Worker {
                 tokio::spawn(async move {
                     let writes = (!redeploy_only).then_some((upserts, deletes));
                     if run_deploy(&api, &target, writes, &events).await {
+                        let budget = budget_event(&budget, interval);
+                        let _ = events.send(AppEvent::Data(budget)).await;
+                    }
+                });
+            }
+            Command::DeployLatest { env_id, service_id } => {
+                let (budget, interval) = (api.budget(), self.configured_interval);
+                let events = self.events.clone();
+                tokio::spawn(async move {
+                    let outcome = match api.deploy_latest_commit(&env_id, &service_id).await {
+                        Ok(()) => LatestOutcome::Started,
+                        Err(WriteError::Refused(e)) => LatestOutcome::Refused(e.to_string()),
+                        Err(WriteError::Unknown(e)) => LatestOutcome::Unknown(e.to_string()),
+                    };
+                    let data = DataEvent::DeployedLatest {
+                        env_id,
+                        service_id,
+                        outcome,
+                    };
+                    if events.send(AppEvent::Data(data)).await.is_ok() {
                         let budget = budget_event(&budget, interval);
                         let _ = events.send(AppEvent::Data(budget)).await;
                     }
@@ -1008,6 +1028,77 @@ mod tests {
             }
             cmds = app.update(AppEvent::Data(event), Instant::now());
         }
+    }
+
+    #[tokio::test]
+    async fn deploy_latest_sends_one_latest_commit_deploy() {
+        let mut h = Harness::start(None).await;
+        mount(
+            &h.server,
+            "serviceInstanceDeploy",
+            200,
+            ok("serviceInstanceDeploy"),
+        )
+        .await;
+        h.send(Command::DeployLatest {
+            env_id: "e1".into(),
+            service_id: "s1".into(),
+        })
+        .await;
+        let event = loop {
+            match h.next().await {
+                DataEvent::Budget { .. } => continue,
+                event => break event,
+            }
+        };
+        assert!(
+            matches!(
+                &event,
+                DataEvent::DeployedLatest { env_id, service_id, outcome: LatestOutcome::Started }
+                    if env_id == "e1" && service_id == "s1"
+            ),
+            "{event:?}"
+        );
+        let requests = h.server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["operationName"], "ServiceInstanceDeploy");
+        assert_eq!(
+            body["variables"],
+            json!({"environmentId": "e1", "serviceId": "s1"})
+        );
+        assert!(body["query"]
+            .as_str()
+            .unwrap()
+            .contains("latestCommit: true"));
+    }
+
+    #[tokio::test]
+    async fn deploy_latest_refusal_is_reported_not_resent() {
+        let mut h = Harness::start(None).await;
+        mount(&h.server, "serviceInstanceDeploy", 400, json!({})).await;
+        h.send(Command::DeployLatest {
+            env_id: "e1".into(),
+            service_id: "s1".into(),
+        })
+        .await;
+        let event = loop {
+            match h.next().await {
+                DataEvent::Budget { .. } => continue,
+                event => break event,
+            }
+        };
+        assert!(
+            matches!(
+                &event,
+                DataEvent::DeployedLatest {
+                    outcome: LatestOutcome::Refused(_),
+                    ..
+                }
+            ),
+            "{event:?}"
+        );
+        assert_eq!(h.server.received_requests().await.unwrap().len(), 1);
     }
 
     async fn mount(server: &MockServer, op: &str, status: u16, body: serde_json::Value) {

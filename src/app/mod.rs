@@ -99,6 +99,7 @@ impl PendingGroup {
 pub enum Confirm {
     Discard { env_id: String, service_id: String },
     Deploy(DeployConfirm),
+    DeployLatest(Box<LatestConfirm>),
 }
 
 /// Deploying one pending group. The ids come from the group, never from the
@@ -109,6 +110,32 @@ pub struct DeployConfirm {
     pub service_id: String,
     /// Names changed on Railway since they were edited.
     pub drift: Vec<String>,
+}
+
+/// Deploying the latest commit of a service's branch, with what is deployed
+/// now and where it goes, as known when `D` was pressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatestConfirm {
+    pub project_id: String,
+    pub env_id: String,
+    pub env_name: String,
+    pub service_id: String,
+    pub service_name: String,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    /// The deployment running now, else the latest one.
+    pub current: Option<DeploymentSummary>,
+    /// Variables written to Railway but not deployed: they ship with this deploy.
+    pub written: usize,
+}
+
+/// What Railway said to a deploy of the latest commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LatestOutcome {
+    Started,
+    Refused(String),
+    /// Sent, but Railway may or may not have started it.
+    Unknown(String),
 }
 
 /// Why variables were loaded: for the Variables view, to check a deploy
@@ -201,6 +228,11 @@ pub enum DataEvent {
         service_id: String,
         step: DeployStep,
     },
+    DeployedLatest {
+        env_id: String,
+        service_id: String,
+        outcome: LatestOutcome,
+    },
     /// Saving the pending file failed; the text never holds a value.
     SaveFailed(String),
     /// The external editor finished: the new value, or why it could not run.
@@ -257,6 +289,11 @@ pub enum Command {
         upserts: Variables,
         deletes: Vec<String>,
         redeploy_only: bool,
+    },
+    /// Deploys the latest commit of the service's connected branch.
+    DeployLatest {
+        env_id: String,
+        service_id: String,
     },
     /// Handled by the main loop, not the worker: edit `initial` in `$VISUAL`/`$EDITOR`.
     EditExternal {
@@ -339,6 +376,8 @@ pub struct App {
     pub confirm: Option<Confirm>,
     /// Deploys sent to the worker and not finished, by (env id, service id).
     deploys: BTreeMap<(String, String), deploy::Sent>,
+    /// Latest-commit deploys sent to the worker and not answered, by (env id, service id).
+    latest_deploys: BTreeMap<(String, String), deploy::LatestSent>,
     /// Ctrl-C was pressed once while deploys are in flight; a second one quits.
     /// Cleared once no deploy is in flight.
     force_quit_armed: bool,
@@ -397,6 +436,7 @@ impl App {
             var_input: None,
             confirm: None,
             deploys: BTreeMap::new(),
+            latest_deploys: BTreeMap::new(),
             force_quit_armed: false,
             table_filter: None,
             filter_input: None,
@@ -424,7 +464,7 @@ impl App {
             AppEvent::Tick(_) => self.on_tick(now, &mut out),
             AppEvent::Data(data) => self.on_data(data, now, &mut out),
         }
-        if self.deploys.is_empty() {
+        if !self.deploy_in_flight() {
             self.force_quit_armed = false;
         }
         self.track_service_focus(now);
@@ -698,6 +738,11 @@ impl App {
                 service_id,
                 step,
             } => self.on_deploy_step(env_id, service_id, step, now, out),
+            DataEvent::DeployedLatest {
+                env_id,
+                service_id,
+                outcome,
+            } => self.on_deploy_latest(env_id, service_id, outcome, now, out),
             DataEvent::SaveFailed(message) => self.message = Some(message),
             DataEvent::Edited { name, result } => match result {
                 Ok(value) => self.set_variable(&name, value, out),
@@ -1462,6 +1507,16 @@ impl fmt::Debug for DataEvent {
                 .field("service_id", service_id)
                 .field("step", step)
                 .finish(),
+            DataEvent::DeployedLatest {
+                env_id,
+                service_id,
+                outcome,
+            } => f
+                .debug_struct("DeployedLatest")
+                .field("env_id", env_id)
+                .field("service_id", service_id)
+                .field("outcome", outcome)
+                .finish(),
             DataEvent::SaveFailed(m) => f.debug_tuple("SaveFailed").field(m).finish(),
             DataEvent::Edited { name, result } => f
                 .debug_struct("Edited")
@@ -1556,6 +1611,11 @@ impl fmt::Debug for Command {
                 .field("deletes", deletes)
                 .field("redeploy_only", redeploy_only)
                 .finish(),
+            Command::DeployLatest { env_id, service_id } => f
+                .debug_struct("DeployLatest")
+                .field("env_id", env_id)
+                .field("service_id", service_id)
+                .finish(),
             Command::EditExternal { name, .. } => f
                 .debug_struct("EditExternal")
                 .field("name", name)
@@ -1645,6 +1705,8 @@ mod tests {
             created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
             commit_sha: None,
             commit_message: None,
+            repo: None,
+            branch: None,
             image: None,
             instances: vec![Instance {
                 id: format!("{id}-i0"),
@@ -3692,6 +3754,185 @@ mod tests {
         assert_eq!(
             app.message.as_deref(),
             Some("deploying api to production: OLD deleted…")
+        );
+    }
+
+    // ---- deploy latest commit ----
+
+    fn git_deploy(id: &str, sha: &str, msg: &str) -> DeploymentSummary {
+        DeploymentSummary {
+            commit_sha: Some(sha.into()),
+            commit_message: Some(msg.into()),
+            repo: Some("acme/api".into()),
+            branch: Some("main".into()),
+            ..deploy(id, DeploymentStatus::Success)
+        }
+    }
+
+    /// Services open on production with svc-a built from acme/api@main.
+    fn app_with_git_service(now: Instant) -> App {
+        let mut app = app_in_services(now);
+        let svc = service(
+            "svc-a",
+            git_deploy("d2", "bbbbbbb2", "newer"),
+            vec![git_deploy("d1", "aaaaaaa1", "running")],
+        );
+        data(&mut app, services_event("e-prod", Ok(vec![svc])), now);
+        app
+    }
+
+    fn latest_outcome(outcome: LatestOutcome) -> DataEvent {
+        DataEvent::DeployedLatest {
+            env_id: "e-prod".into(),
+            service_id: "svc-a".into(),
+            outcome,
+        }
+    }
+
+    #[test]
+    fn shift_d_on_a_service_asks_with_what_will_be_deployed() {
+        let now = Instant::now();
+        let mut app = app_with_git_service(now);
+        assert_eq!(app.update(key('D'), now), vec![]);
+        let Some(Confirm::DeployLatest(c)) = &app.confirm else {
+            panic!("expected the latest-commit confirm, got {:?}", app.confirm);
+        };
+        assert_eq!(
+            (&c.env_id[..], &c.env_name[..], &c.service_name[..]),
+            ("e-prod", "production", "svc-a-name")
+        );
+        assert_eq!(c.repo.as_deref(), Some("acme/api"));
+        assert_eq!(c.branch.as_deref(), Some("main"));
+        // What is running, not the newest attempt.
+        assert_eq!(c.current.as_ref().map(|d| d.id.as_str()), Some("d1"));
+        assert_eq!(c.written, 0);
+    }
+
+    #[test]
+    fn y_sends_the_deploy_and_any_other_key_cancels() {
+        let now = Instant::now();
+        let mut app = app_with_git_service(now);
+        app.update(key('D'), now);
+        assert_eq!(app.update(key('n'), now), vec![]);
+        assert!(app.confirm.is_none());
+
+        app.update(key('D'), now);
+        assert_eq!(
+            app.update(key('y'), now),
+            vec![Command::DeployLatest {
+                env_id: "e-prod".into(),
+                service_id: "svc-a".into(),
+            }]
+        );
+        assert_eq!(
+            app.message.as_deref(),
+            Some("deploying the latest commit of svc-a-name to production…")
+        );
+        // A second D while it is in flight is refused, and so is quitting.
+        app.update(key('D'), now);
+        assert!(app.confirm.is_none());
+        assert_eq!(app.message.as_deref(), Some("already deploying svc-a-name"));
+        assert_eq!(app.update(key('q'), now), vec![]);
+    }
+
+    #[test]
+    fn shift_d_in_deployments_deploys_that_service() {
+        let now = Instant::now();
+        let mut app = app_with_git_service(now);
+        app.update(code(KeyCode::Enter), now);
+        assert_eq!(app.kind(), Kind::Deployments);
+        app.update(key('D'), now);
+        assert!(matches!(
+            &app.confirm,
+            Some(Confirm::DeployLatest(c)) if c.service_id == "svc-a"
+        ));
+        let cmds = app.update(key('y'), now);
+        assert!(matches!(cmds.as_slice(), [Command::DeployLatest { .. }]));
+        // Railway accepted it: the open deployments list reloads.
+        let cmds = data(&mut app, latest_outcome(LatestOutcome::Started), now);
+        assert!(cmds.iter().any(
+            |c| matches!(c, Command::LoadDeployments { service_id, .. } if service_id == "svc-a")
+        ));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Command::LoadServices { .. })));
+        assert_eq!(app.update(key('q'), now), vec![Command::Quit]);
+    }
+
+    #[test]
+    fn started_deploy_ships_written_variables_and_keeps_unwritten_ones() {
+        let now = Instant::now();
+        let mut app = app_with_git_service(now);
+        let t = crate::pending::Target {
+            project_id: "p2",
+            env_id: "e-prod",
+            env_name: "production",
+            service_id: "svc-a",
+            service_name: "svc-a-name",
+        };
+        app.pending.set(&t, "WRITTEN", "1".into(), None);
+        app.pending.set(&t, "LATER", "2".into(), None);
+        sp_mut(&mut app, "e-prod", "svc-a")
+            .vars
+            .get_mut("WRITTEN")
+            .unwrap()
+            .applied = true;
+        app.update(key('D'), now);
+        assert!(matches!(&app.confirm, Some(Confirm::DeployLatest(c)) if c.written == 1));
+        app.update(key('y'), now);
+        let cmds = data(&mut app, latest_outcome(LatestOutcome::Started), now);
+        assert!(cmds.iter().any(|c| matches!(c, Command::SavePending(_))));
+        let sp = app.pending.service("e-prod", "svc-a").unwrap();
+        assert_eq!(sp.vars.keys().collect::<Vec<_>>(), ["LATER"]);
+        assert!(!sp.written_not_deployed);
+    }
+
+    #[test]
+    fn refused_and_unknown_deploys_are_reported() {
+        let now = Instant::now();
+        let mut app = app_with_git_service(now);
+        app.update(key('D'), now);
+        app.update(key('y'), now);
+        data(
+            &mut app,
+            latest_outcome(LatestOutcome::Refused("Not Authorized".into())),
+            now,
+        );
+        assert_eq!(
+            app.message.as_deref(),
+            Some("deploy of svc-a-name failed: Not Authorized")
+        );
+        app.update(key('D'), now);
+        app.update(key('y'), now);
+        data(
+            &mut app,
+            latest_outcome(LatestOutcome::Unknown("timeout".into())),
+            now,
+        );
+        assert_eq!(
+            app.message.as_deref(),
+            Some("deploy of svc-a-name outcome unknown — check the deployments view")
+        );
+    }
+
+    #[test]
+    fn an_image_service_has_no_commit_to_deploy() {
+        let now = Instant::now();
+        let mut app = app_in_services(now);
+        let image = DeploymentSummary {
+            image: Some("postgres:16".into()),
+            ..deploy("d1", DeploymentStatus::Success)
+        };
+        data(
+            &mut app,
+            services_event("e-prod", Ok(vec![service("svc-a", image, vec![])])),
+            now,
+        );
+        app.update(key('D'), now);
+        assert!(app.confirm.is_none());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("cannot deploy svc-a-name: it runs an image, not a repo")
         );
     }
 }

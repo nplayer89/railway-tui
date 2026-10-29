@@ -11,7 +11,7 @@ use crate::theme::{Theme, THEMES};
 
 /// The default theme, which the fixtures render with.
 const T: &Theme = &THEMES[0];
-use crate::app::{App, LogsView, StartPrefs, View};
+use crate::app::{App, Confirm, LatestConfirm, LogsView, StartPrefs, View};
 use crate::logs::buffer::{LogBuffer, LOG_CAP};
 use crate::logs::follow::StreamState;
 use crate::model::{
@@ -61,6 +61,8 @@ fn deploy(id: &str, status: DeploymentStatus, instances: &[InstanceStatus]) -> D
         created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
         commit_sha: Some("a1b2c3d4e5f6".into()),
         commit_message: Some("fix auth header".into()),
+        repo: Some("acme/api".into()),
+        branch: Some("main".into()),
         image: None,
         instances: instances
             .iter()
@@ -1243,4 +1245,37 @@ fn focused_long_service_name_scrolls() {
             .any(|r| r.starts_with("zz-other-long-service-name-tha")),
         "{later:?}"
     );
+}
+
+#[test]
+fn latest_commit_confirm_shows_target_source_and_what_runs_now() {
+    let mut app = services_app(vec![service(
+        "api",
+        deploy("d1", DeploymentStatus::Success, &[InstanceStatus::Running]),
+        vec![],
+    )]);
+    app.confirm = Some(Confirm::DeployLatest(Box::new(LatestConfirm {
+        project_id: "p".into(),
+        env_id: "e-prod".into(),
+        env_name: "production".into(),
+        service_id: "api-id".into(),
+        service_name: "api".into(),
+        repo: Some("acme/api".into()),
+        branch: Some("main".into()),
+        current: Some(deploy("d1", DeploymentStatus::Success, &[])),
+        written: 2,
+    })));
+    let screen = text(&render(&app, Instant::now()));
+    for want in [
+        "Deploy latest commit to production",
+        "service: api",
+        "repo:    acme/api",
+        "branch:  main",
+        "now:     a1b2c3d  fix auth header",
+        "deploy:  latest commit on main",
+        "! 2 written variable changes will ship with this deploy",
+        "Deploy? y to confirm, any other key cancels",
+    ] {
+        assert!(screen.contains(want), "missing {want:?} in\n{screen}");
+    }
 }

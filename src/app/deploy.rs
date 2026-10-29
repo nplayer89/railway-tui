@@ -1,10 +1,16 @@
 //! Deploying one pending group: read Railway, confirm with `y`, then follow
 //! the worker's steps. Every id comes from the group, never from the open
 //! project or environment, and only what was actually sent is marked applied.
+//!
+//! Also deploying a service's latest commit (`D` on Services or Deployments):
+//! one mutation, confirmed with `y`.
 
 use std::time::Instant;
 
-use super::{App, Command, Confirm, DeployConfirm, DeployStep, Kind, Phase, VarsPurpose, View};
+use super::{
+    App, Command, Confirm, DeployConfirm, DeployStep, Kind, LatestConfirm, LatestOutcome, Phase,
+    VarsPurpose, View,
+};
 use crate::model::Variables;
 use crate::pending::Change;
 
@@ -18,7 +24,132 @@ pub(super) struct Sent {
     deletes: Vec<String>,
 }
 
+/// A latest-commit deploy in flight, with the names to report it by.
+#[derive(Clone)]
+pub(super) struct LatestSent {
+    project_id: String,
+    env_name: String,
+    service_name: String,
+}
+
 impl App {
+    /// Whether any deploy (pending group or latest commit) is in flight.
+    pub(super) fn deploy_in_flight(&self) -> bool {
+        !self.deploys.is_empty() || !self.latest_deploys.is_empty()
+    }
+
+    /// `D` on a service or its deployments: ask before deploying its latest
+    /// commit, showing what is deployed now and where the new one goes.
+    pub(super) fn request_deploy_latest(&mut self, service_id: String) {
+        let (Some(project), Some(env)) = (self.project.clone(), self.environment.clone()) else {
+            self.message = Some("cannot deploy: no environment is open".into());
+            return;
+        };
+        let Some(svc) = self.service(&service_id) else {
+            self.message = Some("cannot deploy: the service is not loaded yet".into());
+            return;
+        };
+        let key = (env.id.clone(), service_id.clone());
+        if self.deploys.contains_key(&key) || self.latest_deploys.contains_key(&key) {
+            self.message = Some(format!("already deploying {}", svc.service_name));
+            return;
+        }
+        let source = svc.latest.as_ref().or(svc.active.first());
+        let repo = source.and_then(|d| d.repo.clone());
+        if repo.is_none() && source.is_some_and(|d| d.image.is_some()) {
+            self.message = Some(format!(
+                "cannot deploy {}: it runs an image, not a repo",
+                svc.service_name
+            ));
+            return;
+        }
+        let written = self
+            .pending
+            .service(&env.id, &service_id)
+            .map_or(0, |sp| sp.vars.values().filter(|v| v.applied).count());
+        self.confirm = Some(Confirm::DeployLatest(Box::new(LatestConfirm {
+            project_id: project.id,
+            env_id: env.id,
+            env_name: env.name,
+            service_id,
+            service_name: svc.service_name.clone(),
+            repo,
+            branch: source.and_then(|d| d.branch.clone()),
+            current: svc.active.first().or(svc.latest.as_ref()).cloned(),
+            written,
+        })));
+    }
+
+    /// `y` on the latest-commit confirm: send the deploy.
+    pub(super) fn start_deploy_latest(&mut self, c: LatestConfirm, out: &mut Vec<Command>) {
+        let key = (c.env_id, c.service_id);
+        if self.deploys.contains_key(&key) || self.latest_deploys.contains_key(&key) {
+            self.message = Some(format!("already deploying {}", c.service_name));
+            return;
+        }
+        self.message = Some(format!(
+            "deploying the latest commit of {} to {}…",
+            c.service_name, c.env_name
+        ));
+        out.push(Command::DeployLatest {
+            env_id: key.0.clone(),
+            service_id: key.1.clone(),
+        });
+        self.latest_deploys.insert(
+            key,
+            LatestSent {
+                project_id: c.project_id,
+                env_name: c.env_name,
+                service_name: c.service_name,
+            },
+        );
+    }
+
+    pub(super) fn on_deploy_latest(
+        &mut self,
+        env_id: String,
+        service_id: String,
+        outcome: LatestOutcome,
+        now: Instant,
+        out: &mut Vec<Command>,
+    ) {
+        let key = (env_id, service_id);
+        let Some(sent) = self.latest_deploys.remove(&key) else {
+            return;
+        };
+        match outcome {
+            LatestOutcome::Started => {
+                // Written variables went out with this deploy.
+                if self.pending.service(&key.0, &key.1).is_some_and(|sp| {
+                    sp.vars.values().any(|v| v.applied) || sp.written_not_deployed
+                }) {
+                    self.finish_deploy(&key);
+                    out.push(Command::SavePending(self.pending.clone()));
+                }
+                self.message = Some(format!(
+                    "deploying the latest commit of {} to {}: Railway accepted it",
+                    sent.service_name, sent.env_name
+                ));
+                self.reload_after_deploy(&key, &sent.project_id, now, out);
+                if self.project_id() == Some(sent.project_id.as_str())
+                    && self.env_id() == Some(key.0.as_str())
+                    && self.view_service_id(Kind::Deployments) == Some(key.1.as_str())
+                {
+                    self.load_deployments(key.1.clone(), now, out);
+                }
+            }
+            LatestOutcome::Refused(error) => {
+                self.message = Some(format!("deploy of {} failed: {error}", sent.service_name));
+            }
+            LatestOutcome::Unknown(_) => {
+                self.message = Some(format!(
+                    "deploy of {} outcome unknown — check the deployments view",
+                    sent.service_name
+                ));
+            }
+        }
+    }
+
     /// `D` on a group in the review: read the service's variables first, so
     /// the confirm can list what changed on Railway since the edits.
     pub(super) fn request_deploy(&mut self, env_id: String, service_id: String) -> Vec<Command> {
@@ -199,7 +330,7 @@ impl App {
                     "deployed {} to {}",
                     sent.service_name, sent.env_name
                 ));
-                self.reload_after_deploy(&key, &sent, now, out);
+                self.reload_after_deploy(&key, &sent.project_id, now, out);
             }
             DeployStep::Failed {
                 during: Phase::Redeploy,
@@ -323,13 +454,11 @@ impl App {
     fn reload_after_deploy(
         &mut self,
         key: &(String, String),
-        sent: &Sent,
+        project_id: &str,
         now: Instant,
         out: &mut Vec<Command>,
     ) {
-        if self.project_id() != Some(sent.project_id.as_str())
-            || self.env_id() != Some(key.0.as_str())
-        {
+        if self.project_id() != Some(project_id) || self.env_id() != Some(key.0.as_str()) {
             return;
         }
         if self.stack.iter().any(|v| matches!(v, View::Services)) {

@@ -160,6 +160,8 @@ mod tests {
             created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
             commit_sha: None,
             commit_message: None,
+            repo: None,
+            branch: None,
             image: None,
             instances: inst
                 .iter()
