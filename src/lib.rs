@@ -4,6 +4,7 @@ pub mod api;
 pub mod app;
 pub mod auth;
 pub mod budget;
+pub mod clipboard;
 pub mod config;
 pub mod github;
 pub mod logs;
