@@ -20,8 +20,8 @@ const ICON_GLOBE: &str = "\u{f0ac}";
 const ICON_FOLDER: &str = "\u{f07b}";
 const ICON_LIST: &str = "\u{f03a}";
 
-/// Width of the workspace name field in the statusline.
-const WORKSPACE_CELLS: usize = 20;
+/// Widest the workspace name field grows before the name scrolls.
+const WORKSPACE_MAX_CELLS: usize = 20;
 
 fn mode_colour(t: &Theme, mode: Mode) -> ratatui::style::Color {
     match mode {
@@ -118,11 +118,14 @@ pub(super) fn draw_statusline(frame: &mut Frame, area: Rect, app: &App, step: u6
             Style::new().fg(t.text).bg(t.bg),
         )]
     });
+    // The field fits the name up to the cap; past it, the name scrolls.
     let workspace_block = app.workspace_name().map(|name| {
+        let name = clean(name);
+        let cells = UnicodeWidthStr::width(name.as_str()).min(WORKSPACE_MAX_CELLS);
         vec![
             Span::styled(format!(" {ICON_FOLDER} "), Style::new().fg(t.bg).bg(t.bad)),
             Span::styled(
-                marquee(&clean(name), WORKSPACE_CELLS, step),
+                format!(" {} ", marquee(&name, cells, step)),
                 Style::new().fg(t.text).bg(t.select_bg),
             ),
         ]

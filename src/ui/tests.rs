@@ -1693,7 +1693,7 @@ fn statusline_shows_env_branch_and_scrolling_workspace() {
     assert!(r0.contains('\u{f0ac}') && r0.contains('\u{e725}'), "{r0}");
     let field = |r: &str| {
         let i = r.find('\u{f07b}').unwrap();
-        r[i..].chars().skip(2).take(20).collect::<String>()
+        r[i..].chars().skip(3).take(20).collect::<String>()
     };
     assert_eq!(field(&r0), "Neil's Deployment Wo");
     assert_eq!(field(&r1), "eil's Deployment Wor");
@@ -1707,14 +1707,23 @@ fn statusline_shows_env_branch_and_scrolling_workspace() {
     let x = r0.find('\u{f07b}').unwrap();
     let x = r0[..x].chars().count() as u16 + 2;
     assert_eq!(buf[(x, y)].bg, T.select_bg);
+    // A long name fills the capped field, with a space of padding either side.
+    assert!(
+        r0.contains("\u{f07b}  Neil's Deployment Wo  \u{f03a}"),
+        "{r0}"
+    );
 }
 
 #[test]
-fn short_workspace_name_is_padded_not_scrolled() {
+fn short_workspace_name_sizes_the_field_and_does_not_scroll() {
     let app = workspace_app("staging", "shop");
     let row = |step| status_row(&render_at_step(&app, 140, step));
     assert_eq!(row(0), row(7));
-    assert!(row(0).contains("shop "), "{}", row(0));
+    assert!(row(0).contains("\u{f07b}  shop  \u{f03a}"), "{}", row(0));
+    // Up to the cap the field is exactly as wide as the name.
+    let app = workspace_app("staging", "Neil's Deployment");
+    let r = status_row(&render_at_step(&app, 140, 0));
+    assert!(r.contains("\u{f07b}  Neil's Deployment  \u{f03a}"), "{r}");
 }
 
 #[test]
