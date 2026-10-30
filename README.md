@@ -1,53 +1,129 @@
 # railway-tui
 
-A k9s-style terminal UI for looking at [Railway](https://railway.com) from the keyboard: see every
+[![CI](https://github.com/nplayer89/railway-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/nplayer89/railway-tui/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/nplayer89/railway-tui)](https://github.com/nplayer89/railway-tui/releases/latest)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+
+A [k9s](https://k9scli.io)-style terminal UI for [Railway](https://railway.com). See every
 service's deployment health at a glance, and get from a failed or crashed deployment to the log
 line that explains it in a couple of keystrokes.
 
-Everything is read-only except two things: you can edit, add and delete a service's variables and
-deploy those changes (see [Variables](#variables)), and you can deploy the latest commit of a
-service's connected branch (`D`), or switch the service to another branch and deploy that (`d`),
-both on Services or Deployments and confirmed with `y`. It never restarts, scales or otherwise
-changes anything else. It uses only Railway's public GraphQL API.
+> [!NOTE]
+> railway-tui is an unofficial community project, not affiliated with or endorsed by Railway. It
+> uses only Railway's public GraphQL API. It is pre-1.0: keys, config and on-disk formats may
+> still change between minor versions (see the [changelog](CHANGELOG.md)).
 
-Views: Projects, Services (one row per service with a coloured box per replica), Deployments
-(history of one service), Instances (the replicas of a deployment) and Logs (live build or
-runtime logs with a filter), Variables (one service's variables) and Pending (review and deploy
-your unsent variable changes).
+## Contents
+
+- [Features](#features)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [What it changes on Railway](#what-it-changes-on-railway)
+- [Keys](#keys)
+- [Variables](#variables)
+- [Configuration](#configuration)
+- [Known limitations](#known-limitations)
+- [Contributing](#contributing)
+- [Security](#security)
+- [License](#license)
+
+## Features
+
+- **Health at a glance**: one row per service, with a coloured box for each replica.
+- **Drill down**: Projects → Services → Deployments → Instances → Logs, by keyboard or the `:`
+  command line.
+- **Live logs**: build and runtime logs streamed over Railway's websocket API, with a filter,
+  follow mode and automatic reconnect.
+- **Variables**: search, reveal, edit, add, delete and copy a service's variables. Changes are
+  kept as pending, reviewed as a diff, and deployed only when you confirm.
+- **Deploys**: deploy the latest commit of a service's branch, or switch it to another branch and
+  deploy that, always behind a confirmation.
+- **Rate-limit aware**: refreshes are budgeted against Railway's hourly API quota.
+- **Uses your existing login**: reuses the `railway` CLI login, or takes an API token.
+- **16 themes**, including Tokyo Night, Catppuccin, Dracula, Nord, Gruvbox and Solarized.
 
 ## Install
 
-Requires a Rust toolchain.
+You need a terminal with 24-bit colour and a [Nerd Font](https://www.nerdfonts.com) (v3) for the
+icons. Builds are published for macOS and Linux (x86_64 and arm64).
 
-Icons need a Nerd Font (v3) in your terminal.
+### Prebuilt binary
+
+Download the archive for your platform from the
+[latest release](https://github.com/nplayer89/railway-tui/releases/latest), check it against its
+`.sha256` file, and put `railway-tui` on your `PATH`. For example, on an Apple Silicon Mac:
 
 ```sh
-cargo install --path .
+curl -LO https://github.com/nplayer89/railway-tui/releases/download/v0.1.0/railway-tui-v0.1.0-aarch64-apple-darwin.tar.gz
+curl -LO https://github.com/nplayer89/railway-tui/releases/download/v0.1.0/railway-tui-v0.1.0-aarch64-apple-darwin.tar.gz.sha256
+shasum -a 256 -c railway-tui-v0.1.0-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf railway-tui-v0.1.0-aarch64-apple-darwin.tar.gz
+mv railway-tui-v0.1.0-aarch64-apple-darwin/railway-tui ~/.local/bin/
 ```
 
-## Log in
+The macOS binaries are not notarised. If you downloaded with a browser and macOS refuses to open
+it, run `xattr -d com.apple.quarantine ~/.local/bin/railway-tui`.
+
+### With Cargo
+
+With a [Rust toolchain](https://rustup.rs) installed:
+
+```sh
+cargo install --git https://github.com/nplayer89/railway-tui --tag v0.1.0 --locked
+```
+
+### From source
+
+```sh
+git clone https://github.com/nplayer89/railway-tui
+cd railway-tui
+cargo install --path . --locked
+```
+
+## Quick start
 
 railway-tui reuses the [`railway` CLI](https://docs.railway.com/guides/cli) login, so log in with
-the CLI first:
+the CLI first, then run it:
 
 ```sh
 railway login
+railway-tui
 ```
+
+On launch it reopens the last-used project and environment. Press `?` at any time for help.
+
+### Authentication
 
 railway-tui reads the CLI's `~/.railway/config.json` but never writes it. When the token has
 expired it runs `railway whoami`, which makes the CLI refresh its own login. `RAILWAY_ENV`
 (`staging`, `dev`) picks the CLI's matching config file, as it does for the CLI.
 
-Alternatively, set `RAILWAY_API_TOKEN` to an account API token; it takes precedence
-over the CLI login.
+Alternatively, set `RAILWAY_API_TOKEN` to an account API token; it takes precedence over the CLI
+login.
 
-Then run:
+### Views
 
-```sh
-railway-tui
-```
+| view | shows |
+| --- | --- |
+| Projects | the projects in your workspaces |
+| Services | one row per service with a coloured box per replica |
+| Deployments | the deployment history of one service |
+| Instances | the replicas of a deployment |
+| Logs | live build or runtime logs, with a filter |
+| Variables | one service's variables |
+| Pending | your unsent variable changes, to review and deploy |
 
-On launch it reopens the last-used project and environment.
+## What it changes on Railway
+
+Everything is read-only except:
+
+- editing, adding and deleting a service's variables, and deploying those changes (see
+  [Variables](#variables));
+- deploying the latest commit of a service's connected branch (`D`), or switching the service to
+  another branch and deploying that (`d`).
+
+Each of these is confirmed with `y` first. railway-tui never restarts, scales or otherwise changes
+anything else, and a test (`tests/no_mutations.rs`) holds the code to that list of writes.
 
 ## Keys
 
@@ -111,10 +187,11 @@ Edits are not sent to Railway immediately. They are kept as pending changes and 
 
 ### Review and deploy
 
-`p` (or `:pending`) lists the pending changes in the open project, grouped by environment, then service, with the
-current environment first. `D` deploys the selected group: a confirmation shows the diff, and any variable
-that "changed on Railway since your edit". `y` deploys; any other key cancels. `x` discards a group
-(also confirmed), and `r` / `R` both toggle reveal-all. A group cannot be discarded while it is deploying.
+`p` (or `:pending`) lists the pending changes in the open project, grouped by environment, then
+service, with the current environment first. `D` deploys the selected group: a confirmation shows
+the diff, and any variable that "changed on Railway since your edit". `y` deploys; any other key
+cancels. `x` discards a group (also confirmed), and `r` / `R` both toggle reveal-all. A group
+cannot be discarded while it is deploying.
 
 Deploy order for one service: upsert the changed variables without triggering a deploy, then the
 deletes, then a redeploy of that service only. If something fails, the group stays pending and a
@@ -129,18 +206,7 @@ Pending changes are saved to `$XDG_STATE_HOME/railway-tui/pending.toml` (default
 holds secret values in plain text.** A corrupt file is moved to `pending.toml.corrupt-<unix seconds>`
 (never over an earlier one; the message names the path) and you start empty.
 
-### First live run checklist
-
-Do the first run on a non-production environment. Things not yet confirmed against the real API:
-
-- Does deleting a variable trigger a deploy by itself? (`variableDelete` has no `skipDeploys`; the
-  worst case is an extra deploy that already carries the new values.)
-- Sealed variables (which cannot be read back) are now fetched via `isSealed` and shown as
-  `<Opaque>`; confirm that matches Railway. How do `RAILWAY_*` variables appear in the view?
-- What is Railway's exact "not found" wording when deleting a variable that is already gone?
-- Does `$EDITOR` (`E`) receive every keystroke cleanly, with no characters lost to the TUI?
-
-## Config
+## Configuration
 
 Optional, TOML, at `$XDG_CONFIG_HOME/railway-tui/railway-tui.conf` (default
 `~/.config/railway-tui/railway-tui.conf`). Every key is optional; unknown keys are an error.
@@ -165,16 +231,49 @@ default_environment = "production"
 theme = "catppuccin-mocha"
 ```
 
-## Development
+## Known limitations
+
+Try the variable editing and deploy features on a non-production environment first. Some
+behaviour is not yet confirmed against the real API:
+
+- Does deleting a variable trigger a deploy by itself? (`variableDelete` has no `skipDeploys`; the
+  worst case is an extra deploy that already carries the new values.)
+- Sealed variables (which cannot be read back) are fetched via `isSealed` and shown as
+  `<Opaque>`; confirm that matches Railway. How do `RAILWAY_*` variables appear in the view?
+- What is Railway's exact "not found" wording when deleting a variable that is already gone?
+- Does `$EDITOR` (`E`) receive every keystroke cleanly, with no characters lost to the TUI?
+
+If you see any of these behave unexpectedly, please
+[open an issue](https://github.com/nplayer89/railway-tui/issues).
+
+## Contributing
+
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to build,
+test and release. In short:
 
 ```sh
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
 ```
 
-The tests never call Railway. A separate, ignored suite checks the real API read-only using your
-CLI login:
+The tests never call Railway.
 
-```sh
-RAILWAY_TUI_LIVE=1 cargo test --test live_readonly -- --ignored --nocapture --test-threads=1
-```
+## Security
+
+railway-tui runs with your Railway login and can change variables and deploy. Please report
+vulnerabilities privately as described in [SECURITY.md](SECURITY.md), not in a public issue.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
+the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
+additional terms or conditions.
