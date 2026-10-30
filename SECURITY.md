@@ -20,4 +20,6 @@ Of particular interest:
 - a variable value or token reaching the screen unrevealed, an error message, or a log;
 - the on-disk files (`pending.toml`, the remembered state) being readable by other users.
 
-Only the latest commit on `main` is supported.
+## Supported versions
+
+Fixes go into the latest release and `main`; older releases are not patched.

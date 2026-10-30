@@ -2,6 +2,12 @@
 name = "railway-tui"
 version = "0.1.0"
 edition = "2021"
+description = "A k9s-style terminal UI for Railway: deployment health, logs and variables from the keyboard"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nplayer89/railway-tui"
+readme = "README.md"
+keywords = ["railway", "tui", "terminal", "deployment", "logs"]
+categories = ["command-line-utilities"]
 
 [lib]
 name = "railway_tui"
